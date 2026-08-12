@@ -80,6 +80,11 @@
   --indigo:       #2F2DB4;
   --near-black:   #0A0A0A;
 
+  /* Not a brand colour — LinkedIn's own blue, used only behind the "in"
+     mark so the logo is reproduced as LinkedIn publishes it rather than
+     recoloured. Nothing else in the shell may reference this. */
+  --linkedin:     #0A66C2;
+
   --brand:        var(--navy);
   --brand-hover:  #23237F;
   --brand-press:  #14144E;

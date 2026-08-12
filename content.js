@@ -863,6 +863,89 @@
   const NON_CONTENT_IMAGE =
     /profile-displayphoto|profile-framedphoto|profile-displaybackgroundimage|company-logo|ghost-person|ghost-company/;
 
+  /* ------------------------------------------------------------------ *
+   * Profile media, by CDN path
+   *
+   * The same path segments the line above uses to *reject* an image are what
+   * identify the profile's own picture and cover, so both readers key on them
+   * rather than on markup.
+   *
+   * That is the fix for a photo that went missing. The DOM reader looked for
+   * `img.pv-top-card-profile-picture__image`, and LinkedIn ships that image as
+   * `pv-top-card-profile-picture__image--show`. A class selector matches whole
+   * tokens, so the two do not match, and the read fell through to og:image —
+   * which on a signed-in profile page is frequently LinkedIn's own artwork
+   * rather than the member's face. Class names churn; `/profile-displayphoto/`
+   * has been in the CDN path for as long as the CDN has existed.
+   * ------------------------------------------------------------------ */
+  const PROFILE_PHOTO_PATH = /\/profile-(?:displayphoto|framedphoto)/i;
+  const PROFILE_BANNER_PATH = /\/profile-displaybackgroundimage/i;
+
+  /** First URL on the wanted CDN path. Pure, so the rule itself is testable. */
+  function pickImageByPath(urls, re) {
+    for (const u of urls || []) {
+      if (typeof u === 'string' && /^https?:/i.test(u) && re.test(u)) return u;
+    }
+    return null;
+  }
+
+  /**
+   * Every image URL an element subtree references, in document order.
+   *
+   * `data-delayed-url` matters here for the same reason it does in the feed:
+   * LinkedIn parks the real URL there until the image scrolls into view, and
+   * a cover photo below the fold has no `src` yet.
+   */
+  function imageUrlsIn(root) {
+    const out = [];
+    try {
+      for (const img of root.querySelectorAll('img')) {
+        const u =
+          img.currentSrc ||
+          img.getAttribute('src') ||
+          img.getAttribute('data-delayed-url') ||
+          img.getAttribute('data-li-src') ||
+          '';
+        if (u) out.push(u);
+      }
+    } catch (_) {
+      /* a selector the parser dislikes must not lose what was already read */
+    }
+    return out;
+  }
+
+  /**
+   * Every image URL reachable from an entity — chrome included, unlike
+   * imagesFrom(), because on a profile the avatar *is* the content.
+   */
+  function allImageUrls(node) {
+    const out = [];
+    for (const vi of VY.collect(node, (n) => Array.isArray(n.artifacts) && (n.rootUrl || n.root))) {
+      const u = VY.vectorImageUrl(vi);
+      if (u) out.push(u);
+    }
+    for (const n of VY.collect(node, (x) => typeof x.rootUrl === 'string' || typeof x.url === 'string')) {
+      const u = typeof n.url === 'string' ? n.url : n.rootUrl;
+      if (typeof u === 'string') out.push(u);
+    }
+    return out;
+  }
+
+  /**
+   * "18,432 followers", "1.2K followers", "500+ connections".
+   *
+   * Read out of the rendered text rather than off a class name. The follower
+   * count used to come from `main span:has(+ span)` — the first span in the
+   * page with a sibling span, which on a modern profile is not the follower
+   * count and on many profiles is not a number at all.
+   */
+  function countFromText(text, word) {
+    const m = String(text == null ? '' : text)
+      .replace(/,/g, '')
+      .match(new RegExp('([\\d.]+\\s*[KMB]?)\\s*\\+?\\s*' + word, 'i'));
+    return m ? parseCompact(m[1]) : null;
+  }
+
   /**
    * Media read straight out of a fetched permalink page's markup.
    *
@@ -1061,6 +1144,20 @@
         VY.vectorImageUrl(bg.vectorImage) ||
         (imagesFrom(bg)[0] || {}).url ||
         null;
+    }
+
+    /*
+     * Last resort: the entity carries the image somewhere the named fields
+     * above do not reach. LinkedIn moves these between `profilePicture`,
+     * `picture`, `profilePictureOriginalImage` and the dash resolution-result
+     * wrappers, and each move silently blanks the photo. Scanning the entity's
+     * own subtree for the avatar CDN path survives all of them, and it is
+     * scoped to this profile so it cannot pick up somebody else's face.
+     */
+    if (!photo || !banner) {
+      const urls = allImageUrls(p);
+      if (!photo) photo = pickImageByPath(urls, PROFILE_PHOTO_PATH);
+      if (!banner) banner = pickImageByPath(urls, PROFILE_BANNER_PATH);
     }
 
     return {
@@ -1385,32 +1482,34 @@
       '[data-section="summary"]'
     ]);
 
-    let photo = '';
-    for (const sel of ['img.pv-top-card-profile-picture__image', 'img[class*="profile-photo"]', 'main img[class*="EntityPhoto"]']) {
-      try {
-        const el = document.querySelector(sel);
-        if (el && el.src) {
-          photo = el.src;
-          break;
-        }
-      } catch (_) {
-        /* keep going */
-      }
+    /*
+     * The avatar and cover, by CDN path. `main` first so a commenter's or a
+     * "People also viewed" avatar in the sidebar can never win — the top card
+     * is the first thing in `main` — then the whole document, then og:image as
+     * the last resort it always should have been.
+     */
+    let root = null;
+    try {
+      root = document.querySelector('main');
+    } catch (_) {
+      /* ignore */
     }
-    if (!photo) photo = meta('meta[property="og:image"]');
+    const scoped = root ? imageUrlsIn(root) : [];
+    const everywhere = imageUrlsIn(document);
 
-    let banner = '';
-    for (const sel of ['img[class*="cover-img"]', 'div[class*="profile-background"] img', 'img[class*="background-image"]']) {
-      try {
-        const el = document.querySelector(sel);
-        if (el && el.src) {
-          banner = el.src;
-          break;
-        }
-      } catch (_) {
-        /* keep going */
-      }
-    }
+    const photo =
+      pickImageByPath(scoped, PROFILE_PHOTO_PATH) ||
+      pickImageByPath(everywhere, PROFILE_PHOTO_PATH) ||
+      meta('meta[property="og:image"]');
+
+    const banner =
+      pickImageByPath(scoped, PROFILE_BANNER_PATH) ||
+      pickImageByPath(everywhere, PROFILE_BANNER_PATH) ||
+      '';
+
+    // The top card carries both counts as plain text. Bounded, because further
+    // down the page other people's follower counts appear too.
+    const topText = textOfNode(root || (document && document.body)).slice(0, 3000);
 
     return {
       publicId,
@@ -1421,19 +1520,28 @@
       headline,
       location,
       industry: '',
-      about: about || ogDesc,
-      followers: parseCompact(pick(['main span:has(+ span)', '[class*="follower"]'])),
-      connections: null,
+      about: about || sectionText('about') || ogDesc,
+      followers: countFromText(topText, 'followers?'),
+      connections: countFromText(topText, 'connections?'),
       photoUrl: photo || null,
       bannerUrl: banner || null,
       experience: experienceFromDom(),
-      education: [],
-      skills: [],
+      education: educationFromDom(),
+      skills: skillsFromDom(),
       currentPosition: null,
       profileUrl: U.profileUrl(publicId),
       scrapedAt: new Date().toISOString(),
       source: 'dom'
     };
+  }
+
+  /** innerText where the page offers it, textContent otherwise. */
+  function textOfNode(el) {
+    try {
+      return (el && (el.innerText || el.textContent)) || '';
+    } catch (_) {
+      return '';
+    }
   }
 
   function parseCompact(s) {
@@ -1445,35 +1553,101 @@
     return isFinite(n) ? n : null;
   }
 
-  function experienceFromDom() {
+  /**
+   * The rows of one profile section, as LinkedIn renders them.
+   *
+   * Every section hangs off an anchor div whose id is what the profile's own
+   * in-page navigation targets — `#experience`, `#education`, `#skills` — so
+   * those ids are the durable handle on the rendered page. Inside, each entry
+   * is an <li> that prints every field twice: once visible with aria-hidden,
+   * once for a screen reader. Taking only the aria-hidden spans avoids
+   * doubling every string.
+   *
+   * Returns the raw span lists; each caller knows its own field order.
+   */
+  function sectionRows(anchorId, limit) {
     const rows = [];
     let section = null;
     try {
-      const anchor = document.querySelector('#experience');
+      const anchor = document.querySelector('#' + anchorId);
       section = anchor ? anchor.closest('section') : null;
     } catch (_) {
       /* ignore */
     }
     if (!section) return rows;
 
-    for (const li of section.querySelectorAll('li')) {
-      // LinkedIn renders each field twice — once visible, once for screen
-      // readers. Taking only aria-hidden spans avoids doubling every string.
+    let items;
+    try {
+      items = section.querySelectorAll('li');
+    } catch (_) {
+      return rows;
+    }
+    for (const li of items) {
       const spans = [...li.querySelectorAll('span[aria-hidden="true"]')]
         .map((s) => (s.textContent || '').trim())
         .filter(Boolean);
       if (!spans.length) continue;
-      rows.push({
-        title: spans[0] || '',
-        company: (spans[1] || '').split('·')[0].trim(),
-        location: spans[3] || '',
-        dates: spans[2] || '',
-        current: /present/i.test(spans[2] || ''),
-        description: spans.slice(4).join(' ')
-      });
-      if (rows.length >= 40) break;
+      rows.push(spans);
+      if (rows.length >= (limit || 40)) break;
     }
     return rows;
+  }
+
+  /** The longest string in a section — its body copy rather than its chrome. */
+  function sectionText(anchorId) {
+    let best = '';
+    for (const spans of sectionRows(anchorId, 8)) {
+      for (const s of spans) if (s.length > best.length) best = s;
+    }
+    return best;
+  }
+
+  function experienceFromDom() {
+    return sectionRows('experience').map((spans) => ({
+      title: spans[0] || '',
+      company: (spans[1] || '').split('·')[0].trim(),
+      location: spans[3] || '',
+      dates: spans[2] || '',
+      current: /present/i.test(spans[2] || ''),
+      description: spans.slice(4).join(' ')
+    }));
+  }
+
+  /*
+   * Education and skills used to be hardcoded empty here, so a run that fell
+   * through to the DOM strategy produced education.txt saying "(no education
+   * captured)" and a profile.json with no skills — for a profile that showed
+   * both on screen.
+   */
+  function educationFromDom() {
+    const rows = [];
+    for (const spans of sectionRows('education')) {
+      const school = spans[0] || '';
+      if (!school) continue;
+      // "Bachelor of Technology, Computer Science" is one span on LinkedIn.
+      const parts = (spans[1] || '').split(',').map((s) => s.trim()).filter(Boolean);
+      rows.push({
+        school,
+        degree: parts[0] || '',
+        field: parts.slice(1).join(', '),
+        dates: spans[2] || '',
+        description: spans.slice(3).join(' ')
+      });
+    }
+    return rows;
+  }
+
+  function skillsFromDom() {
+    const out = [];
+    const seen = new Set();
+    // Nested <li>s (a skill's endorsement list) repeat the name; dedupe.
+    for (const spans of sectionRows('skills', 80)) {
+      const name = spans[0];
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      out.push(name);
+    }
+    return out;
   }
 
   /* ------------------------------------------------------------------ *
@@ -2592,7 +2766,21 @@
       declaresMedia,
       needsDetail,
       mediaFromHtml,
-      classifyByMedia
+      classifyByMedia,
+      pickImageByPath,
+      allImageUrls,
+      imageUrlsIn,
+      countFromText,
+      parseCompact,
+      /*
+       * Needs a real document rather than the fake one engine-test.mjs
+       * builds, so the suite covers the rules it is made of — pickImageByPath,
+       * countFromText, allImageUrls — and this export exists so the whole
+       * reader can be run against a saved profile page in a browser.
+       */
+      profileFromDom,
+      PROFILE_PHOTO_PATH,
+      PROFILE_BANNER_PATH
     });
   }
 })();

@@ -26,23 +26,22 @@
   border-right: 1px solid var(--border);
 }
 
-/* The Content Daddy mark on its navy plate — the reversed lockup the
-   guideline approves for navy, indigo and photographic grounds.
+/* The "in" mark, white on LinkedIn's own blue — reproduced as LinkedIn
+   publishes it rather than recoloured into the brand palette, which is the
+   only way to use somebody else's logo that is not worse than not using it.
 
-   Flat on purpose. Misuse rule 03 rules out drop shadows, glows and bevels
-   on the logo, so the plate carries no elevation even though every other
-   raised surface in the shell does. */
+   Flat on purpose: no shadow, glow or bevel on a logo, whosever it is. */
 .brand-mark {
   display: grid;
   place-items: center;
   width: 34px; height: 34px;
   margin-bottom: 10px;
   border-radius: var(--r-sm);
-  background: var(--brand);
-  color: var(--on-brand);
+  background: var(--linkedin);
+  color: #FFFFFF;
   flex: none;
 }
-.brand-mark svg { width: 20px; height: 20px; }
+.brand-mark svg { width: 21px; height: 21px; }
 
 .rail-btn {
   position: relative;

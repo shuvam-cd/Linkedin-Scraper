@@ -13,14 +13,14 @@
  * crisp at 16 px where hinting would otherwise mangle it. Every shape is
  * defined once in a 100x100 design space and sampled 4x4 per output pixel.
  *
- * THE MARK: Content Daddy's camera — a rounded body with the lens barrel
- * flaring off its right side — reversed in white on a Navy plate, which is
- * the lockup the brand guidelines approve for navy grounds.
+ * THE MARK: the "in" glyph in white on LinkedIn blue.
  *
- * It replaces the LinkedIn "in" glyph this generator used to draw. That glyph
- * is LinkedIn Corporation's trademark, and shipping it implied an affiliation
- * that does not exist — with the company whose User Agreement this tool
- * already contravenes.
+ * NOTE: that glyph and that blue are LinkedIn Corporation's trademarks. On a
+ * locally loaded build for your own use this is unremarkable. Publishing or
+ * distributing the extension wearing them is not — it asserts an affiliation
+ * that does not exist, with the company whose User Agreement this tool already
+ * contravenes, and it is grounds for removal from the Chrome Web Store on its
+ * own. Swap the mark before it leaves your machine.
  */
 import { deflateSync } from 'node:zlib';
 import { writeFileSync, mkdirSync } from 'node:fs';
@@ -88,45 +88,31 @@ function encodePng(width, height, rgba) {
 /* ---------------------------------------------------------------- *
  * The mark, in a 100x100 design space
  *
- * The camera is a rounded body (x 13..61) with the lens barrel flaring off
- * its right side to x 87 — so the glyph's bounding box is x 13..87, y 30..70,
- * centred horizontally and optically centred vertically.
- *
- * The barrel's left edge sits at x 59, two units *inside* the body, so the
- * two shapes union into one silhouette instead of meeting at a seam that
- * antialiasing would show as a hairline at 16 px.
+ * Laid out so the glyph's bounding box is centred: x 17..84, y 21..80.
+ * The "n" is a left stem, an upper half-annulus for the shoulder, and a right
+ * stem. The annulus radii are chosen so its inner and outer edges land exactly
+ * on the stem edges — that is what makes the join look drawn rather than
+ * assembled.
  * ---------------------------------------------------------------- */
-const NAVY = [0x1a, 0x1a, 0x64]; // Content Daddy Navy — #1A1A64
+const BLUE = [0x0a, 0x66, 0xc2]; // LinkedIn brand blue — #0A66C2
 const WHITE = [0xff, 0xff, 0xff];
 
 const G = {
-  radius: 22, // background corner rounding
-  body: { x0: 13, x1: 61, y0: 30, y1: 70, r: 11 },
-  barrel: [
-    [59, 45],
-    [87, 31],
-    [87, 69],
-    [59, 55]
-  ]
+  radius: 18, // background corner rounding
+  iDot: { cx: 23, cy: 28, r: 7 },
+  iStem: { x0: 17, x1: 29, y0: 42, y1: 80 },
+  nStem: { x0: 36, x1: 48, y0: 42, y1: 80 },
+  nArch: { cx: 60, cy: 66, rOuter: 24, rInner: 12 },
+  nRight: { x0: 72, x1: 84, y0: 66, y1: 80 }
 };
 
-/** Rounded-rect coverage test for an arbitrary rect. */
-function inRoundRect(x, y, r) {
-  if (x < r.x0 || x > r.x1 || y < r.y0 || y > r.y1) return false;
-  const cx = Math.min(Math.max(x, r.x0 + r.r), r.x1 - r.r);
-  const cy = Math.min(Math.max(y, r.y0 + r.r), r.y1 - r.r);
-  return (x - cx) ** 2 + (y - cy) ** 2 <= r.r * r.r;
-}
+const inRect = (x, y, r) => x >= r.x0 && x <= r.x1 && y >= r.y0 && y <= r.y1;
+const inCircle = (x, y, c) => (x - c.cx) ** 2 + (y - c.cy) ** 2 <= c.r ** 2;
 
-/** Crossing-number point-in-polygon. The barrel is convex, but this is cheap. */
-function inPolygon(x, y, pts) {
-  let inside = false;
-  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
-    const [xi, yi] = pts[i];
-    const [xj, yj] = pts[j];
-    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
-  }
-  return inside;
+function inArch(x, y, a) {
+  if (y > a.cy) return false; // upper half only
+  const d2 = (x - a.cx) ** 2 + (y - a.cy) ** 2;
+  return d2 <= a.rOuter ** 2 && d2 >= a.rInner ** 2;
 }
 
 /** Rounded-rect coverage test over the full 0..100 square. */
@@ -137,7 +123,12 @@ function inBackground(x, y, r) {
   return (x - cx) ** 2 + (y - cy) ** 2 <= r * r;
 }
 
-const inGlyph = (x, y) => inRoundRect(x, y, G.body) || inPolygon(x, y, G.barrel);
+const inGlyph = (x, y) =>
+  inCircle(x, y, G.iDot) ||
+  inRect(x, y, G.iStem) ||
+  inRect(x, y, G.nStem) ||
+  inArch(x, y, G.nArch) ||
+  inRect(x, y, G.nRight);
 
 /* ---------------------------------------------------------------- *
  * Rasteriser
@@ -165,12 +156,12 @@ function render(size) {
       const at = (py * size + px) * 4;
       if (!bg) continue; // fully transparent outside the rounded square
 
-      // Composite the white glyph over the navy plate, then the plate over
+      // Composite the white glyph over the blue plate, then the plate over
       // transparency. Doing it in that order keeps the glyph's edges clean
       // against the plate instead of against the page behind it.
       const glyphRatio = fg / bg;
       for (let c = 0; c < 3; c++) {
-        out[at + c] = Math.round(NAVY[c] * (1 - glyphRatio) + WHITE[c] * glyphRatio);
+        out[at + c] = Math.round(BLUE[c] * (1 - glyphRatio) + WHITE[c] * glyphRatio);
       }
       out[at + 3] = Math.round((bg / total) * 255);
     }

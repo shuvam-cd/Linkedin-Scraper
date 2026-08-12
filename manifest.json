@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "LinkedIn Scraper By Sumon",
+  "name": "LinkedIn Scraper",
   "version": "1.0.5",
   "description": "Collect a LinkedIn profile and its posts using your own already-logged-in browser session. Conservatively paced, visible tab, one ZIP export with CSV.",
 
@@ -31,7 +31,7 @@
 
   "action": {
     "default_popup": "popup.html",
-    "default_title": "LinkedIn Scraper By Sumon",
+    "default_title": "LinkedIn Scraper",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",

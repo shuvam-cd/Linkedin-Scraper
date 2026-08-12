@@ -1,4 +1,4 @@
-# LinkedIn Scraper By Sumon
+# LinkedIn Scraper
 
 A Manifest V3 Chrome extension that collects a LinkedIn profile and its posts
 using the session you're **already** logged into. There is no login flow, no
@@ -31,7 +31,7 @@ linkedin-post-scraper/
 ├── popup.js            Popup controller (a pure view over worker state)
 ├── offscreen.html      Packaging worker document
 ├── offscreen.js        Fetches media, packs the .zip, mints blob URLs
-├── icons/              16/32/48/128 px toolbar icons (Content Daddy camera, Navy)
+├── icons/              16/32/48/128 px toolbar icons (LinkedIn blue "in")
 ├── tools/              Tests, plus make-icons.mjs (regenerates the PNGs)
 ├── ENDPOINTS.md        How to capture and repair the Voyager endpoints
 └── README.md
@@ -89,11 +89,11 @@ their API" from the outside. So it lives in its own file, has no DOM or
 `chrome.*` dependency, and is tested in isolation:
 
 ```
-node tools/test.mjs               310 assertions, no dependencies
+node tools/test.mjs               320 assertions, no dependencies
 
-  resolver-test.mjs   56   URN resolution, session cookies, Rest.li encoding
+  resolver-test.mjs   58   URN resolution, session cookies, Rest.li encoding
   utils-test.mjs      33   public-id normalisation, CSV escaping
-  engine-test.mjs     45   session detection, entity mapping, paging
+  engine-test.mjs     53   session detection, entity mapping, profile media, paging
   export-test.mjs     48   archive tree, CSV, README
   wiring-check.mjs    34   manifest / popup / message wiring, safety limits
   regression-test.mjs 94   tab navigation, timers, media scope, video frames
@@ -412,6 +412,14 @@ font installed renders the real thing, everywhere else gets DM Sans. Montserrat
 is OFL and ships in full. `ui/fonts/README.md` has the details and how to swap
 in a licensed Google Sans webfont build.
 
+**One deliberate exception.** The toolbar icon and the shell's brand mark are
+LinkedIn's "in" on LinkedIn blue, which is not a Content Daddy colour. It has
+its own token, `--linkedin`, and nothing else in the stylesheet may reference
+it. Reproducing another company's logo as they publish it is defensible;
+recolouring it into your own palette is not, so the mark keeps its blue and
+the rest of the shell keeps navy. See **[The icon](#the-icon)** for the
+trademark position.
+
 ## Options
 
 | Option | Effect |
@@ -595,6 +603,49 @@ further. See [ENDPOINTS.md](ENDPOINTS.md).
 Not an endpoint problem and not something to retry. LinkedIn is refusing
 automated requests from the session. Stop for the day.
 
+## The profile photo, and everything else that was missing from a profile
+
+Symptom: no profile picture, no follower or connection count, `education.txt`
+saying "(no education captured)" and no skills — for a profile that plainly
+shows all of it on screen.
+
+That is the DOM strategy, which runs whenever the embedded payload does not
+carry a `.Profile` entity. It was written against class names, and LinkedIn
+renamed them. Running the same saved profile page through the reader before and
+after:
+
+| Field | Before | After |
+|---|---|---|
+| `photoUrl` | `static.licdn.com/…/og-generic.png` | the member's 400×400 avatar |
+| `bannerUrl` | `null` | the cover image |
+| `followers` | `null` | `18432` |
+| `connections` | `null` | `500` |
+| `education` | `[]` | every row on the page |
+| `skills` | `[]` | every skill on the page |
+
+Four separate causes:
+
+- **The photo selector could not match.** It asked for
+  `img.pv-top-card-profile-picture__image`; LinkedIn ships that image as
+  `pv-top-card-profile-picture__image--show`. A class selector matches whole
+  tokens, so those are different classes and the read fell through to
+  `og:image` — which on a signed-in profile page is LinkedIn's own generic
+  artwork. Worse than nothing: the popup showed a picture, the export wrote a
+  `profile_picture.png`, and neither was the person.
+- **The cover was never lazy-aware.** It read `el.src`, and a cover below the
+  fold has its URL parked on `data-delayed-url` until it scrolls into view.
+- **Counts came from `main span:has(+ span)`** — the first span in the page
+  with a sibling span, which is not the follower count on any profile.
+- **Education and skills were hardcoded `[]`.**
+
+The replacement keys on things that do not churn: the CDN path
+(`/profile-displayphoto/`, `/profile-displaybackgroundimage/`) for the images,
+scoped to `<main>` first so a "People also viewed" avatar cannot win; the
+rendered text for the counts; and the `#experience` / `#education` / `#skills`
+anchor ids, which are what the profile's own in-page navigation targets. The
+embedded-JSON reader got the same CDN-path fallback, so a shape change that
+moves `profilePicture` no longer blanks the photo there either.
+
 ## Fixed alongside the rebrand
 
 Six defects found while reworking the shell. Each is reproducible; the first
@@ -651,21 +702,25 @@ debugging the wrong thing. Capture them live or leave Strategy A off.
 
 ## The icon
 
-The toolbar icon is the Content Daddy camera reversed in white on a Navy plate
-— the lockup the guidelines approve for navy grounds. It is drawn from geometry
-in `tools/make-icons.mjs` rather than traced from a font, which is what keeps it
-readable at 16 px where hinting would otherwise close up the shape. Node's
+The toolbar icon and the shell's brand mark are LinkedIn's "in" in white on
+LinkedIn blue, reproduced as LinkedIn publishes it rather than recoloured into
+the Content Daddy palette — recolouring somebody else's logo to match your own
+is worse than leaving it alone. It is drawn from geometry in
+`tools/make-icons.mjs` rather than traced from a font, which is what keeps it
+readable at 16 px where hinting would otherwise close up the counters. Node's
 `zlib` is the only thing it needs; the PNG encoder is thirty lines and this
 project still has no `package.json`.
 
 Regenerate with `node tools/make-icons.mjs`. The PNGs are committed, so a normal
 install remains build-step-free.
 
-It replaces the LinkedIn "in" glyph the generator used to draw. **That glyph is
-LinkedIn Corporation's trademark**, and shipping it asserted an affiliation that
-does not exist with the company whose User Agreement this tool already
-contravenes — grounds for removal from the Chrome Web Store on its own. The
-rail's *Scrape* icon was the same square and is now a neutral profile card.
+**The "in" glyph and that blue are LinkedIn Corporation's trademarks.** Using
+them on a locally loaded build for your own use is unremarkable. Publishing or
+distributing the extension wearing them is not: it asserts an affiliation that
+does not exist, with the company whose User Agreement this tool already
+contravenes, and it is grounds for removal from the Chrome Web Store on its own.
+Swap the mark before it leaves your machine — `tools/make-icons.mjs` is thirty
+lines of geometry and `.brand-mark` in `popup.html` is one `<svg>`.
 
 ## Permissions
 

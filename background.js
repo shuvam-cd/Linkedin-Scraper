@@ -159,7 +159,7 @@ async function persist() {
   } catch (err) {
     // Most likely the quota; "unlimitedStorage" is requested to avoid this.
     writing.forEach((c) => dirtyChunks.add(c)); // retry on the next tick
-    console.warn('[LinkedIn Scraper By Sumon] persist failed', err);
+    console.warn('[LinkedIn Scraper] persist failed', err);
     addLog('warn', `Could not save to local storage: ${err.message}`);
   }
 }

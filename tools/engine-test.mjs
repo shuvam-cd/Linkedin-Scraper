@@ -446,6 +446,91 @@ check('a single dip does not warn', () => {
   ok(!t.warned);
 });
 
+/* ================================================================== *
+ * Profile media and counts
+ *
+ * The photo went missing because the DOM reader asked for
+ * `img.pv-top-card-profile-picture__image` and LinkedIn ships that image as
+ * `…__image--show`. A class selector matches whole tokens, so it never
+ * matched, and the read fell through to og:image. These cover the rule that
+ * replaced it: the CDN path, which does not churn.
+ * ================================================================== */
+group('profile media, by CDN path');
+
+const PHOTO = 'https://media.licdn.com/dms/image/v2/D5603AQ/profile-displayphoto-shrink_400_400/0/17?e=1';
+const FRAMED = 'https://media.licdn.com/dms/image/v2/D56/profile-framedphoto-shrink_400_400/0/17?e=1';
+const BANNER = 'https://media.licdn.com/dms/image/v2/D56/profile-displaybackgroundimage-shrink_350_1400/0/17?e=1';
+const POST_IMG = 'https://media.licdn.com/dms/image/v2/D4E22AQ/feedshare-shrink_2048_1536/0/17?e=1';
+const LOGO = 'https://media.licdn.com/dms/image/v2/C4D0BAQ/company-logo_200_200/0/16?e=1';
+
+check('picks the avatar out of a page full of other images', () => {
+  eq(E.pickImageByPath([LOGO, POST_IMG, PHOTO], E.PROFILE_PHOTO_PATH), PHOTO);
+  eq(E.pickImageByPath([POST_IMG, BANNER], E.PROFILE_BANNER_PATH), BANNER);
+});
+
+check('a framed photo is still the member photo', () => {
+  eq(E.pickImageByPath([FRAMED], E.PROFILE_PHOTO_PATH), FRAMED);
+});
+
+check('the avatar and the cover are never confused for each other', () => {
+  eq(E.pickImageByPath([BANNER], E.PROFILE_PHOTO_PATH), null);
+  eq(E.pickImageByPath([PHOTO], E.PROFILE_BANNER_PATH), null);
+});
+
+check('nothing on the right path yields null, not a wrong URL', () => {
+  eq(E.pickImageByPath([LOGO, POST_IMG], E.PROFILE_PHOTO_PATH), null);
+  eq(E.pickImageByPath([], E.PROFILE_PHOTO_PATH), null);
+  eq(E.pickImageByPath(null, E.PROFILE_PHOTO_PATH), null);
+  eq(E.pickImageByPath(['/dms/image/profile-displayphoto/x'], E.PROFILE_PHOTO_PATH), null, 'relative is not a URL');
+});
+
+check('allImageUrls reaches an avatar the named fields do not', () => {
+  // The shape LinkedIn moves between releases: the picture is nested a level
+  // deeper than profilePicture.displayImageReference.vectorImage.
+  const entity = {
+    entityUrn: 'urn:li:fsd_profile:ABC',
+    firstName: 'Ada',
+    profilePicture: {
+      displayImageReferenceResolutionResult: {
+        vectorImage: { rootUrl: 'https://media.licdn.com/dms/image/v2/D5603AQ/profile-displayphoto-shrink_400_400/0/17', artifacts: [{ fileIdentifyingUrlPathSegment: '?e=1', width: 400 }] }
+      }
+    }
+  };
+  eq(E.pickImageByPath(E.allImageUrls(entity), E.PROFILE_PHOTO_PATH), PHOTO);
+});
+
+check('mapProfileEntity falls back to the CDN path for photo and banner', () => {
+  const p = {
+    entityUrn: 'urn:li:fsd_profile:ABC',
+    publicIdentifier: 'ada',
+    firstName: 'Ada',
+    lastName: 'Lovelace',
+    headline: 'Mathematician',
+    profilePicture: { somethingNew: { vectorImage: { rootUrl: PHOTO, artifacts: [] } } },
+    backgroundPicture: { somethingNew: { vectorImage: { rootUrl: BANNER, artifacts: [] } } }
+  };
+  const out = E.mapProfileEntity(p, { included: [p] });
+  eq(out.photoUrl, PHOTO, 'photoUrl');
+  eq(out.bannerUrl, BANNER, 'bannerUrl');
+  eq(out.fullName, 'Ada Lovelace');
+});
+
+group('follower and connection counts');
+
+check('reads the counts LinkedIn actually prints', () => {
+  eq(E.countFromText('Kolkata, India · 18,432 followers · 500+ connections', 'followers?'), 18432);
+  eq(E.countFromText('Kolkata, India · 18,432 followers · 500+ connections', 'connections?'), 500);
+  eq(E.countFromText('1.2K followers', 'followers?'), 1200);
+  eq(E.countFromText('3M followers', 'followers?'), 3000000);
+  eq(E.countFromText('1 follower', 'followers?'), 1);
+});
+
+check('a missing count is null rather than zero', () => {
+  eq(E.countFromText('Kolkata, India', 'followers?'), null);
+  eq(E.countFromText('', 'followers?'), null);
+  eq(E.countFromText(null, 'connections?'), null);
+});
+
 /* ================================================================== */
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
 

@@ -1,0 +1,367 @@
+/* ══════════════════════════════════════════════════════════════════
+   tokens.css — the single source of truth for the visual system.
+
+   The system is Content Daddy's, per Brand Guidelines · 2026:
+
+     Navy       #1A1A64   primary
+     Indigo     #2F2DB4   secondary / the lift
+     White      #FFFFFF   the default surface
+     Near-black #0A0A0A   body text on white
+
+   Type is the two faces the guideline allows, no exceptions:
+   Montserrat for display, Google Sans for everything else. Both are
+   bundled locally — an extension page cannot reach a font CDN, and the
+   guideline forbids substituting system fonts. See ui/fonts/README.md
+   for what ships and why.
+
+   Nothing below this file may hardcode a colour, radius, duration or
+   shadow. If a value is needed twice, it becomes a token here.
+
+   Themes are driven by [data-theme] on <html>. "system" is the absence
+   of an explicit choice, resolved by the prefers-color-scheme block, so
+   switching costs one attribute write and repaints instantly.
+   ══════════════════════════════════════════════════════════════════ */
+
+/* ══ Faces ══════════════════════════════════════════════════════
+   Variable fonts, latin + latin-ext only. `local()` comes first on
+   the body face so a machine with the licensed Google Sans installed
+   renders the real brand font; the bundled fallback covers the rest.
+   ══════════════════════════════════════════════════════════════ */
+@font-face {
+  font-family: "CD Display";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: block;
+  src: url("fonts/montserrat-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "CD Display";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: block;
+  src: url("fonts/montserrat-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+    U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
+    U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "CD Text";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: block;
+  src: local("Google Sans"), local("Google Sans Text"), local("Product Sans"),
+    url("fonts/dmsans-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "CD Text";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: block;
+  src: local("Google Sans"), local("Google Sans Text"), local("Product Sans"),
+    url("fonts/dmsans-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+    U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
+    U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+:root {
+  /* ── brand ─────────────────────────────────────────────────────
+     Navy is the default mark colour on light surfaces; indigo is the
+     lift — hover, focus, and the accent that keeps a dense panel from
+     reading as one flat block of navy. Nothing outside these two,
+     white, and near-black is a brand colour. */
+  --navy:         #1A1A64;
+  --indigo:       #2F2DB4;
+  --near-black:   #0A0A0A;
+
+  --brand:        var(--navy);
+  --brand-hover:  #23237F;
+  --brand-press:  #14144E;
+  --brand-2:      var(--indigo);
+  --brand-3:      #6E6CE0;   /* readable indigo on dark ground */
+
+  /* ── semantic status ───────────────────────────────────────────
+     Two tokens per state on purpose. The saturated value is a *fill*
+     — a lamp, a meter, a checkmark — and fails contrast as text on
+     white; the -ink value is the one text may use. */
+  --success:     #16A971;
+  --success-ink: #0B7A50;
+  --warning:     #E8A317;
+  --warning-ink: #9A5B00;
+  --danger:      #E23B3B;
+  --danger-ink:  #C11B1B;
+
+  /* ── surfaces ──────────────────────────────────────────────────
+     White is the surface every panel starts from, per the guideline.
+     The app ground beneath it is white carrying a trace of navy, so
+     cards read as raised without introducing a fifth colour. */
+  --bg:       #F4F4F9;
+  --surface:  #FFFFFF;
+  --card:     #FFFFFF;
+  --sunken:   #EFEFF6;
+  --raised:   #FFFFFF;   /* sits ON a card: segmented thumb, popovers */
+  --overlay:  rgba(10, 10, 40, .38);
+
+  /* ── lines ─────────────────────────────────────────────────────
+     Navy-tinted rather than neutral grey: a grey hairline beside navy
+     reads as a different, colder system. */
+  --border:        rgba(26, 26, 100, .11);
+  --border-strong: rgba(26, 26, 100, .20);
+
+  /* ── ink ───────────────────────────────────────────────────────
+     Near-black for body copy exactly as specified. The muted steps
+     are navy-tinted so secondary text stays in the family. */
+  --text:    var(--near-black);
+  --text-2:  #55555F;
+  --text-3:  #8A8A99;
+  --on-brand: #FFFFFF;
+
+  /* ── tinted fills (states, badges, selection) ──────────────── */
+  --brand-soft:   rgba(47, 45, 180, .10);
+  --brand-softer: rgba(47, 45, 180, .05);
+  --success-soft: rgba(22, 169, 113, .13);
+  --warning-soft: rgba(232, 163, 23, .16);
+  --danger-soft:  rgba(226, 59, 59, .11);
+  --hover:        rgba(26, 26, 100, .055);
+  --press:        rgba(26, 26, 100, .095);
+
+  /* focus ring — two layers so it reads on any surface */
+  --ring: 0 0 0 2px var(--surface), 0 0 0 4px var(--indigo);
+
+  /* ── elevation: layered, low-opacity, never harsh ──────────────
+     Tinted navy, not black: a neutral drop shadow under a navy card
+     greys the whole panel. */
+  --e1: 0 1px 2px rgba(10, 10, 40, .05);
+  --e2: 0 1px 2px rgba(10, 10, 40, .05), 0 2px 6px -2px rgba(10, 10, 40, .09);
+  --e3: 0 1px 2px rgba(10, 10, 40, .05), 0 6px 16px -6px rgba(10, 10, 40, .13);
+  --e4: 0 1px 2px rgba(10, 10, 40, .06), 0 12px 28px -10px rgba(10, 10, 40, .20),
+        0 32px 64px -32px rgba(10, 10, 40, .24);
+  --e-brand: 0 1px 2px rgba(26, 26, 100, .26), 0 6px 16px -8px rgba(26, 26, 100, .48);
+
+  /* ── spacing: strict 8px system (4 exists only for icon insets) */
+  --s-half: 4px;
+  --s1: 8px;
+  --s2: 16px;
+  --s3: 24px;
+  --s4: 32px;
+  --s5: 40px;
+  --s6: 48px;
+  --s8: 64px;
+
+  /* ── radius ────────────────────────────────────────────────────
+     The logotype and the "QUALITY ASSURED" chip are softly rounded
+     rather than sharp, so the shell follows. */
+  --r-card:  18px;
+  --r-btn:   12px;
+  --r-input: 12px;
+  --r-sm:    10px;
+  --r-xs:    8px;
+  --r-pill:  999px;
+
+  /* ── type ──────────────────────────────────────────────────────
+     Two faces, no exceptions. Montserrat carries display only — it is
+     not a body-copy font and is never used below 16px except for the
+     wide-tracked eyebrow, which is set in caps where it holds up. */
+  --font-display: "CD Display", Montserrat, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font: "CD Text", "Google Sans", "DM Sans", Roboto, -apple-system,
+          BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --mono: "SF Mono", ui-monospace, "Cascadia Mono", "Segoe UI Mono", Menlo, Consolas, monospace;
+
+  /* Headlines sit at 700; 500 and 600 carry sub-heads and panel titles.
+     Body copy sits at 400; 500 handles labels and emphasis. */
+  --t-display: 700 22px/1.2  var(--font-display);
+  --t-title:   600 16px/1.3  var(--font-display);
+  --t-body:    400 13.5px/1.55 var(--font);
+  --t-label:   500 12.5px/1.4  var(--font);
+  --t-meta:    400 11.5px/1.45 var(--font);
+  --t-eyebrow: 600 10px/1.4  var(--font-display);
+
+  /* The deck sets its eyebrows very wide; the display face is tracked
+     tight so the geometry reads as one word rather than a row of letters. */
+  --track-eyebrow: .16em;
+  --track-display: -.02em;
+  --track-tight:   -.006em;
+
+  /* ── motion ────────────────────────────────────────────────────
+     The brand is confident rather than corporate — motion is quick and
+     settled, never bouncy. */
+  --dur-1: 120ms;   /* hover, colour */
+  --dur-2: 200ms;   /* the default */
+  --dur-3: 260ms;   /* enter / expand */
+  --ease:      cubic-bezier(.22, .61, .36, 1);   /* standard out */
+  --ease-in:   cubic-bezier(.55, .06, .68, .19);
+  --ease-soft: cubic-bezier(.32, .72, 0, 1);     /* long travel */
+
+  /* ── layout ────────────────────────────────────────────────────
+     `--tip-gap` is shared by every tooltip so the rail's right-hand
+     placement and the topbar's downward placement stay in step. */
+  --rail: 56px;
+  --topbar: 52px;
+  --statusbar: 34px;
+  --popup-w: 480px;
+  --popup-h: 600px;
+  --tip-gap: 10px;
+
+  --z-toast: 90;
+  --z-overlay: 100;
+}
+
+/* ══ dark ═══════════════════════════════════════════════════════
+   Grounded on the brand's own near-black, which is exactly what the
+   guideline's full-bleed bands use. Navy is too dark to carry a
+   control on near-black, so indigo takes the primary role and navy
+   becomes the surface tint underneath it.
+   ══════════════════════════════════════════════════════════════ */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --brand:       var(--indigo);
+  --brand-hover: #4442CE;
+  --brand-press: #6E6CE0;
+
+  --bg:      #0A0A0A;
+  --surface: #121223;
+  --card:    #15152C;
+  --sunken:  #0D0D1C;
+  --raised:  #272750;    /* lighter than the track, or the thumb reads as a hole */
+  --overlay: rgba(5, 5, 16, .62);
+
+  --border:        rgba(255, 255, 255, .09);
+  --border-strong: rgba(255, 255, 255, .17);
+
+  --text:   #F7F7FB;
+  --text-2: #A3A3B6;
+  --text-3: #6F6F84;
+
+  /* On near-black the saturated fill is already legible as text, so
+     the -ink steps lighten rather than darken. */
+  --success-ink: #3BD79B;
+  --warning-ink: #F2BA4C;
+  --danger-ink:  #FF7A7A;
+
+  --brand-soft:   rgba(110, 108, 224, .20);
+  --brand-softer: rgba(110, 108, 224, .11);
+  --success-soft: rgba(22, 169, 113, .18);
+  --warning-soft: rgba(232, 163, 23, .18);
+  --danger-soft:  rgba(226, 59, 59, .20);
+  --hover:        rgba(255, 255, 255, .06);
+  --press:        rgba(255, 255, 255, .10);
+
+  --ring: 0 0 0 2px var(--surface), 0 0 0 4px var(--brand-3);
+
+  /* Shadows do little on near-black; a top hairline reads as the light
+     source instead, so elevation survives the theme flip. */
+  --e1: 0 1px 2px rgba(0, 0, 0, .40);
+  --e2: 0 1px 2px rgba(0, 0, 0, .44), 0 2px 6px -2px rgba(0, 0, 0, .5);
+  --e3: 0 1px 2px rgba(0, 0, 0, .46), 0 6px 16px -6px rgba(0, 0, 0, .58);
+  --e4: 0 1px 2px rgba(0, 0, 0, .5), 0 12px 28px -10px rgba(0, 0, 0, .7),
+        0 32px 64px -32px rgba(0, 0, 0, .8);
+  --e-brand: 0 1px 2px rgba(0, 0, 0, .5), 0 6px 18px -8px rgba(47, 45, 180, .8);
+}
+
+/* ══ system = no explicit choice ════════════════════════════════ */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --brand:       var(--indigo);
+    --brand-hover: #4442CE;
+    --brand-press: #6E6CE0;
+
+    --bg:      #0A0A0A;
+    --surface: #121223;
+    --card:    #15152C;
+    --sunken:  #0D0D1C;
+    --raised:  #272750;
+    --overlay: rgba(5, 5, 16, .62);
+
+    --border:        rgba(255, 255, 255, .09);
+    --border-strong: rgba(255, 255, 255, .17);
+
+    --text:   #F7F7FB;
+    --text-2: #A3A3B6;
+    --text-3: #6F6F84;
+
+    --success-ink: #3BD79B;
+    --warning-ink: #F2BA4C;
+    --danger-ink:  #FF7A7A;
+
+    --brand-soft:   rgba(110, 108, 224, .20);
+    --brand-softer: rgba(110, 108, 224, .11);
+    --success-soft: rgba(22, 169, 113, .18);
+    --warning-soft: rgba(232, 163, 23, .18);
+    --danger-soft:  rgba(226, 59, 59, .20);
+    --hover:        rgba(255, 255, 255, .06);
+    --press:        rgba(255, 255, 255, .10);
+
+    --ring: 0 0 0 2px var(--surface), 0 0 0 4px var(--brand-3);
+
+    --e1: 0 1px 2px rgba(0, 0, 0, .40);
+    --e2: 0 1px 2px rgba(0, 0, 0, .44), 0 2px 6px -2px rgba(0, 0, 0, .5);
+    --e3: 0 1px 2px rgba(0, 0, 0, .46), 0 6px 16px -6px rgba(0, 0, 0, .58);
+    --e4: 0 1px 2px rgba(0, 0, 0, .5), 0 12px 28px -10px rgba(0, 0, 0, .7),
+          0 32px 64px -32px rgba(0, 0, 0, .8);
+    --e-brand: 0 1px 2px rgba(0, 0, 0, .5), 0 6px 18px -8px rgba(47, 45, 180, .8);
+  }
+}
+
+/* ══ reset ══════════════════════════════════════════════════════ */
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  width: var(--popup-w);
+  height: var(--popup-h);
+  margin: 0;
+  overflow: hidden;               /* the view scrolls, never the frame */
+  background: var(--bg);
+  color: var(--text);
+  font: var(--t-body);
+  letter-spacing: var(--track-tight);
+  -webkit-font-smoothing: antialiased;
+  font-variant-numeric: tabular-nums;
+  accent-color: var(--brand);
+}
+
+button, input, textarea, select { font: inherit; color: inherit; }
+button { cursor: pointer; background: none; border: 0; padding: 0; }
+ul, ol { margin: 0; padding: 0; list-style: none; }
+h1, h2, h3, p { margin: 0; }
+svg { display: block; flex: none; }
+
+::selection { background: var(--brand-soft); }
+
+:focus-visible { outline: none; box-shadow: var(--ring); border-radius: var(--r-xs); }
+
+.hidden { display: none !important; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap;
+}
+
+/* thin, unobtrusive scrollbars that follow the theme */
+.scroll { overflow-y: auto; scrollbar-width: thin; overscroll-behavior: contain; }
+.scroll::-webkit-scrollbar { width: 10px; }
+.scroll::-webkit-scrollbar-track { background: transparent; }
+.scroll::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: var(--r-pill);
+}
+.scroll::-webkit-scrollbar-thumb:hover { background-clip: content-box; background-color: var(--text-3); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
+}

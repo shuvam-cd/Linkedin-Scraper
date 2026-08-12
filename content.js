@@ -1,0 +1,2598 @@
+/*
+ * content.js — runs on https://www.linkedin.com/*
+ *
+ * Does the actual scraping. Every network call is a same-origin fetch from the
+ * page, so it carries the user's normal session cookies; nothing here handles
+ * or stores credentials, and no header is sent that the page would not send
+ * itself.
+ *
+ * Results stream back to the service worker over a long-lived port as they are
+ * produced, so partial data survives a failure part-way through and the popup
+ * can show live progress.
+ *
+ * Three collection strategies, tried in order and each able to carry the run
+ * on its own:
+ *
+ *   A  Voyager API      richest, and the first thing to break. Off until the
+ *                       endpoints in CFG are filled in — see ENDPOINTS.md.
+ *   B  Embedded JSON    the normalized payloads LinkedIn server-renders into
+ *                       <code> blocks. No endpoint knowledge needed.
+ *   C  DOM harvest      reads the rendered page. Slowest and shallowest, and
+ *                       the only one that keeps working when the other two rot.
+ */
+(function () {
+  'use strict';
+
+  // The script is in the manifest AND may be re-injected via chrome.scripting.
+  if (window.__LIS_CONTENT_LOADED__) return;
+  window.__LIS_CONTENT_LOADED__ = true;
+
+  const U = globalThis.LIS;
+  const VY = globalThis.LISVoyager;
+  const MSG = U.MSG;
+  const L = U.LIMITS;
+  const ORIGIN = U.ORIGIN;
+
+  /* ================================================================== *
+   * CFG — every version-specific value, in one place.
+   *
+   * LinkedIn rotates Voyager paths, `queryId` values and `decorationId`
+   * values without notice, and a stale value fails in a way that looks
+   * exactly like a rate limit. So nothing here is guessed: Strategy A stays
+   * switched off until you paste in values captured from a live request.
+   *
+   * ENDPOINTS.md walks through the capture, one capability at a time. The
+   * shape below is what it tells you to fill in:
+   *
+   *   posts: {
+   *     enabled: true,
+   *     path: '/identity/profileUpdatesV2',
+   *     params: {
+   *       profileUrn: '{profileUrn}',
+   *       q: 'memberShareFeed',
+   *       count: '{count}',
+   *       start: '{start}',
+   *       moduleKey: '…'
+   *     }
+   *   }
+   *
+   * Placeholders substituted into `path` and `params`:
+   *   {publicId} {profileUrn} {profileId} {activityUrn} {activityId}
+   *   {start} {count} {paginationToken}
+   *
+   * Paste values *decoded* — the Rest.li encoder re-escapes them correctly,
+   * and List(...) / (key:value) syntax is preserved rather than mangled.
+   * ================================================================== */
+  const CFG = {
+    // Stable. The version lives in the path segments below it, not here.
+    voyagerBase: `${ORIGIN}/voyager/api`,
+
+    profile: { enabled: false, path: '', params: {} },
+
+    posts: {
+      enabled: false,
+      path: '',
+      params: {},
+      pageSize: 20,
+      // Rest.li offset paging is the norm; a few finders hand back an opaque
+      // token instead. Set this when {paginationToken} appears in `params`.
+      usePaginationToken: false
+    },
+
+    comments: { enabled: false, path: '', params: {}, pageSize: 20 },
+
+    // Reaction breakdown by type. The summary counts usually ride along with
+    // the post itself, so this is only needed for a per-type split.
+    reactions: { enabled: false, path: '', params: {}, pageSize: 50 },
+
+    /*
+     * Re-fetch every post's permalink even when the list response already
+     * looked complete. Off by default: on LinkedIn each detail fetch is a
+     * separate page load against the session budget.
+     */
+    alwaysFetchDetail: false,
+
+    /*
+     * Strategy B reads whatever the server rendered into the page. Nothing
+     * here is version-specific — it scans every <code> block and keeps what
+     * parses as JSON — so it needs no maintenance when A breaks.
+     */
+    embeddedJson: { enabled: true },
+
+    // Strategy C. Selectors are probed in order and the first hit wins.
+    dom: { enabled: true, maxScrollRounds: 60, idleRoundsBeforeStop: 4 }
+  };
+
+  /* ------------------------------------------------------------------ *
+   * Run state
+   * ------------------------------------------------------------------ */
+  const S = {
+    active: false,
+    stop: false,
+    paused: false,
+    navigating: false,
+    cfg: null,
+    port: null,
+    heartbeat: null,
+    seen: new Set(),
+    posts: [],
+    collected: 0,
+    target: 0,
+    skippedVideos: 0,
+    requests: 0,
+    startedAt: 0,
+    profile: null,
+    pagination: null // { stoppedEarly, reason, pages }
+  };
+
+  const limiter = new U.RateLimiter(L.MIN_REQUEST_GAP_MS);
+
+  /** Thrown to unwind the whole run without being treated as a failure. */
+  class Abort extends Error {
+    constructor(reason, message) {
+      super(message || reason);
+      this.reason = reason;
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Messaging
+   * ------------------------------------------------------------------ */
+  /*
+   * One heartbeat, ever.
+   *
+   * emit() reconnects whenever the port has dropped, so a naive
+   * `S.heartbeat = setInterval(...)` inside connectPort() orphans the previous
+   * timer on every reconnect. Each orphan keeps calling emit(), which
+   * reconnects, which starts another one — a leak that ends up holding the
+   * service worker awake indefinitely.
+   */
+  function startHeartbeat() {
+    stopHeartbeat();
+    // Traffic on the port also keeps the service worker from being evicted.
+    S.heartbeat = setInterval(() => emit(MSG.C_HEARTBEAT, {}), 15000);
+  }
+
+  function stopHeartbeat() {
+    if (S.heartbeat) {
+      clearInterval(S.heartbeat);
+      S.heartbeat = null;
+    }
+  }
+
+  function connectPort() {
+    if (S.port) return S.port;
+    S.port = chrome.runtime.connect({ name: U.PORT_NAME });
+    S.port.onDisconnect.addListener(() => {
+      S.port = null;
+      // Service worker went away mid-run; stop rather than scrape into the void.
+      if (S.active) S.stop = true;
+      else stopHeartbeat(); // nothing left to report — don't reconnect forever
+    });
+    startHeartbeat();
+    return S.port;
+  }
+
+  function emit(type, payload) {
+    try {
+      if (!S.port) connectPort();
+      S.port.postMessage(Object.assign({ type }, payload));
+    } catch (_) {
+      S.port = null;
+    }
+  }
+
+  const log = (level, message) => emit(MSG.C_LOG, { level, message });
+
+  let lastProgress = 0;
+  function emitProgress(force) {
+    const now = Date.now();
+    if (!force && now - lastProgress < 400) return;
+    lastProgress = now;
+    emit(MSG.C_PROGRESS, {
+      collected: S.collected,
+      target: S.target,
+      skippedVideos: S.skippedVideos,
+      requests: S.requests
+    });
+  }
+
+  /** Cursor handed back by the worker when a run is being continued. */
+  function resumeCursor(kind) {
+    const c = S.cfg && S.cfg.startCursor;
+    return c && c.kind === kind && c.value != null ? c.value : null;
+  }
+
+  function fmtDuration(sec) {
+    return U.fmtDuration(sec);
+  }
+
+  /** Halt the run and ask the user to intervene in the visible tab. */
+  function requireAttention(kind, message) {
+    S.paused = true;
+    emit(MSG.C_ATTENTION, { kind, message, url: location.href });
+  }
+
+  async function waitWhilePaused() {
+    while (S.paused && !S.stop) await U.sleep(500);
+    if (S.stop) throw new Abort('stopped', 'Stopped by user');
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Session / page checks
+   *
+   * Detecting "is this browser logged in" is harder than it looks, and getting
+   * it wrong in the strict direction is worse than getting it wrong in the
+   * lenient direction:
+   *
+   *   - `li_at`, the actual session cookie, is HttpOnly. document.cookie never
+   *     contains it. Requiring it reports "not logged in" for every valid
+   *     session, which blocks the run before it makes a single request.
+   *   - `JSESSIONID` is readable, but LinkedIn issues one to logged-out
+   *     visitors too, so its presence proves nothing on its own.
+   *   - The rendered page is the reliable signal: logged-out LinkedIn shows a
+   *     sign-in form or a Join now / Sign in nav, and logged-in LinkedIn shows
+   *     the member chrome.
+   *
+   * So the gate below refuses only when LinkedIn has actually put us on an
+   * auth wall or is showing a sign-in call to action. Anything ambiguous is
+   * allowed through: the cost of a false positive is one request that comes
+   * back 401 and is handled properly there, while the cost of a false negative
+   * is the user staring at a login banner they cannot clear.
+   * ------------------------------------------------------------------ */
+
+  /** A security check. Never solved here — the run pauses and hands the tab back. */
+  const onChallengePage = (pathname) => /^\/checkpoint\//.test(pathname || location.pathname);
+
+  /** A sign-in / join wall. Different from a challenge: this one needs a login. */
+  const onLoginPage = (pathname) => /^\/(uas\/|authwall|login|signup)/.test(pathname || location.pathname);
+
+  const onAuthWall = (pathname) => onChallengePage(pathname) || onLoginPage(pathname);
+
+  function signInCtaPresent() {
+    try {
+      if (document.querySelector('form.login__form, form[action*="login-submit"], .authwall-join-form, .authwall')) {
+        return true;
+      }
+      // The logged-out public profile chrome offers both of these together.
+      const nav = document.querySelector('header, nav');
+      const t = nav ? nav.textContent || '' : '';
+      return /\bjoin now\b/i.test(t) && /\bsign in\b/i.test(t);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function memberChromePresent() {
+    try {
+      return !!document.querySelector(
+        '#global-nav, .global-nav__me, .global-nav__me-photo, [data-control-name="identity_welcome_message"], ' +
+          'img.global-nav__me-photo, [data-test-global-nav]'
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * Returns a verdict *and* the signal that produced it, so a failure says
+   * something more useful than "log in first" when the user already has.
+   */
+  function sessionState() {
+    const c = VY.sessionCookies(document.cookie);
+
+    if (onChallengePage()) return { ok: false, why: 'LinkedIn is showing a security check.' };
+    if (onLoginPage()) return { ok: false, why: 'LinkedIn redirected this tab to its sign-in page.' };
+    if (signInCtaPresent()) {
+      return { ok: false, why: 'This page is showing LinkedIn\'s signed-out view (Join now / Sign in).' };
+    }
+
+    if (c.liAt) return { ok: true, why: 'li_at cookie visible' };
+    if (memberChromePresent()) return { ok: true, why: 'signed-in page chrome' };
+    // li_at is HttpOnly, so this is the normal healthy case: a JSESSIONID we
+    // can read, and no sign of a logged-out page.
+    if (c.csrf) return { ok: true, why: 'JSESSIONID present, no signed-out markers' };
+
+    return { ok: false, why: 'No LinkedIn cookies in this browser at all.' };
+  }
+
+  const isLoggedIn = () => sessionState().ok;
+
+  /** The `CHALLENGE` marker LinkedIn returns in a JSON body instead of a page. */
+  function looksLikeChallenge(text) {
+    if (!text) return false;
+    return (
+      /"status"\s*:\s*"?CHALLENGE"?/i.test(text) ||
+      /"challengeUrl"\s*:/i.test(text) ||
+      /checkpoint\/challenge/i.test(text)
+    );
+  }
+
+  const CHALLENGE_MSG =
+    'LinkedIn is asking for a security check. Open the tab, complete it yourself, then press Resume. ' +
+    'Nothing here will try to solve it.';
+
+  const LOGIN_MSG = 'Log into LinkedIn in this tab, then press Resume.';
+
+  /* ------------------------------------------------------------------ *
+   * Rate-limited fetch
+   *
+   * One limiter for the whole run, so the 3 s floor holds across strategies
+   * and passes rather than per call site. The session counter is checked here
+   * too — it is the only place every request funnels through.
+   * ------------------------------------------------------------------ */
+
+  /** Countdown that logs progress and can be cut short by Stop. */
+  async function coolOff(ms, why) {
+    const until = Date.now() + ms;
+    let left = ms;
+    while (left > 0) {
+      if (S.stop) throw new Abort('stopped', 'Stopped by user');
+      log('warn', `${why} — waiting ${Math.ceil(left / 1000)}s...`);
+      await U.sleep(Math.min(10000, left));
+      left = until - Date.now();
+    }
+  }
+
+  function spendRequest() {
+    S.requests++;
+    if (S.requests % 10 === 0) emit(MSG.C_REQUESTS, { requests: S.requests });
+    if (S.requests > L.SESSION_MAX_REQUESTS) {
+      throw new Abort(
+        'session_limit',
+        `Session request budget reached (${L.SESSION_MAX_REQUESTS}). Stopping cleanly with everything collected.`
+      );
+    }
+  }
+
+  /**
+   * A single GET, rate-limited, with LinkedIn's specific failure modes.
+   *
+   *   429  standard rate limit  -> cool off 3 min, retry up to MAX_RETRIES
+   *   999  LinkedIn's own block -> never retried into; pause and hand back
+   *   403  usually a dead CSRF token or a rotated endpoint -> fail fast
+   *   redirect to /checkpoint   -> pause and hand back
+   */
+  async function apiGet(url, opts) {
+    const { retries = L.MAX_RETRIES, expectJson = true, voyager = false } = opts || {};
+    let attempt = 0;
+    let pauses = 0;
+
+    for (;;) {
+      await waitWhilePaused();
+      if (S.stop) throw new Abort('stopped', 'Stopped by user');
+
+      if (onAuthWall()) {
+        if (++pauses > 6) throw new Error('the tab did not get past LinkedIn\'s auth page');
+        if (onChallengePage()) requireAttention('challenge', CHALLENGE_MSG);
+        else requireAttention('login', LOGIN_MSG);
+        await waitWhilePaused();
+        continue;
+      }
+
+      await limiter.wait();
+      spendRequest();
+
+      let res;
+      try {
+        res = await fetch(url, {
+          method: 'GET',
+          credentials: 'include',
+          headers: voyager ? VY.headers(document.cookie) : { accept: 'text/html,application/xhtml+xml' },
+          redirect: 'follow'
+        });
+      } catch (err) {
+        if (attempt >= retries) throw new Error(`Network error: ${err.message}`);
+        attempt++;
+        await coolOff(L.BACKOFF_MS * attempt, `Network error (${err.message})`);
+        continue;
+      }
+
+      // A follow-through to the checkpoint flow is the clearest challenge
+      // signal there is — clearer than anything in the body.
+      let landed = '';
+      try {
+        landed = new URL(res.url).pathname;
+      } catch (_) {
+        /* opaque URL; fall through to the body checks */
+      }
+      if (landed && onAuthWall(landed)) {
+        if (++pauses > 6) throw new Error('redirected to an auth page repeatedly');
+        if (onChallengePage(landed)) requireAttention('challenge', CHALLENGE_MSG);
+        else requireAttention('login', LOGIN_MSG);
+        await waitWhilePaused();
+        continue;
+      }
+
+      /*
+       * 999 is LinkedIn's own non-standard block response. Retrying into it
+       * is what turns a soft throttle into a restriction, so it is never
+       * retried automatically — the run pauses and waits for a human.
+       */
+      if (res.status === 999) {
+        if (++pauses > 3) throw new Error('HTTP 999 — LinkedIn is refusing requests');
+        requireAttention(
+          'rate-limit',
+          'LinkedIn returned HTTP 999 — it is refusing automated requests from this session. ' +
+            'Leave the tab idle for a while, browse normally for a few minutes, then press Resume. ' +
+            'Everything collected so far is kept.'
+        );
+        await waitWhilePaused();
+        continue;
+      }
+
+      if (res.status === 429) {
+        if (attempt >= retries) throw new Error(`Rate limited (HTTP 429) after ${retries} retries`);
+        attempt++;
+        await coolOff(L.RATE_LIMIT_PAUSE_MS, 'Rate limited (HTTP 429)');
+        continue;
+      }
+
+      if (res.status === 401 || res.status === 403) {
+        const body = await res.text().catch(() => '');
+        if (looksLikeChallenge(body)) {
+          if (++pauses > 6) throw new Error('challenge response did not clear');
+          requireAttention('challenge', CHALLENGE_MSG);
+          await waitWhilePaused();
+          continue;
+        }
+        /*
+         * 401 means the session was rejected outright. 403 with no readable
+         * JSESSIONID means the csrf-token header went out empty, which is the
+         * same problem wearing a different number. Either way it is auth, not
+         * a rotated endpoint — asking the user to re-check their login is the
+         * useful move.
+         */
+        const sess = sessionState();
+        if (res.status === 401 || !sess.ok || !VY.csrfFromCookie(document.cookie)) {
+          if (++pauses > 6) throw new Error(`not authenticated (HTTP ${res.status})`);
+          requireAttention('login', `${LOGIN_MSG} (HTTP ${res.status} — ${sess.why})`);
+          await waitWhilePaused();
+          continue;
+        }
+        // Authenticated and not challenged: the endpoint or the request shape
+        // has moved. Retrying cannot fix that — fail fast so the caller falls
+        // through to the next strategy.
+        throw new Error(`HTTP ${res.status} (endpoint or request shape may have changed — see ENDPOINTS.md)`);
+      }
+
+      if (res.status === 404) throw new Error('HTTP 404 (not found, removed, or not visible to you)');
+
+      if (!res.ok) {
+        if (res.status < 500) throw new Error(`HTTP ${res.status} (endpoint may have changed)`);
+        if (attempt >= retries) throw new Error(`HTTP ${res.status}`);
+        attempt++;
+        await coolOff(L.BACKOFF_MS * attempt, `HTTP ${res.status}`);
+        continue;
+      }
+
+      const text = await res.text();
+      if (looksLikeChallenge(text)) {
+        if (++pauses > 6) throw new Error('challenge response did not clear');
+        requireAttention('challenge', CHALLENGE_MSG);
+        await waitWhilePaused();
+        continue;
+      }
+      if (!expectJson) return text;
+      try {
+        return JSON.parse(text);
+      } catch (_) {
+        throw new Error('Unexpected non-JSON response (endpoint may have changed)');
+      }
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Voyager request wrapper
+   * ------------------------------------------------------------------ */
+  function fillTemplate(v, vars) {
+    if (typeof v === 'string') {
+      return v.replace(/\{(\w+)\}/g, (m, k) => (vars[k] === undefined || vars[k] === null ? m : String(vars[k])));
+    }
+    if (Array.isArray(v)) return v.map((x) => fillTemplate(x, vars));
+    if (v && typeof v === 'object') {
+      const out = {};
+      for (const k of Object.keys(v)) out[k] = fillTemplate(v[k], vars);
+      return out;
+    }
+    return v;
+  }
+
+  /** Assembles a Voyager URL from a CFG block, or null when it isn't configured. */
+  function voyagerUrl(spec, vars) {
+    if (!spec || !spec.enabled || !spec.path) return null;
+    const path = fillTemplate(spec.path, vars);
+    const qs = VY.restliQuery(fillTemplate(spec.params || {}, vars));
+    return CFG.voyagerBase + (path.charAt(0) === '/' ? path : '/' + path) + (qs ? '?' + qs : '');
+  }
+
+  /**
+   * A Voyager GET, resolved out of the normalized envelope.
+   *
+   * Returns `{ raw, data }` — `raw` keeps `included[]` so a caller can fall
+   * back to scanning by `$type` when the `data` graph has changed shape,
+   * which is what actually breaks first.
+   */
+  async function voyagerGet(spec, vars, opts) {
+    const url = voyagerUrl(spec, vars);
+    if (!url) throw new Error('endpoint not configured');
+    const raw = await apiGet(url, Object.assign({ voyager: true }, opts));
+    const resolved = VY.resolveNormalized(raw, { withMeta: true });
+    if (resolved.truncated) {
+      log('warn', 'A response was larger than the resolver budget — some nested detail was left unresolved.');
+    }
+    return { raw, data: resolved.value };
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Strategy B plumbing — payloads embedded in a server-rendered page
+   *
+   * LinkedIn ships the data its React app needs inside hidden <code> blocks.
+   * Nothing below keys off the block ids (they are per-response GUIDs) or off
+   * a payload path: every <code> is tried, whatever parses as JSON is kept,
+   * and the `included[]` arrays are merged into one pool to read by type.
+   * That makes this the strategy that survives an API change untouched.
+   * ------------------------------------------------------------------ */
+  function payloadsFromRoot(root) {
+    const out = [];
+    let nodes;
+    try {
+      nodes = root.querySelectorAll('code');
+    } catch (_) {
+      return out;
+    }
+    for (const el of nodes) {
+      const t = (el.textContent || '').trim();
+      if (t.length < 2) continue;
+      const c = t.charAt(0);
+      if (c !== '{' && c !== '[') continue;
+      try {
+        out.push(JSON.parse(t));
+      } catch (_) {
+        /* datalet blocks and non-JSON payloads are expected here */
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Parses fetched HTML without loading a single subresource or running a
+   * script — DOMParser builds an inert document, which is the whole reason
+   * this is safe to point at arbitrary markup.
+   */
+  function payloadsFromHtml(html) {
+    try {
+      return payloadsFromRoot(new DOMParser().parseFromString(html, 'text/html'));
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /** One pooled envelope, so byType() can see every entity the page shipped. */
+  function mergePayloads(list) {
+    const included = [];
+    for (const p of list) {
+      if (!p || typeof p !== 'object') continue;
+      if (Array.isArray(p.included)) included.push(...p.included);
+      if (p.data && Array.isArray(p.data.included)) included.push(...p.data.included);
+    }
+    return { data: {}, included };
+  }
+
+  async function fetchPagePayloads(url) {
+    const html = await apiGet(url, { expectJson: false });
+    return mergePayloads(payloadsFromHtml(html));
+  }
+
+  /*
+   * Entities pulled straight out of `included[]` are *flat*: their nested
+   * media, actor and social counts are still `*`-prefixed URN references
+   * pointing elsewhere in the same pool. Mapping one without resolving it
+   * first yields a post with no images, no video and no counts — which looks
+   * exactly like a post that genuinely had none. Everything read by type goes
+   * through here first.
+   */
+  function resolveAgainst(pool, entity, index) {
+    if (!entity || typeof entity !== 'object') return entity;
+    if (typeof entity.entityUrn !== 'string') return entity;
+    return VY.resolveEntity(pool, entity.entityUrn, { index: index || VY.buildIndex(pool) }) || entity;
+  }
+
+  /** Every entity of a type in a pool, each resolved against that pool. */
+  function resolvedOfType(pool, match) {
+    const index = VY.buildIndex(pool);
+    return VY.byType(pool, match).map((e) => resolveAgainst(pool, e, index));
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Entity readers
+   *
+   * LinkedIn wraps almost every string in one of several envelopes and moves
+   * between them across model versions, so nothing reads a field directly.
+   * ------------------------------------------------------------------ */
+
+  /** Unwraps TextViewModel, AttributedText, localized maps and bare strings. */
+  function textOf(v, depth) {
+    depth = depth || 0;
+    if (v == null || depth > 6) return '';
+    if (typeof v === 'string') return v;
+    if (typeof v === 'number') return String(v);
+    if (Array.isArray(v)) return v.map((x) => textOf(x, depth + 1)).filter(Boolean).join(' ');
+    if (typeof v !== 'object') return '';
+
+    if (typeof v.text === 'string') return v.text;
+    if (typeof v.rawText === 'string') return v.rawText;
+    if (typeof v.defaultLocalizedName === 'string') return v.defaultLocalizedName;
+    if (typeof v.name === 'string') return v.name;
+    if (v.text && typeof v.text === 'object') return textOf(v.text, depth + 1);
+    if (v.localized && typeof v.localized === 'object') {
+      const vals = Object.values(v.localized);
+      if (vals.length) return textOf(vals[0], depth + 1);
+    }
+    if (v.attributedText) return textOf(v.attributedText, depth + 1);
+    return '';
+  }
+
+  const num = (v) => (typeof v === 'number' && isFinite(v) ? v : null);
+
+  /** "Mar 2019 – Present" from a Rest.li DateRange. */
+  function dateRangeText(r) {
+    if (!r || typeof r !== 'object') return '';
+    const MONTHS = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const one = (d) => {
+      if (!d || typeof d !== 'object') return '';
+      const y = d.year ? String(d.year) : '';
+      const m = d.month && MONTHS[d.month] ? MONTHS[d.month] : '';
+      return [m, y].filter(Boolean).join(' ');
+    };
+    const a = one(r.start);
+    const b = one(r.end);
+    if (a && b) return `${a} – ${b}`;
+    if (a) return `${a} – Present`;
+    return b || '';
+  }
+
+  /**
+   * The creation time encoded in an activity id.
+   *
+   * LinkedIn's ids are snowflake-shaped: the high bits are a millisecond
+   * epoch. It is the only way to date a post harvested from the DOM, where
+   * the page shows nothing but "2w". Range-checked before use, so if the id
+   * format ever changes this returns null instead of a nonsense date.
+   */
+  function timestampFromActivityId(id) {
+    if (!id || !/^\d+$/.test(String(id))) return null;
+    let ms;
+    try {
+      ms = Number(BigInt(String(id)) >> 22n);
+    } catch (_) {
+      return null;
+    }
+    const floor = Date.UTC(2010, 0, 1);
+    const ceil = Date.now() + 86400000;
+    return ms > floor && ms < ceil ? ms : null;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Media
+   *
+   * An update carries far more images than the post attached. The author's
+   * avatar hangs off `actor`, a reshared post brings its own author's avatar,
+   * articles carry a publisher logo, and the social summary carries commenter
+   * photos. Walking the whole graph for anything with `artifacts` collected all
+   * of them, which meant:
+   *
+   *   - every post folder opened with the poster's profile picture as
+   *     media_01.jpg, ahead of the actual photos;
+   *   - a text-only post came back with one image, so classifyPost() filed it
+   *     as an image post — wrong `type` in posts.csv, and a junk file on disk;
+   *   - media_count was inflated on every single row;
+   *   - the packager re-downloaded the same avatar once per post.
+   *
+   * So media is collected from the *content* subtrees only. The skip list is
+   * keyed on the containers LinkedIn hangs identity and chrome off, which move
+   * far less often than the model class names do. `resharedUpdate` is
+   * deliberately absent: a repost's media is the original's media, and only its
+   * `actor` needs skipping — which the walk does at any depth.
+   * ------------------------------------------------------------------ */
+  const CHROME_KEYS = new Set([
+    // who posted / who reacted — never post content
+    'actor', 'author', 'commenter', 'miniProfile', 'miniCompany',
+    'profilePicture', 'nonEntityProfilePicture', 'profilePictureDisplayImage',
+    'companyLogo', 'entityLogo', 'logo',
+    // engagement furniture
+    'socialDetail', 'socialProof', 'socialProofText', 'socialActivityCounts',
+    'comments', 'comment', 'likes', 'reactions',
+    // page chrome and telemetry
+    'header', 'footer', 'updateMetadata', 'trackingData',
+    'contextualHeader', 'contextualDescription',
+    'navigationBar', 'controlMenu', 'overflowActions'
+  ]);
+
+  /** Video posters are recorded by videosFrom(); they are not separate images. */
+  const IMAGE_SKIP_KEYS = new Set([...CHROME_KEYS, 'thumbnail', 'posterImage']);
+
+  /**
+   * VY.collect, but it refuses to descend into the containers above.
+   *
+   * A `*`-prefixed key names the same thing as its resolved twin, so both
+   * forms are tested against the skip list.
+   */
+  function collectContent(node, pred, opts) {
+    const o = Object.assign({ limit: Infinity, maxNodes: 60000, skip: CHROME_KEYS }, opts || {});
+    const out = [];
+    const seen = new Set();
+    let left = o.maxNodes;
+
+    (function visit(n) {
+      if (out.length >= o.limit || left <= 0) return;
+      if (!n || typeof n !== 'object') return;
+      if (seen.has(n)) return;
+      seen.add(n);
+      left--;
+
+      if (Array.isArray(n)) {
+        for (const v of n) visit(v);
+        return;
+      }
+      try {
+        if (pred(n)) out.push(n);
+      } catch (_) {
+        /* a predicate must never take the walk down with it */
+      }
+      for (const k of Object.keys(n)) {
+        if (o.skip.has(k.charCodeAt(0) === 42 /* '*' */ ? k.slice(1) : k)) continue;
+        visit(n[k]);
+      }
+    })(node);
+
+    return out;
+  }
+
+  /** Every image URL reachable from a node's content, widest artifact per image. */
+  function imagesFrom(node) {
+    const out = [];
+    const seen = new Set();
+    const push = (u) => {
+      if (u && /^https?:/i.test(u) && !seen.has(u)) {
+        seen.add(u);
+        out.push({ type: 'image', url: u });
+      }
+    };
+    const isVectorImage = (n) => Array.isArray(n.artifacts) && (n.rootUrl || n.root);
+    for (const vi of collectContent(node, isVectorImage, { skip: IMAGE_SKIP_KEYS })) {
+      push(VY.vectorImageUrl(vi));
+    }
+    return out;
+  }
+
+  /**
+   * Video, honestly.
+   *
+   * LinkedIn serves adaptive DASH/HLS behind expiring signed URLs. Where a
+   * progressive variant exists it is a plain file and can be downloaded;
+   * where only a manifest exists, the manifest URL is recorded and the
+   * archive gets a note saying why there is no file. There is deliberately no
+   * stream muxer here — it would be a large dependency that ages badly.
+   */
+  function videosFrom(node) {
+    const out = [];
+    const metas = collectContent(
+      node,
+      (n) => Array.isArray(n.progressiveStreams) || Array.isArray(n.adaptiveStreams)
+    );
+
+    for (const m of metas) {
+      const prog = Array.isArray(m.progressiveStreams) ? m.progressiveStreams : [];
+      let best = null;
+      for (const s of prog) {
+        const url =
+          (Array.isArray(s.streamingLocations) && s.streamingLocations[0] && s.streamingLocations[0].url) ||
+          s.url ||
+          null;
+        if (!url || !/^https?:/i.test(url)) continue;
+        const score = s.bitRate || s.width || 0;
+        if (!best || score > best.score) {
+          best = { url, score, width: s.width || null, height: s.height || null, size: s.size || null, mime: s.mediaType || null };
+        }
+      }
+
+      let manifest = null;
+      let protocol = null;
+      for (const s of Array.isArray(m.adaptiveStreams) ? m.adaptiveStreams : []) {
+        const url =
+          (Array.isArray(s.masterPlaylists) && s.masterPlaylists[0] && s.masterPlaylists[0].url) || s.url || null;
+        if (url && /^https?:/i.test(url)) {
+          manifest = url;
+          protocol = s.protocol || s.mediaType || null;
+          break;
+        }
+      }
+
+      if (!best && !manifest) continue;
+      out.push({
+        type: 'video',
+        url: best ? best.url : null,
+        manifestUrl: manifest,
+        protocol,
+        width: best ? best.width : null,
+        height: best ? best.height : null,
+        bytes: best ? best.size : null,
+        mime: best ? best.mime : null,
+        durationMs: num(m.duration) || num(m.durationMs),
+        thumbnail: VY.vectorImageUrl(m.thumbnail) || null,
+        downloadable: !!best
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Whether the update *claims* to carry media, whatever we managed to read.
+   *
+   * A feed-list response routinely declares the component and ships an empty
+   * payload — the image or the stream only materialises on the permalink page.
+   * Such a post used to look finished from every angle: it had body text, it
+   * had its counts, mapUpdate stamped `detailFetched: true`, and classifyPost
+   * called it `text` precisely *because* no media was found. So needsDetail()
+   * said no, the detail pass skipped it, and its photos were never fetched at
+   * all. That is the "media missing on some posts" case.
+   */
+  function declaresMedia(node) {
+    return (
+      collectContent(
+        node,
+        (n) =>
+          !!n.imageComponent ||
+          !!n.linkedInVideoComponent ||
+          !!n.videoComponent ||
+          !!n.externalVideoComponent ||
+          !!n.videoPlayMetadata ||
+          !!n.documentComponent ||
+          !!n.carouselComponent ||
+          !!n.celebrationComponent ||
+          Array.isArray(n.images) ||
+          Array.isArray(n.progressiveStreams) ||
+          Array.isArray(n.adaptiveStreams),
+        { limit: 1 }
+      ).length > 0
+    );
+  }
+
+  /** Avatars, logos and placeholders, by CDN path. Shared by both DOM readers. */
+  const NON_CONTENT_IMAGE =
+    /profile-displayphoto|profile-framedphoto|profile-displaybackgroundimage|company-logo|ghost-person|ghost-company/;
+
+  /**
+   * Media read straight out of a fetched permalink page's markup.
+   *
+   * The detail pass reads the embedded JSON payloads, and when LinkedIn does
+   * not server-render those for a given post there is nothing to map — the
+   * fetch "succeeded" and produced no media. The rendered markup is still
+   * right there in the same response, so read it rather than giving up.
+   */
+  function mediaFromHtml(html) {
+    let doc;
+    try {
+      doc = new DOMParser().parseFromString(html, 'text/html');
+    } catch (_) {
+      return [];
+    }
+    const out = [];
+    const seen = new Set();
+    const push = (m) => {
+      const key = m.url || m.manifestUrl;
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      out.push(m);
+    };
+
+    try {
+      // og:image is the post's own image, server-rendered and stable for years.
+      for (const el of doc.querySelectorAll('meta[property="og:image"], meta[name="og:image"]')) {
+        const u = el.getAttribute('content') || '';
+        if (/^https?:/i.test(u) && !NON_CONTENT_IMAGE.test(u)) push({ type: 'image', url: u });
+      }
+      for (const img of doc.querySelectorAll('img')) {
+        const u = img.getAttribute('src') || img.getAttribute('data-delayed-url') || img.getAttribute('data-li-src') || '';
+        if (!/licdn\.com\/dms\/image/.test(u) || NON_CONTENT_IMAGE.test(u)) continue;
+        push({ type: 'image', url: u });
+      }
+      for (const el of doc.querySelectorAll('[data-sources]')) {
+        try {
+          for (const s of JSON.parse(el.getAttribute('data-sources') || '[]')) {
+            if (!s || !s.src || !/^https?:/i.test(s.src)) continue;
+            const adaptive = /\.m3u8|\.mpd/.test(s.src);
+            push({
+              type: 'video',
+              url: adaptive ? null : s.src,
+              manifestUrl: adaptive ? s.src : null,
+              protocol: s.type || null,
+              downloadable: !adaptive
+            });
+          }
+        } catch (_) {
+          /* attribute shape changed; the other readers still ran */
+        }
+      }
+      for (const v of doc.querySelectorAll('video[src], video source[src]')) {
+        const u = v.getAttribute('src') || '';
+        if (/^https?:/i.test(u)) push({ type: 'video', url: u, downloadable: true });
+      }
+    } catch (_) {
+      /* a selector the parser dislikes must not lose what was already read */
+    }
+    return out;
+  }
+
+  /** Carousel / PDF posts. `transcribedDocumentUrl` is the flattened PDF. */
+  function documentsFrom(node) {
+    const out = [];
+    const docs = collectContent(
+      node,
+      (n) =>
+        typeof n.transcribedDocumentUrl === 'string' ||
+        (typeof n.manifestUrl === 'string' && (n.totalPageCount != null || n.title != null))
+    );
+    for (const d of docs) {
+      const url = typeof d.transcribedDocumentUrl === 'string' ? d.transcribedDocumentUrl : null;
+      out.push({
+        type: 'document',
+        url: url && /^https?:/i.test(url) ? url : null,
+        manifestUrl: typeof d.manifestUrl === 'string' ? d.manifestUrl : null,
+        title: textOf(d.title) || '',
+        pages: num(d.totalPageCount),
+        downloadable: !!(url && /^https?:/i.test(url))
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Post kind, decided from the shapes present rather than from a $type
+   * whitelist — LinkedIn renames model classes far more often than it changes
+   * what a video or a document looks like.
+   */
+  function classifyPost(node, media) {
+    // Scoped like the media readers: an actor's own title/subtitle pair used to
+    // be enough to make a plain text post look like an article card.
+    const has = (pred) => collectContent(node, pred, { limit: 1 }).length > 0;
+
+    if (has((n) => n.resharedUpdate || n['*resharedUpdate'] || n.reshareContext)) return 'repost';
+    if (media.some((m) => m.type === 'document')) return 'document';
+    if (media.some((m) => m.type === 'video')) return 'video';
+    if (has((n) => Array.isArray(n.pollOptions) || n.pollSummary || n.pollComponent)) return 'poll';
+    // An article card is a link-out: a navigation target plus a headline.
+    // `navigationContext` alone is far too common to key off.
+    if (
+      has(
+        (n) =>
+          !!n.articleComponent ||
+          !!(n.navigationContext && n.navigationContext.actionTarget && n.title != null && (n.subtitle != null || n.largeImage != null))
+      )
+    ) {
+      return 'article';
+    }
+    if (media.some((m) => m.type === 'image')) return 'image';
+    return 'text';
+  }
+
+  /**
+   * Reaction counts by type.
+   *
+   * The per-type split rides along with the post on some responses and not
+   * others. Unknown reaction names are carried through rather than dropped,
+   * so a new one shows up in the export instead of vanishing.
+   */
+  function reactionsFrom(node) {
+    const byType = {};
+    let total = null;
+
+    for (const s of VY.collect(node, (n) => Array.isArray(n.reactionTypeCounts))) {
+      for (const r of s.reactionTypeCounts) {
+        const kind = String(r.reactionType || r.type || '').toUpperCase();
+        const c = num(r.count);
+        if (kind && c != null) byType[kind] = (byType[kind] || 0) + c;
+      }
+      if (total == null) total = num(s.numLikes) ?? num(s.numReactions) ?? null;
+    }
+
+    if (total == null) {
+      for (const s of VY.collect(node, (n) => n.numLikes != null || n.numReactions != null)) {
+        total = num(s.numLikes) ?? num(s.numReactions);
+        if (total != null) break;
+      }
+    }
+    const summed = Object.values(byType).reduce((a, b) => a + b, 0);
+    if (total == null && summed) total = summed;
+    return { total, byType };
+  }
+
+  function socialCountsFrom(node) {
+    const r = reactionsFrom(node);
+    let comments = null;
+    let reposts = null;
+    for (const s of VY.collect(node, (n) => n.numComments != null || n.numShares != null)) {
+      if (comments == null) comments = num(s.numComments);
+      if (reposts == null) reposts = num(s.numShares);
+      if (comments != null && reposts != null) break;
+    }
+    return { reactions: r.total, reactionsByType: r.byType, comments, reposts };
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Mapping — profile
+   * ------------------------------------------------------------------ */
+  /** Reads a field that may be inline or still a `*`-prefixed reference. */
+  const linked = (n, key) => (n[key] !== undefined ? n[key] : n['*' + key]);
+
+  function mapProfileEntity(rawProfile, pool) {
+    if (!rawProfile) return null;
+    const index = VY.buildIndex(pool || {});
+    // The profile entity itself has to be resolved before its picture, banner
+    // and geo can be read — they are all references in the flat form.
+    const p = resolveAgainst(pool || {}, rawProfile, index);
+
+    const first = textOf(p.firstName);
+    const last = textOf(p.lastName);
+    const fullName = [first, last].filter(Boolean).join(' ') || textOf(p.name) || textOf(p.title);
+
+    const geo =
+      textOf(p.geoLocationName) ||
+      textOf(p.locationName) ||
+      textOf(p.geoLocation && (p.geoLocation.geo || p.geoLocation)) ||
+      textOf(p.location);
+
+    let photo = null;
+    let banner = null;
+    const pic = p.profilePicture || p.picture;
+    if (pic) {
+      photo =
+        VY.vectorImageUrl(pic.displayImageReference && pic.displayImageReference.vectorImage) ||
+        VY.vectorImageUrl(pic.displayImage) ||
+        VY.vectorImageUrl(pic.vectorImage) ||
+        (imagesFrom(pic)[0] || {}).url ||
+        null;
+    }
+    const bg = p.backgroundImage || p.backgroundPicture || p.backgroundCoverImage;
+    if (bg) {
+      banner =
+        VY.vectorImageUrl(bg.displayImageReference && bg.displayImageReference.vectorImage) ||
+        VY.vectorImageUrl(bg.vectorImage) ||
+        (imagesFrom(bg)[0] || {}).url ||
+        null;
+    }
+
+    return {
+      publicId: p.publicIdentifier || '',
+      profileUrn: p.entityUrn || null,
+      fullName,
+      firstName: first,
+      lastName: last,
+      headline: textOf(p.headline),
+      location: geo,
+      industry: textOf(p.industryName) || textOf(p.industry),
+      about: textOf(p.summary) || textOf(p.about),
+      followers: num(p.followerCount) ?? num(p.followersCount),
+      connections: num(p.connectionsCount) ?? num(p.connections),
+      photoUrl: photo,
+      bannerUrl: banner,
+      experience: readExperience(pool || p, index),
+      education: readEducation(pool || p, index),
+      skills: readSkills(pool || p),
+      currentPosition: null, // filled in below
+      profileUrl: p.publicIdentifier ? U.profileUrl(p.publicIdentifier) : null,
+      scrapedAt: new Date().toISOString()
+    };
+  }
+
+  /*
+   * Position and Education entities are matched on the fields they carry
+   * rather than on `$type`: LinkedIn runs two profile models side by side
+   * (`…voyager.identity.profile.Position` and `…voyager.dash.identity.profile.Position`)
+   * and moves profiles between them, but a role has always been a title plus
+   * a company and a school has always been a name.
+   */
+  function readExperience(pool, index) {
+    const rows = [];
+    const seen = new Set();
+    const isPosition = (x) =>
+      x.title != null &&
+      (x.companyName != null || x.company != null || x['*company'] != null || x.companyUrn != null);
+
+    for (const raw of VY.collect(pool, isPosition)) {
+      const n = resolveAgainst(pool, raw, index);
+      const title = textOf(n.title);
+      const company = textOf(n.companyName) || textOf(linked(n, 'company'));
+      if (!title && !company) continue;
+
+      const key = `${title}|${company}|${JSON.stringify(n.dateRange || n.timePeriod || '')}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const companyRef = n.companyUrn || rawUrnOf(raw, 'company');
+      rows.push({
+        title,
+        company,
+        companyUrl: companyRef ? `${ORIGIN}/company/${VY.urnId(companyRef)}/` : null,
+        location: textOf(n.locationName) || textOf(n.geoLocationName) || '',
+        dates: dateRangeText(n.dateRange || n.timePeriod),
+        current: !!((n.dateRange && !n.dateRange.end) || (n.timePeriod && !n.timePeriod.endDate)),
+        description: textOf(n.description)
+      });
+    }
+    return rows;
+  }
+
+  /** The raw URN behind a `*`-prefixed key, when there is one. */
+  function rawUrnOf(node, key) {
+    const v = node['*' + key];
+    return typeof v === 'string' && VY.isUrn(v) ? v : null;
+  }
+
+  function readEducation(pool, index) {
+    const rows = [];
+    const seen = new Set();
+    const isEducation = (x) =>
+      x.schoolName != null || (x.degreeName != null && (x.school != null || x['*school'] != null));
+
+    for (const raw of VY.collect(pool, isEducation)) {
+      const n = resolveAgainst(pool, raw, index);
+      const school = textOf(n.schoolName) || textOf(linked(n, 'school'));
+      if (!school) continue;
+
+      const key = `${school}|${textOf(n.degreeName)}|${textOf(n.fieldOfStudy)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push({
+        school,
+        degree: textOf(n.degreeName),
+        field: textOf(n.fieldOfStudy),
+        dates: dateRangeText(n.dateRange || n.timePeriod),
+        description: textOf(n.description)
+      });
+    }
+    return rows;
+  }
+
+  function readSkills(pool) {
+    const out = [];
+    const seen = new Set();
+    for (const n of VY.collect(pool, (x) => typeof x.$type === 'string' && /\.Skill$/.test(x.$type))) {
+      const name = textOf(n.name);
+      if (name && !seen.has(name)) {
+        seen.add(name);
+        out.push(name);
+      }
+    }
+    return out;
+  }
+
+  function withCurrentPosition(profile) {
+    if (!profile) return profile;
+    const cur = (profile.experience || []).find((e) => e.current) || (profile.experience || [])[0] || null;
+    profile.currentPosition = cur
+      ? { title: cur.title, company: cur.company, dates: cur.dates, location: cur.location }
+      : null;
+    return profile;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Mapping — posts
+   * ------------------------------------------------------------------ */
+
+  /**
+   * Post body text: the longest text-bearing node under the update's content.
+   *
+   * Scoped for the same reason the media readers are — an author's headline is
+   * a `description` too, and on a short post it is the *longer* string, so the
+   * unscoped walk handed back the poster's job title as the post body.
+   */
+  function postTextFrom(node) {
+    let best = '';
+    for (const n of collectContent(
+      node,
+      (x) => x.commentary || x.text != null || x.attributedText != null || x.description != null
+    )) {
+      const t = textOf(n.commentary) || textOf(n.text) || textOf(n.attributedText) || textOf(n.description);
+      if (t && t.length > best.length) best = t;
+    }
+    return best;
+  }
+
+  function mapUpdate(node) {
+    /*
+     * The entity's own URN wins over a deep scan.
+     *
+     * A repost carries two activity URNs — its own and the one it resharded —
+     * and findUrns returns them in walk order, so the deep scan can file the
+     * repost under the *original* post's id. That yields a post whose permalink
+     * points at somebody else's content, and it collides with the original if
+     * that was collected too. The update's entityUrn is unambiguous:
+     * urn:li:fsd_update:(urn:li:activity:<own>,FEED,EMPTY).
+     */
+    const urns = VY.findUrns(node, 'urn:li:activity:');
+    const activityId =
+      VY.activityId(node.entityUrn || node['*entityUrn'] || '') || (urns.length ? VY.activityId(urns[0]) : null);
+    if (!activityId) return null;
+    const ownUrn = urns.find((u) => VY.activityId(u) === activityId) || `urn:li:activity:${activityId}`;
+
+    const media = []
+      .concat(documentsFrom(node))
+      .concat(videosFrom(node))
+      .concat(imagesFrom(node));
+
+    // A video's own poster frame is not a separate media item.
+    const posters = new Set(media.filter((m) => m.type === 'video').map((m) => m.thumbnail).filter(Boolean));
+    const cleaned = media.filter((m) => !(m.type === 'image' && posters.has(m.url)));
+
+    const social = socialCountsFrom(node);
+    const type = classifyPost(node, cleaned);
+
+    let publishedAt = null;
+    for (const n of VY.collect(node, (x) => x.createdAt != null || x.publishedAt != null || x.firstPublishedAt != null)) {
+      publishedAt = num(n.createdAt) || num(n.publishedAt) || num(n.firstPublishedAt);
+      if (publishedAt) break;
+    }
+    const derived = timestampFromActivityId(activityId);
+    const timestampSource = publishedAt ? 'api' : derived ? 'derived-from-urn' : 'unknown';
+    const incomplete = cleaned.length === 0 && declaresMedia(node);
+
+    return {
+      activityId,
+      urn: ownUrn,
+      postUrl: U.postUrlFromActivityId(activityId),
+      type,
+      text: postTextFrom(node),
+      publishedAt: publishedAt || derived || null,
+      timestampSource,
+      reactions: social.reactions,
+      reactionsByType: social.reactionsByType,
+      comments: social.comments,
+      reposts: social.reposts,
+      media: cleaned,
+      mediaCount: cleaned.length,
+      // Declared but not delivered: the permalink page still owes us this one.
+      mediaIncomplete: incomplete,
+      detailFetched: !incomplete
+    };
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Profile — three strategies
+   * ------------------------------------------------------------------ */
+  async function getProfile(publicId) {
+    // A — Voyager
+    if (CFG.profile.enabled) {
+      try {
+        const { raw } = await voyagerGet(CFG.profile, { publicId });
+        const p = pickProfileEntity(raw, publicId);
+        if (p) {
+          log('success', 'Profile read from the Voyager API.');
+          return withCurrentPosition(Object.assign(mapProfileEntity(p, raw), { source: 'voyager' }));
+        }
+        log('warn', 'Voyager profile response held no profile entity — falling back.');
+      } catch (err) {
+        if (err instanceof Abort) throw err;
+        log('warn', `Voyager profile failed (${err.message}) — falling back to the rendered page.`);
+      }
+    } else {
+      log('info', 'Voyager profile endpoint is not configured — using the page payload (see ENDPOINTS.md).');
+    }
+
+    // B — the payload the server rendered into the page
+    if (CFG.embeddedJson.enabled) {
+      try {
+        const pool = onProfilePageFor(publicId)
+          ? mergePayloads(payloadsFromRoot(document))
+          : await fetchPagePayloads(U.profileUrl(publicId));
+        const p = pickProfileEntity(pool, publicId);
+        if (p) {
+          log('success', 'Profile read from the embedded page payload.');
+          return withCurrentPosition(Object.assign(mapProfileEntity(p, pool), { source: 'embedded-json' }));
+        }
+        log('warn', 'No profile entity in the page payload — falling back to the DOM.');
+      } catch (err) {
+        if (err instanceof Abort) throw err;
+        log('warn', `Embedded payload read failed (${err.message}) — falling back to the DOM.`);
+      }
+    }
+
+    // C — read the rendered page
+    log('warn', 'Reading the profile off the rendered page. Expect fewer fields.');
+    return withCurrentPosition(profileFromDom(publicId));
+  }
+
+  const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  /**
+   * Whether the tab is already showing this profile.
+   *
+   * `publicId` has been percent-*decoded* by normalisePublicId, while
+   * location.pathname stays encoded — so a non-ASCII slug never matched and the
+   * page was re-fetched over the network even though it was already open,
+   * spending a request from the session budget for nothing. Decode both.
+   */
+  function onProfilePageFor(publicId) {
+    let path = location.pathname;
+    try {
+      path = decodeURIComponent(path);
+    } catch (_) {
+      /* malformed escape; compare the raw form rather than throwing */
+    }
+    return new RegExp(`^/in/${escapeRe(publicId)}/?$`, 'i').test(path);
+  }
+
+  function pickProfileEntity(pool, publicId) {
+    const candidates = VY.byType(pool, /\.Profile$/);
+    if (!candidates.length) return null;
+    const exact = candidates.find(
+      (p) => String(p.publicIdentifier || '').toLowerCase() === String(publicId).toLowerCase()
+    );
+    // Several profiles ride along in a feed payload; the richest one that is
+    // not the target would be the wrong answer, so prefer the exact match and
+    // only fall back to "the one with a headline" when there is no id match.
+    return exact || candidates.find((p) => p.headline || p.firstName) || candidates[0];
+  }
+
+  /**
+   * Best-effort profile read straight off the rendered page.
+   *
+   * og: meta tags are the durable part — server-rendered and stable for
+   * years. Class names are not, so every DOM lookup below is a list of
+   * candidates and the structural fallbacks come last.
+   */
+  function profileFromDom(publicId) {
+    const meta = (sel, attr) => {
+      const el = document.querySelector(sel);
+      return el ? el.getAttribute(attr || 'content') || '' : '';
+    };
+    const pick = (sels) => {
+      for (const s of sels) {
+        try {
+          const el = document.querySelector(s);
+          const t = el && (el.textContent || '').trim();
+          if (t) return t;
+        } catch (_) {
+          /* a selector may be invalid on an older Chrome; keep going */
+        }
+      }
+      return '';
+    };
+
+    const ogTitle = meta('meta[property="og:title"]');
+    const ogDesc = meta('meta[property="og:description"]');
+
+    const name =
+      pick(['main h1', 'h1.text-heading-xlarge', 'h1']) || ogTitle.split(' - ')[0].split(' | ')[0].trim();
+
+    const headline =
+      pick([
+        '.text-body-medium.break-words',
+        'main h1 + div',
+        '[data-generated-suggestion-target] ~ div .text-body-medium'
+      ]) || (ogTitle.includes(' - ') ? ogTitle.split(' - ').slice(1).join(' - ').split(' | ')[0].trim() : '');
+
+    const location = pick([
+      '.text-body-small.inline.t-black--light.break-words',
+      'main .pv-text-details__left-panel .text-body-small',
+      'span.text-body-small:not(.inline-show-more-text)'
+    ]);
+
+    const about = pick([
+      '#about ~ div .inline-show-more-text',
+      'section:has(#about) .display-flex.full-width span[aria-hidden="true"]',
+      '[data-section="summary"]'
+    ]);
+
+    let photo = '';
+    for (const sel of ['img.pv-top-card-profile-picture__image', 'img[class*="profile-photo"]', 'main img[class*="EntityPhoto"]']) {
+      try {
+        const el = document.querySelector(sel);
+        if (el && el.src) {
+          photo = el.src;
+          break;
+        }
+      } catch (_) {
+        /* keep going */
+      }
+    }
+    if (!photo) photo = meta('meta[property="og:image"]');
+
+    let banner = '';
+    for (const sel of ['img[class*="cover-img"]', 'div[class*="profile-background"] img', 'img[class*="background-image"]']) {
+      try {
+        const el = document.querySelector(sel);
+        if (el && el.src) {
+          banner = el.src;
+          break;
+        }
+      } catch (_) {
+        /* keep going */
+      }
+    }
+
+    return {
+      publicId,
+      profileUrn: null,
+      fullName: name,
+      firstName: name.split(' ')[0] || '',
+      lastName: name.split(' ').slice(1).join(' '),
+      headline,
+      location,
+      industry: '',
+      about: about || ogDesc,
+      followers: parseCompact(pick(['main span:has(+ span)', '[class*="follower"]'])),
+      connections: null,
+      photoUrl: photo || null,
+      bannerUrl: banner || null,
+      experience: experienceFromDom(),
+      education: [],
+      skills: [],
+      currentPosition: null,
+      profileUrl: U.profileUrl(publicId),
+      scrapedAt: new Date().toISOString(),
+      source: 'dom'
+    };
+  }
+
+  function parseCompact(s) {
+    if (!s) return null;
+    const m = String(s).replace(/,/g, '').match(/([\d.]+)\s*([KMB])?/i);
+    if (!m) return null;
+    const mult = { k: 1e3, m: 1e6, b: 1e9 }[(m[2] || '').toLowerCase()] || 1;
+    const n = Math.round(parseFloat(m[1]) * mult);
+    return isFinite(n) ? n : null;
+  }
+
+  function experienceFromDom() {
+    const rows = [];
+    let section = null;
+    try {
+      const anchor = document.querySelector('#experience');
+      section = anchor ? anchor.closest('section') : null;
+    } catch (_) {
+      /* ignore */
+    }
+    if (!section) return rows;
+
+    for (const li of section.querySelectorAll('li')) {
+      // LinkedIn renders each field twice — once visible, once for screen
+      // readers. Taking only aria-hidden spans avoids doubling every string.
+      const spans = [...li.querySelectorAll('span[aria-hidden="true"]')]
+        .map((s) => (s.textContent || '').trim())
+        .filter(Boolean);
+      if (!spans.length) continue;
+      rows.push({
+        title: spans[0] || '',
+        company: (spans[1] || '').split('·')[0].trim(),
+        location: spans[3] || '',
+        dates: spans[2] || '',
+        current: /present/i.test(spans[2] || ''),
+        description: spans.slice(4).join(' ')
+      });
+      if (rows.length >= 40) break;
+    }
+    return rows;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Pagination health
+   *
+   * LinkedIn's activity pagination degrades and then stops well before an
+   * account's full history. This tracks that honestly so the popup can say
+   * "LinkedIn stopped returning more" rather than implying the account was
+   * exhausted.
+   * ------------------------------------------------------------------ */
+  class PageTracker {
+    constructor(label) {
+      this.label = label;
+      this.pages = 0;
+      this.yields = [];
+      this.declineStreak = 0;
+      this.warned = false;
+      this.stoppedEarly = false;
+      this.reason = '';
+    }
+
+    /** Returns 'stop' when the page carried nothing new. */
+    record(fresh) {
+      const prev = this.yields.length ? this.yields[this.yields.length - 1] : null;
+      this.pages++;
+      this.yields.push(fresh);
+
+      if (fresh === 0) {
+        this.stoppedEarly = true;
+        this.reason = `${this.label} returned a page with no new posts after ${this.pages} page(s).`;
+        return 'stop';
+      }
+
+      if (prev != null && fresh < prev) this.declineStreak++;
+      else this.declineStreak = 0;
+
+      if (this.declineStreak >= L.DECLINE_WARN_STREAK && !this.warned) {
+        this.warned = true;
+        log(
+          'warn',
+          `Yield is falling off (${this.yields.slice(-4).join(' → ')} per page). LinkedIn usually stops ` +
+            'returning older posts well before an account runs out.'
+        );
+      }
+      return 'continue';
+    }
+
+    summary(collected) {
+      if (this.stoppedEarly) {
+        return `Collected ${collected} posts — LinkedIn stopped returning more.`;
+      }
+      return `Collected ${collected} posts.`;
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Strategy A — Voyager activity feed
+   * ------------------------------------------------------------------ */
+  async function harvestViaVoyager(profile, add) {
+    if (!CFG.posts.enabled) throw new Error('endpoint not configured');
+
+    const tracker = new PageTracker('Voyager feed');
+    S.pagination = tracker; // published now so an abort still reports its page history
+    const size = CFG.posts.pageSize || 20;
+    let start = Number(resumeCursor('voyager') || 0) || 0;
+    let token = resumeCursor('token');
+    if (start || token) log('info', 'Resuming pagination from the saved cursor.');
+
+    while (S.collected < S.cfg.maxPosts) {
+      if (S.stop) throw new Abort('stopped');
+
+      const { raw, data } = await voyagerGet(CFG.posts, {
+        publicId: profile.publicId,
+        profileUrn: profile.profileUrn || '',
+        profileId: profile.profileUrn ? VY.urnId(profile.profileUrn) : '',
+        start,
+        count: size,
+        paginationToken: token || ''
+      });
+
+      // Prefer the resolved element list; fall back to scanning included[]
+      // by type, which survives a change in how `data` links to its elements.
+      // The fallback entities are flat, so they get resolved on the way out.
+      let elements = firstArray(data, ['elements', 'items', 'updates']) || [];
+      if (!elements.length) elements = resolvedOfType(raw, /Update$|UpdateV2$/);
+
+      const before = S.collected;
+      for (const el of elements) {
+        const post = mapUpdate(el);
+        if (post) add(post);
+        if (S.collected >= S.cfg.maxPosts) break;
+      }
+      const fresh = S.collected - before;
+
+      if (tracker.record(fresh) === 'stop') break;
+      pageLog(tracker.pages, 'Page');
+      if (S.collected >= S.cfg.maxPosts) break;
+
+      // Advance the cursor.
+      if (CFG.posts.usePaginationToken) {
+        const next = deepFind(data, 'paginationToken') || deepFind(raw, 'paginationToken');
+        if (!next || next === token) {
+          tracker.stoppedEarly = true;
+          tracker.reason = 'LinkedIn stopped issuing a pagination token.';
+          break;
+        }
+        token = next;
+        emit(MSG.C_CURSOR, { kind: 'token', value: token });
+      } else {
+        const paging = deepFindObject(data, (n) => n.start != null && n.count != null);
+        const total = paging ? num(paging.total) : null;
+        start += size;
+        if (total != null && start >= total) {
+          log('info', `Reached the end of the feed (${total} reported).`);
+          break;
+        }
+        emit(MSG.C_CURSOR, { kind: 'voyager', value: start });
+      }
+
+      await U.sleep(U.randOf(L.PAGE_DELAY));
+    }
+
+    return S.collected > 0;
+  }
+
+  function firstArray(obj, keys) {
+    if (!obj || typeof obj !== 'object') return null;
+    for (const k of keys) if (Array.isArray(obj[k]) && obj[k].length) return obj[k];
+    for (const k of keys) {
+      if (obj.data && Array.isArray(obj.data[k]) && obj.data[k].length) return obj.data[k];
+    }
+    return null;
+  }
+
+  function deepFind(node, key) {
+    const hit = VY.collect(node, (n) => typeof n[key] === 'string' && n[key], { limit: 1 })[0];
+    return hit ? hit[key] : null;
+  }
+
+  const deepFindObject = (node, pred) => VY.collect(node, pred, { limit: 1 })[0] || null;
+
+  /* ------------------------------------------------------------------ *
+   * Strategy B — the activity page's embedded payload
+   *
+   * The server renders the first page of activity into the document. There is
+   * no public offset parameter, so this yields exactly one page — which is
+   * reported as such rather than dressed up as the whole history.
+   * ------------------------------------------------------------------ */
+  async function harvestViaEmbedded(profile, add) {
+    const tracker = new PageTracker('Embedded payload');
+    S.pagination = tracker;
+    const url = U.activityUrl(profile.publicId);
+    const onActivityPage = /\/recent-activity\//.test(location.pathname);
+
+    const pool = onActivityPage ? mergePayloads(payloadsFromRoot(document)) : await fetchPagePayloads(url);
+
+    let updates = resolvedOfType(pool, /Update$|UpdateV2$/);
+    if (!updates.length) {
+      // Nothing matched by type — fall back to any entity carrying an
+      // activity URN, which is the one thing every update shape has. These
+      // are URN-only stubs; the detail pass fills them in.
+      updates = VY.findUrns(pool, 'urn:li:activity:').map((u) => ({ entityUrn: u }));
+    }
+
+    const before = S.collected;
+    for (const el of updates) {
+      const post = mapUpdate(el);
+      if (post) add(post);
+      if (S.collected >= S.cfg.maxPosts) break;
+    }
+    const fresh = S.collected - before;
+    tracker.record(fresh);
+
+    if (fresh && S.collected < S.cfg.maxPosts) {
+      tracker.stoppedEarly = true;
+      tracker.reason = 'Only the server-rendered first page is available without the Voyager feed endpoint.';
+      log(
+        'warn',
+        `The page payload held ${fresh} post(s) — that is the first page only. ` +
+          'Configure the Voyager feed endpoint (ENDPOINTS.md) to page further back.'
+      );
+    }
+
+    return fresh > 0;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Strategy C — scroll the rendered activity feed
+   *
+   * Anchored on `urn:li:activity:` appearing in an element attribute rather
+   * than on any class name: the URN is the one thing that has to stay put for
+   * LinkedIn's own code to work.
+   * ------------------------------------------------------------------ */
+  function harvestFeedCards() {
+    const found = [];
+    const seen = new Set();
+    let nodes;
+    try {
+      nodes = document.querySelectorAll('[data-urn],[data-id],[data-entity-urn],[data-activity-urn]');
+    } catch (_) {
+      return found;
+    }
+
+    for (const el of nodes) {
+      let urn = '';
+      for (const a of ['data-urn', 'data-id', 'data-entity-urn', 'data-activity-urn']) {
+        const v = el.getAttribute(a) || '';
+        if (v.indexOf('urn:li:activity:') >= 0) {
+          urn = v;
+          break;
+        }
+      }
+      if (!urn) continue;
+      const activityId = VY.activityId(urn);
+      if (!activityId || seen.has(activityId)) continue;
+      seen.add(activityId);
+      found.push(readCard(el, activityId));
+    }
+    return found;
+  }
+
+  function readCard(el, activityId) {
+    const textPick = (sels) => {
+      for (const s of sels) {
+        try {
+          const n = el.querySelector(s);
+          const t = n && (n.innerText || n.textContent || '').trim();
+          if (t) return t;
+        } catch (_) {
+          /* ignore an unsupported selector */
+        }
+      }
+      return '';
+    };
+
+    const text = textPick([
+      '.update-components-text',
+      '.feed-shared-update-v2__description',
+      '.feed-shared-inline-show-more-text',
+      '[class*="update-components-text"]'
+    ]);
+
+    const media = [];
+    const seenUrl = new Set();
+    try {
+      for (const img of el.querySelectorAll('img')) {
+        /*
+         * A feed image below the fold has no `src` yet — LinkedIn parks the
+         * real URL on data-delayed-url until the image scrolls into view. Read
+         * that too, or everything past the first screen comes back with no
+         * media even though the URN was harvested fine.
+         */
+        const src =
+          img.currentSrc ||
+          img.src ||
+          img.getAttribute('data-delayed-url') ||
+          img.getAttribute('data-li-src') ||
+          '';
+        // Only content images: avatars and icons live on different paths.
+        if (!/licdn\.com\/dms\/image/.test(src)) continue;
+        if (NON_CONTENT_IMAGE.test(src)) continue;
+        if (seenUrl.has(src)) continue;
+        seenUrl.add(src);
+        media.push({ type: 'image', url: src });
+      }
+      /*
+       * LinkedIn's video player carries its source list as JSON in a
+       * data-sources attribute — the only place a progressive URL is visible
+       * from the DOM at all.
+       */
+      for (const v of el.querySelectorAll('video,[data-sources]')) {
+        const raw = v.getAttribute('data-sources');
+        if (raw) {
+          try {
+            for (const s of JSON.parse(raw)) {
+              if (s && s.src && /^https?:/i.test(s.src)) {
+                media.push({
+                  type: 'video',
+                  url: /\.m3u8|\.mpd/.test(s.src) ? null : s.src,
+                  manifestUrl: /\.m3u8|\.mpd/.test(s.src) ? s.src : null,
+                  protocol: s.type || null,
+                  downloadable: !/\.m3u8|\.mpd/.test(s.src)
+                });
+              }
+            }
+          } catch (_) {
+            /* attribute shape changed; the post is still recorded */
+          }
+        } else if (v.src && /^https?:/i.test(v.src)) {
+          media.push({ type: 'video', url: v.src, downloadable: true });
+        }
+      }
+    } catch (_) {
+      /* a card that will not read is still worth recording by URN */
+    }
+
+    const counts = readCounts(el);
+    const derived = timestampFromActivityId(activityId);
+
+    return {
+      activityId,
+      urn: `urn:li:activity:${activityId}`,
+      postUrl: U.postUrlFromActivityId(activityId),
+      type: media.some((m) => m.type === 'video') ? 'video' : media.length ? 'image' : 'text',
+      text,
+      publishedAt: derived,
+      timestampSource: derived ? 'derived-from-urn' : 'unknown',
+      reactions: counts.reactions,
+      reactionsByType: {},
+      comments: counts.comments,
+      reposts: counts.reposts,
+      media,
+      mediaCount: media.length,
+      // The DOM never carries the full picture: the detail pass fills it in.
+      detailFetched: false
+    };
+  }
+
+  function readCounts(el) {
+    const out = { reactions: null, comments: null, reposts: null };
+    const grab = (sels, key, re) => {
+      for (const s of sels) {
+        try {
+          const n = el.querySelector(s);
+          if (!n) continue;
+          const label = n.getAttribute('aria-label') || n.innerText || n.textContent || '';
+          const m = label.replace(/,/g, '').match(re);
+          if (m) {
+            out[key] = parseCompact(m[1]);
+            return;
+          }
+        } catch (_) {
+          /* ignore */
+        }
+      }
+    };
+    grab(
+      ['[class*="social-details-social-counts__reactions-count"]', '[aria-label*="reaction"]', '[data-reaction-details]'],
+      'reactions',
+      /([\d.,KMB]+)/i
+    );
+    grab(['[aria-label*="comment"]', '[class*="social-details-social-counts__comments"]'], 'comments', /([\d.,KMB]+)/i);
+    grab(['[aria-label*="repost"]', '[class*="social-details-social-counts__reposts"]'], 'reposts', /([\d.,KMB]+)/i);
+    return out;
+  }
+
+  async function harvestViaDom(add) {
+    if (!/\/recent-activity\//.test(location.pathname)) {
+      throw new Error('not on the activity page');
+    }
+    log('info', 'Scrolling the activity feed. This is the slow path.');
+
+    const tracker = new PageTracker('Feed scroll');
+    S.pagination = tracker;
+    let idleRounds = 0;
+    let lastHeight = 0;
+    let round = 0;
+
+    while (S.collected < S.cfg.maxPosts && round < CFG.dom.maxScrollRounds) {
+      if (S.stop) throw new Abort('stopped');
+      await waitWhilePaused();
+
+      const before = S.collected;
+      for (const p of harvestFeedCards()) {
+        add(p);
+        if (S.collected >= S.cfg.maxPosts) break;
+      }
+      const fresh = S.collected - before;
+      round++;
+
+      if (S.collected >= S.cfg.maxPosts) break;
+
+      // Randomised pauses: a metronome-steady scroll is the single most
+      // obvious automation tell there is.
+      window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+      await U.sleep(U.randOf(L.PAGE_DELAY));
+      await clickShowMore();
+
+      const h = document.body.scrollHeight;
+      if (h === lastHeight && fresh === 0) idleRounds++;
+      else idleRounds = 0;
+      lastHeight = h;
+
+      if (fresh > 0) {
+        tracker.record(fresh);
+        pageLog(tracker.pages, 'Scroll');
+      }
+      if (idleRounds >= CFG.dom.idleRoundsBeforeStop) {
+        tracker.stoppedEarly = true;
+        tracker.reason = 'The feed stopped loading new posts.';
+        break;
+      }
+    }
+
+    if (round >= CFG.dom.maxScrollRounds) {
+      tracker.stoppedEarly = true;
+      tracker.reason = 'Reached the scroll-round ceiling.';
+    }
+    return S.collected > 0;
+  }
+
+  /** LinkedIn paginates the activity feed behind a "Show more results" button. */
+  async function clickShowMore() {
+    try {
+      const buttons = [...document.querySelectorAll('button')].filter((b) => {
+        const t = (b.innerText || '').trim().toLowerCase();
+        return t === 'show more results' || t === 'load more' || t === 'show more';
+      });
+      if (buttons.length) {
+        buttons[buttons.length - 1].click();
+        await U.sleep(U.randOf(L.PAGE_DELAY));
+      }
+    } catch (_) {
+      /* the button is optional; infinite scroll usually carries it */
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Per-post detail
+   * ------------------------------------------------------------------ */
+  /** What a media item points at — the identity two passes must agree on. */
+  const mediaKey = (m) => `${m.type}|${m.url || m.manifestUrl || m.title || ''}`;
+
+  /**
+   * Union of two media lists, richer record winning on a collision.
+   *
+   * The detail pass used to replace `media` outright. Whenever the permalink
+   * page returned fewer items than the harvest had already found — a carousel
+   * that renders lazily, a video whose progressive variant appears on only one
+   * of the two responses — that quietly deleted media the run had in hand.
+   * Adding can only improve the archive; replacing could shrink it.
+   */
+  function mergeMedia(a, b) {
+    const out = [];
+    const at = new Map();
+    for (const m of [].concat(Array.isArray(a) ? a : [], Array.isArray(b) ? b : [])) {
+      if (!m || typeof m !== 'object') continue;
+      const k = mediaKey(m);
+      if (at.has(k)) {
+        const i = at.get(k);
+        if (Object.keys(m).length > Object.keys(out[i]).length) out[i] = m;
+        continue;
+      }
+      at.set(k, out.length);
+      out.push(m);
+    }
+    return out;
+  }
+
+  /**
+   * Applies the "Skip video" option to one post. Returns true if it removed
+   * anything.
+   *
+   * This has to run at both ends of the pipeline. The harvest strips the
+   * video, but the detail pass then merges in a fresh media list read from the
+   * permalink page — which puts the video straight back. Stripping only on the
+   * way in meant the option worked right up until the post got enriched.
+   */
+  function stripVideos(post) {
+    if (!S.cfg || !S.cfg.skipVideos) return false;
+    if (!Array.isArray(post.media) || !post.media.some((m) => m.type === 'video')) return false;
+    post.media = post.media.filter((m) => m.type !== 'video');
+    post.mediaCount = post.media.length;
+    post.videosSkipped = true;
+    if (post.type === 'video') post.type = post.media.length ? 'image' : 'text';
+    return true;
+  }
+
+  function needsDetail(post) {
+    if (CFG.alwaysFetchDetail) return true;
+    if (!post.detailFetched) return true;
+    // The post said it had media and the list response did not carry it.
+    if (post.mediaIncomplete) return true;
+    if (!post.text && post.type !== 'image') return true;
+    if (post.reactions == null || post.comments == null) return true;
+    return false;
+  }
+
+  async function fetchPostDetail(post) {
+    const html = await apiGet(post.postUrl, { expectJson: false });
+    const pool = mergePayloads(payloadsFromHtml(html));
+    let updates = resolvedOfType(pool, /Update$|UpdateV2$/);
+    if (!updates.length) updates = [pool];
+
+    // The permalink page carries the post plus its comment thread; the update
+    // whose URN matches is the one wanted.
+    let best = null;
+    for (const u of updates) {
+      const mapped = mapUpdate(u);
+      if (!mapped) continue;
+      if (mapped.activityId === post.activityId) {
+        best = mapped;
+        break;
+      }
+      if (!best) best = mapped;
+    }
+
+    /*
+     * The rendered markup is the backstop. When LinkedIn does not server-render
+     * an embedded payload for a post, the mapping above finds nothing and the
+     * fetch reports success with no media — the post's photos are right there
+     * in the same HTML response. Read them rather than returning empty-handed.
+     */
+    if (!best || !best.media.length) {
+      const fromHtml = mediaFromHtml(html);
+      if (fromHtml.length) {
+        if (!best) {
+          best = {
+            activityId: post.activityId,
+            urn: post.urn,
+            postUrl: post.postUrl,
+            type: post.type,
+            text: post.text || '',
+            publishedAt: post.publishedAt || null,
+            timestampSource: post.timestampSource || 'unknown',
+            reactions: post.reactions,
+            reactionsByType: post.reactionsByType || {},
+            comments: post.comments,
+            reposts: post.reposts,
+            media: [],
+            mediaCount: 0,
+            mediaIncomplete: false,
+            detailFetched: true
+          };
+        }
+        best.media = mergeMedia(best.media, fromHtml);
+        best.mediaCount = best.media.length;
+        best.mediaIncomplete = false;
+        best.type = classifyByMedia(best.media, best.type);
+        log('info', `Read ${fromHtml.length} media item(s) off the rendered post page.`);
+      }
+    }
+
+    if (!best) throw new Error('no update entity on the permalink page');
+    return { mapped: best, pool };
+  }
+
+  /** Re-derive a post type once media arrives from a source that had none. */
+  function classifyByMedia(media, current) {
+    if (current === 'repost' || current === 'poll' || current === 'article') return current;
+    if (media.some((m) => m.type === 'document')) return 'document';
+    if (media.some((m) => m.type === 'video')) return 'video';
+    if (media.some((m) => m.type === 'image')) return 'image';
+    return current || 'text';
+  }
+
+  async function detailPass() {
+    const pending = S.posts.filter(needsDetail);
+    if (!pending.length) {
+      log('success', 'Full detail already captured — no extra requests needed.');
+      return;
+    }
+
+    const perPost = (L.DETAIL_DELAY[0] + L.DETAIL_DELAY[1]) / 2000 + L.MIN_REQUEST_GAP_MS / 1000;
+    const affordable = Math.max(0, L.SESSION_MAX_REQUESTS - S.requests);
+    if (pending.length > affordable) {
+      log(
+        'warn',
+        `${pending.length} post(s) need a detail fetch but only ~${affordable} requests remain in the session ` +
+          'budget. The pass will stop cleanly when it runs out.'
+      );
+    }
+    log(
+      'info',
+      `Fetching detail for ${pending.length} post(s) — roughly ${fmtDuration(pending.length * perPost)}. ` +
+        'Stop at any point and export what has been collected.'
+    );
+
+    let done = 0;
+    let failed = 0;
+    let streak = 0;
+    const start = Date.now();
+
+    for (const post of pending) {
+      if (S.stop) break;
+      await waitWhilePaused();
+      try {
+        const { mapped } = await fetchPostDetail(post);
+        // Identity comes from the harvest pass; detail only fills content in,
+        // and never replaces a value we already have with a null.
+        for (const k of Object.keys(mapped)) {
+          const v = mapped[k];
+          if (k === 'activityId' || k === 'postUrl' || k === 'urn') continue;
+          if (k === 'media') {
+            post.media = mergeMedia(post.media, v);
+            post.mediaCount = post.media.length;
+            // The permalink response carries the video the harvest stripped.
+            stripVideos(post);
+            continue;
+          }
+          if (k === 'mediaCount') continue; // derived from the merge above
+          if (v == null || v === '' || (Array.isArray(v) && !v.length)) continue;
+          post[k] = v;
+        }
+        post.detailFetched = true;
+        /*
+         * The permalink page is the authoritative source. If the media was not
+         * there either, it is not obtainable — recording that keeps the post
+         * from being re-fetched on every subsequent resume, while metadata.txt
+         * can still say the post declared media that never arrived.
+         */
+        if (post.mediaIncomplete) {
+          post.mediaIncomplete = false;
+          if (!post.media || !post.media.length) post.mediaUnavailable = true;
+        }
+        delete post.error;
+        emit(MSG.C_POST_UPDATE, { post });
+        done++;
+        streak = 0;
+      } catch (err) {
+        if (err instanceof Abort) throw err;
+        post.error = err.message;
+        failed++;
+        streak++;
+        emit(MSG.C_FAILED, { activityId: post.activityId, error: err.message });
+        emit(MSG.C_POST_UPDATE, { post });
+        if (streak >= 5) {
+          log('warn', `Detail fetches are failing repeatedly (${err.message}) — skipping the rest of the pass.`);
+          break;
+        }
+      }
+
+      const seen = done + failed;
+      if (seen % 10 === 0) {
+        const rate = seen / ((Date.now() - start) / 1000);
+        const left = rate > 0 ? ` · ~${fmtDuration((pending.length - seen) / rate)} left` : '';
+        log('info', `Detail ${seen}/${pending.length}${left}`);
+      }
+      if (seen < pending.length) await U.sleep(U.randOf(L.DETAIL_DELAY));
+    }
+    log(failed ? 'warn' : 'success', `Detail pass finished — ${done} ok, ${failed} failed.`);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Comments
+   *
+   * Off by default. When on, this is the only part of the run that collects
+   * other people's personal data, so it is hard-capped twice over and never
+   * follows a commenter's profile link.
+   * ------------------------------------------------------------------ */
+  function mapComment(c) {
+    const author =
+      deepFindObject(c, (n) => n.firstName != null || n.publicIdentifier != null || n.headline != null) || {};
+    const name =
+      [textOf(author.firstName), textOf(author.lastName)].filter(Boolean).join(' ') ||
+      textOf(author.name) ||
+      textOf(c.commenterName) ||
+      '';
+    const publicId = author.publicIdentifier || '';
+
+    let at = null;
+    for (const n of VY.collect(c, (x) => x.createdAt != null || x.createdTime != null)) {
+      at = num(n.createdAt) || num(n.createdTime);
+      if (at) break;
+    }
+
+    const r = reactionsFrom(c);
+    return {
+      author: name,
+      headline: textOf(author.occupation) || textOf(author.headline) || '',
+      profileUrl: publicId ? U.profileUrl(publicId) : null,
+      text: textOf(c.comment) || textOf(c.commentV2) || textOf(c.message) || textOf(c.text) || '',
+      at,
+      reactions: r.total
+    };
+  }
+
+  /** Identity for de-duping. Comments carry no stable id in every shape. */
+  const commentKey = (c) => `${c.author}|${c.at || ''}|${(c.text || '').slice(0, 120)}`;
+
+  async function fetchComments(post) {
+    let list = [];
+    let truncated = false;
+
+    // A — the Voyager comments finder, paged.
+    if (CFG.comments.enabled) {
+      const seen = new Set();
+      const size = CFG.comments.pageSize || 20;
+      let start = 0;
+      try {
+        for (let page = 0; page < L.MAX_COMMENT_PAGES; page++) {
+          const { raw, data } = await voyagerGet(
+            CFG.comments,
+            {
+              activityId: post.activityId,
+              activityUrn: post.urn,
+              start,
+              count: size
+            },
+            { retries: 0 } // a 4xx here must fail fast, not sit through a 3-min pause per post
+          );
+
+          /*
+           * The by-type fallback reads the whole payload, so unlike
+           * `data.elements` it is not a page — asking for it again returns the
+           * same comments. Left in the paging loop it filled the list with
+           * duplicates until it hit the 150 cap. Use it once, then stop.
+           */
+          let batch = firstArray(data, ['elements']);
+          let unpaged = false;
+          if (!batch) {
+            batch = resolvedOfType(raw, /\.Comment$/);
+            unpaged = true;
+          }
+          if (!batch.length) break;
+
+          let fresh = 0;
+          for (const c of batch) {
+            const m = mapComment(c);
+            const key = commentKey(m);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            list.push(m);
+            fresh++;
+            if (list.length >= L.MAX_COMMENTS_PER_POST) break;
+          }
+
+          if (list.length >= L.MAX_COMMENTS_PER_POST) {
+            truncated = post.comments != null && post.comments > list.length;
+            break;
+          }
+          // Nothing new on this page means paging has stopped advancing, and
+          // another round would only re-read the same thread.
+          if (unpaged || fresh === 0) break;
+
+          start += size;
+          if (post.comments != null && start >= post.comments) break;
+          if (page + 1 >= L.MAX_COMMENT_PAGES) truncated = post.comments != null && post.comments > list.length;
+          await U.sleep(U.randOf(L.PAGE_DELAY));
+        }
+        // A configured endpoint's answer is final, including "no comments" —
+        // re-scraping the post page after it would only spend another request.
+        return { list, truncated };
+      } catch (err) {
+        if (err instanceof Abort) throw err;
+        log('warn', `Comment finder failed (${err.message}) — reading the post page instead.`);
+        list = [];
+        truncated = false;
+      }
+    }
+
+    // B — whatever the permalink page server-rendered. First page only.
+    const pool = await fetchPagePayloads(post.postUrl);
+    const seen = new Set();
+    for (const c of resolvedOfType(pool, /\.Comment$/)) {
+      const m = mapComment(c);
+      if (!m.text && !m.author) continue;
+      const key = commentKey(m);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      list.push(m);
+      if (list.length >= L.MAX_COMMENTS_PER_POST) break;
+    }
+    if (list.length && post.comments != null && post.comments > list.length) truncated = true;
+    return { list, truncated };
+  }
+
+  async function commentPass() {
+    const pending = S.posts.filter((p) => p.comments !== 0 && !p.commentList);
+    if (!pending.length) {
+      log('info', 'No posts with comments to fetch.');
+      return;
+    }
+    if (!CFG.comments.enabled) {
+      log(
+        'warn',
+        'The Voyager comments endpoint is not configured — only the first page rendered into each ' +
+          'post page can be read. See ENDPOINTS.md.'
+      );
+    }
+
+    const perPost = (L.DETAIL_DELAY[0] + L.DETAIL_DELAY[1]) / 2000 + L.MIN_REQUEST_GAP_MS / 1000;
+    log(
+      'info',
+      `Fetching comments for ${pending.length} post(s) — roughly ${fmtDuration(pending.length * perPost)}. ` +
+        `Capped at ${L.MAX_COMMENTS_PER_POST} per post.`
+    );
+
+    let done = 0;
+    let failed = 0;
+    let streak = 0;
+
+    for (const post of pending) {
+      if (S.stop) break;
+      await waitWhilePaused();
+      try {
+        const r = await fetchComments(post);
+        post.commentList = r.list;
+        post.commentsTruncated = r.truncated;
+        emit(MSG.C_POST_UPDATE, { post });
+        done++;
+        streak = 0;
+      } catch (err) {
+        if (err instanceof Abort) throw err;
+        post.commentList = [];
+        post.commentError = err.message;
+        emit(MSG.C_POST_UPDATE, { post });
+        failed++;
+        streak++;
+        // LinkedIn gates this for some sessions. If it refuses repeatedly it
+        // will refuse for every post, so stop rather than burn the budget.
+        if (streak >= 3) {
+          log('warn', `Comments unavailable (${err.message}) — skipping the rest of the comment pass.`);
+          break;
+        }
+      }
+      if (done + failed < pending.length) await U.sleep(U.randOf(L.DETAIL_DELAY));
+    }
+    log(failed ? 'warn' : 'success', `Comment pass finished — ${done} ok, ${failed} failed.`);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Logging helpers
+   * ------------------------------------------------------------------ */
+  function pageLog(page, label) {
+    if (page <= 3 || page % 3 === 0) {
+      log('info', `${label} ${page}: ${S.collected}/${S.target} collected${etaSuffix()}`);
+    }
+  }
+
+  function etaSuffix() {
+    const done = S.collected - (S.cfg.alreadyCollected || 0);
+    const left = S.target - S.collected;
+    if (done < 10 || left <= 0) return '';
+    const rate = done / ((Date.now() - S.startedAt) / 1000);
+    if (!isFinite(rate) || rate <= 0) return '';
+    return ` · ~${fmtDuration(left / rate)} left`;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Orchestration
+   * ------------------------------------------------------------------ */
+  async function tryStrategy(name, fn) {
+    const before = S.collected;
+    try {
+      const ok = await fn();
+      return ok || S.collected > before;
+    } catch (err) {
+      if (err instanceof Abort) throw err;
+      log('warn', `${name} failed: ${err.message}`);
+      return S.collected > before;
+    }
+  }
+
+  async function run(cfg) {
+    S.active = true;
+    S.stop = false;
+    S.paused = false;
+    S.navigating = false;
+    S.cfg = cfg;
+    S.seen = new Set(cfg.knownActivityIds || []);
+    /*
+     * Seeded with posts the worker already holds that still need a detail or
+     * comment pass — a run continued in a new tab, or resumed after an
+     * interruption, has to finish what the previous instance started. They are
+     * already in `seen`, so pagination walks past them rather than re-adding.
+     */
+    S.posts = Array.isArray(cfg.pendingPosts) ? cfg.pendingPosts.map((p) => Object.assign({}, p)) : [];
+    S.collected = cfg.alreadyCollected || 0;
+    S.skippedVideos = 0;
+    /*
+     * Carried, not reset. The DOM strategy re-hosts this same run in a freshly
+     * navigated tab, and zeroing here would hand one sitting a second full
+     * request allowance — the exact thing SESSION_MAX_REQUESTS exists to stop —
+     * while the popup's meter jumped backwards mid-run. A genuine user Resume
+     * does start over, and passes 0.
+     */
+    S.requests = Number(cfg.requestsSoFar) || 0;
+    S.target = cfg.maxPosts;
+    S.startedAt = Date.now();
+    S.pagination = null;
+    connectPort();
+    emitProgress(true); // publish the carried-over request count immediately
+
+    let pending = [];
+    const flush = () => {
+      if (!pending.length) return;
+      emit(MSG.C_POSTS, { posts: pending });
+      pending = [];
+    };
+    const add = (post) => {
+      if (!post || !post.activityId || S.seen.has(post.activityId)) return false;
+      /*
+       * "Skip video" drops the video, not the post.
+       *
+       * It used to discard the whole update — losing the body text, the
+       * engagement counts and the permalink along with the stream, with no way
+       * to recover them short of re-running. Nothing about a checkbox sitting
+       * beside "Profile media" suggests it deletes posts, and the row still
+       * belongs in posts.csv either way. The video is stripped, the post stays.
+       */
+      if (stripVideos(post)) S.skippedVideos++;
+      S.seen.add(post.activityId);
+      post.index = S.collected;
+      post.publicId = cfg.publicId;
+      S.posts.push(post);
+      S.collected++;
+      pending.push(post);
+      if (pending.length >= 5) flush();
+      emitProgress();
+      return true;
+    };
+
+    try {
+      const phase = cfg.phase || 'main';
+      log('info', `Starting ${phase === 'posts-dom' ? 'the feed scroll for' : 'scrape of'} /in/${cfg.publicId}.`);
+
+      const sess = sessionState();
+      if (!sess.ok) {
+        if (onChallengePage()) requireAttention('challenge', CHALLENGE_MSG);
+        else requireAttention('login', `${LOGIN_MSG} — ${sess.why}`);
+        await waitWhilePaused();
+      }
+
+      /* ---- profile ---- */
+      let profile = cfg.profile || null;
+      if (phase !== 'posts-dom') {
+        profile = await getProfile(cfg.publicId);
+        S.profile = profile;
+        emit(MSG.C_PROFILE, { profile });
+        log(
+          'success',
+          `${profile.fullName || cfg.publicId}${profile.headline ? ' — ' + profile.headline.slice(0, 60) : ''}`
+        );
+        emitProgress(true);
+      } else {
+        S.profile = profile;
+      }
+
+      /* ---- posts ---- */
+      if (cfg.includePosts) {
+        let via = null;
+
+        if (phase !== 'posts-dom') {
+          if (CFG.posts.enabled) {
+            if (await tryStrategy('Voyager feed', () => harvestViaVoyager(profile, add))) via = 'voyager';
+          } else {
+            log('info', 'Voyager feed endpoint is not configured — see ENDPOINTS.md.');
+          }
+          if (!via && CFG.embeddedJson.enabled) {
+            if (await tryStrategy('Embedded payload', () => harvestViaEmbedded(profile, add))) via = 'embedded';
+          }
+
+          /*
+           * Escalate to the rendered feed when the run is still short of what
+           * was asked for. Strategy B is first-page-only by construction, so
+           * reaching a target of 100 through it alone is impossible — but
+           * Strategy A pages properly, so if *it* ran and stopped, that is
+           * LinkedIn's answer and re-scrolling would only spend the request
+           * budget to rediscover the same posts.
+           */
+          const onActivityPage = /\/recent-activity\//.test(location.pathname);
+          if (CFG.dom.enabled && !onActivityPage && via !== 'voyager' && S.collected < cfg.maxPosts) {
+            // The activity feed lives at its own URL, so the DOM strategy needs
+            // the tab moved. The worker restarts the run there, carrying
+            // everything collected so far so nothing is re-fetched.
+            flush();
+            log(
+              'info',
+              `Have ${S.collected} of ${cfg.maxPosts} — moving the tab to the activity feed to scroll for more.`
+            );
+            S.navigating = true;
+            emit(MSG.C_NAVIGATE, {
+              url: U.activityUrl(cfg.publicId),
+              phase: 'posts-dom',
+              profile
+            });
+            throw new Abort('navigating');
+          }
+        }
+
+        if (phase === 'posts-dom' && CFG.dom.enabled) {
+          await tryStrategy('Feed scroll', () => harvestViaDom(add));
+        }
+
+        flush();
+        emitProgress(true);
+
+        if (S.collected === 0) {
+          throw new Error(
+            'No posts found. The profile may have no public activity, or all three strategies are out of date.'
+          );
+        }
+        if (S.skippedVideos) {
+          log('info', `Dropped the video from ${S.skippedVideos} post(s) per your settings — the posts were kept.`);
+        }
+        log('info', S.pagination ? S.pagination.summary(S.collected) : `Collected ${S.collected} posts.`);
+
+        if (!S.stop) await detailPass();
+        if (!S.stop && cfg.includeComments) await commentPass();
+      }
+
+      flush();
+      emitProgress(true);
+      finish(S.stop ? 'stopped' : 'done');
+    } catch (err) {
+      flush();
+      emitProgress(true);
+      if (err instanceof Abort) {
+        // A navigation is not the end of the run — the worker picks it back up
+        // in the new page, so no DONE is sent.
+        if (err.reason === 'navigating') return;
+        if (err.reason === 'session_limit') {
+          log('warn', err.message);
+          finish('session_limit_reached', err.message);
+        } else {
+          finish(err.reason === 'stopped' ? 'stopped' : 'error', err.message);
+        }
+      } else {
+        log('error', err.message);
+        finish('error', err.message);
+      }
+    } finally {
+      S.active = false;
+      stopHeartbeat();
+    }
+  }
+
+  function finish(status, message) {
+    emit(MSG.C_DONE, {
+      status,
+      message: message || '',
+      collected: S.collected,
+      requests: S.requests,
+      pagination: S.pagination
+        ? { stoppedEarly: S.pagination.stoppedEarly, reason: S.pagination.reason, pages: S.pagination.pages }
+        : null
+    });
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Commands from the service worker
+   * ------------------------------------------------------------------ */
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!msg || !msg.type) return;
+
+    switch (msg.type) {
+      case MSG.PING:
+        sendResponse({ ok: true, url: location.href, loggedIn: isLoggedIn(), active: S.active });
+        return true;
+
+      case MSG.START: {
+        if (S.active) {
+          sendResponse({ ok: false, error: 'A scrape is already running in this tab.' });
+          return true;
+        }
+        if (onChallengePage()) {
+          sendResponse({ ok: false, error: 'challenge' });
+          return true;
+        }
+        {
+          // `why` travels with the refusal so the popup can say what was
+          // actually observed rather than assuming the user forgot to log in.
+          const sess = sessionState();
+          if (!sess.ok) {
+            sendResponse({ ok: false, error: 'not-logged-in', why: sess.why });
+            return true;
+          }
+        }
+        sendResponse({ ok: true });
+        run(msg.cfg); // deliberately not awaited — streams back over the port
+        return true;
+      }
+
+      case MSG.STOP:
+        S.stop = true;
+        S.paused = false;
+        sendResponse({ ok: true });
+        return true;
+
+      case MSG.RESUME:
+        if (S.paused) {
+          S.paused = false;
+          log('info', 'Resumed.');
+        }
+        sendResponse({ ok: true, active: S.active });
+        return true;
+    }
+    return false;
+  });
+
+  /*
+   * Test hook. Populated only when a harness has declared __LIS_TEST__ before
+   * this script is evaluated, which nothing in the extension ever does — so in
+   * a real browser this branch does not run and nothing is exported.
+   *
+   * It exists because the session check and the entity mappers are pure
+   * functions that used to be reachable only through a live LinkedIn session,
+   * and one of them shipped a bug that a two-line test would have caught.
+   */
+  if (globalThis.__LIS_TEST__) {
+    Object.assign(globalThis.__LIS_TEST__, {
+      sessionState,
+      onChallengePage,
+      onLoginPage,
+      onAuthWall,
+      signInCtaPresent,
+      memberChromePresent,
+      textOf,
+      dateRangeText,
+      timestampFromActivityId,
+      classifyPost,
+      reactionsFrom,
+      socialCountsFrom,
+      videosFrom,
+      documentsFrom,
+      imagesFrom,
+      mapUpdate,
+      mapProfileEntity,
+      PageTracker,
+      onProfilePageFor,
+      commentKey,
+      collectContent,
+      mergeMedia,
+      postTextFrom,
+      declaresMedia,
+      needsDetail,
+      mediaFromHtml,
+      classifyByMedia
+    });
+  }
+})();

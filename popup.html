@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Prospect Workspace · Content Daddy</title>
+    <link rel="stylesheet" href="ui/tokens.css" />
+    <link rel="stylesheet" href="ui/components.css" />
+    <link rel="stylesheet" href="ui/app.css" />
+  </head>
+  <body>
+    <div class="app" id="app">
+      <!-- ══ rail ══════════════════════════════════════════════ -->
+      <nav class="rail" aria-label="Sections">
+        <!-- The Content Daddy camera mark, reversed (white on navy). -->
+        <span class="brand-mark" data-tip="Content Daddy" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <rect x="2" y="6.4" width="13" height="11.2" rx="3.2"/>
+            <path d="M16.4 10.2 20.8 7.4a.85.85 0 0 1 1.3.72v7.76a.85.85 0 0 1-1.3.72l-4.4-2.8z"/>
+          </svg>
+        </span>
+
+        <!-- A profile card, not LinkedIn's "in" square: that mark is their
+             trademark, and the extension already carries no affiliation. -->
+        <button class="rail-btn" data-nav="scrape" data-tip="Scrape · 1" aria-current="true" aria-label="Scrape">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="4"/><circle cx="12" cy="10" r="2.5"/><path d="M7.6 17.6a4.6 4.6 0 0 1 8.8 0"/>
+          </svg>
+        </button>
+        <button class="rail-btn" data-nav="activity" data-tip="Activity · 2" aria-label="Activity">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 12h4l2.5-6.5L14 19l2.5-7H21"/>
+          </svg>
+        </button>
+
+        <span class="rail-spacer"></span>
+
+        <button class="rail-btn" data-nav="settings" data-tip="Settings · 3" aria-label="Settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"/><path d="M19.1 14.5a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.11a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.11A1.7 1.7 0 0 0 4.67 8.6a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.11a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.11a1.7 1.7 0 0 0-1.56 1.03z"/>
+          </svg>
+        </button>
+      </nav>
+
+      <!-- ══ main ══════════════════════════════════════════════ -->
+      <div class="main">
+        <header class="topbar">
+          <div class="title">
+            <h1 id="viewTitle">Scrape</h1>
+            <div class="sub" id="viewSub">Collect a profile and its posts</div>
+          </div>
+          <button class="cmdk-trigger" id="cmdkTrigger" aria-label="Open command palette">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.2-3.2"/></svg>
+            <span class="kbd" id="cmdkHint">Ctrl K</span>
+          </button>
+          <!-- Drops downward: this button sits against the right edge of a
+               480px frame, and a right-hand tip lands outside it. -->
+          <button class="icon-btn" id="btnTheme" data-tip="Appearance" data-tip-at="below-end" aria-label="Appearance">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.4"/><path d="M12 2.6v2.1M12 19.3v2.1M21.4 12h-2.1M4.7 12H2.6M18.6 5.4l-1.5 1.5M6.9 17.1l-1.5 1.5M18.6 18.6l-1.5-1.5M6.9 6.9L5.4 5.4"/></svg>
+          </button>
+        </header>
+
+        <div class="views">
+          <!-- ── Scrape ─────────────────────────────────────── -->
+          <section class="view on scroll" data-view="scrape">
+            <div class="stack">
+              <div class="card card-pad">
+                <div class="stack">
+                  <div class="field-row">
+                    <label class="input grow">
+                      <span class="affix">/in/</span>
+                      <input id="publicId" type="text" placeholder="profile URL or public id" autocomplete="off" spellcheck="false" aria-label="LinkedIn profile URL or public identifier" />
+                    </label>
+                    <label class="input qty">
+                      <input id="maxPosts" type="number" min="1" max="500" step="1" value="100" aria-label="Maximum posts" />
+                      <span class="affix unit">posts</span>
+                    </label>
+                  </div>
+
+                  <div class="segmented" id="presetSeg">
+                    <span class="thumb" aria-hidden="true"></span>
+                    <button type="button" class="preset" data-n="50">50</button>
+                    <button type="button" class="preset" data-n="100">100</button>
+                    <button type="button" class="preset" data-n="250">250</button>
+                    <button type="button" class="preset" data-n="500" title="Keep going to the 500-post cap, or until LinkedIn stops returning more">All</button>
+                  </div>
+
+                  <div class="opts">
+                    <label class="check"><input type="checkbox" id="optIncludePosts" checked /><span class="box"></span>Posts</label>
+                    <label class="check" title="Collects other people's names, headlines and comment text"><input type="checkbox" id="optIncludeComments" /><span class="box"></span>Comments</label>
+                    <label class="check"><input type="checkbox" id="optSkipVideos" /><span class="box"></span>Skip video</label>
+                    <label class="check"><input type="checkbox" id="optIncludeProfileMedia" checked /><span class="box"></span>Profile media</label>
+                  </div>
+
+                  <div class="field-row">
+                    <button id="btnStart" class="btn primary" style="flex:1 1 auto">
+                      <span id="startLabel">Start scrape</span>
+                    </button>
+                    <button id="btnStop" class="btn" disabled>Stop</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- attention -->
+              <section id="alert" class="notice hidden">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5M12 16.2v.1"/></svg>
+                <div class="body">
+                  <p id="alertText"></p>
+                  <div class="acts">
+                    <button id="btnResume" class="btn primary sm">Resume</button>
+                    <button id="btnOpenTab" class="btn sm">Open tab</button>
+                  </div>
+                </div>
+              </section>
+
+              <!-- progress -->
+              <div class="card card-pad">
+                <div class="readout">
+                  <div>
+                    <div class="eyebrow">Collected</div>
+                    <div class="figure"><span id="progressText">0 / 0</span></div>
+                  </div>
+                  <div class="right">
+                    <div class="pct" id="pct">0%</div>
+                    <div class="eta" id="eta"></div>
+                  </div>
+                </div>
+
+                <div class="progress" style="margin-top:var(--s2)"><div id="barFill" class="bar"></div></div>
+
+                <div class="metrics">
+                  <div class="m"><b id="statPosts">0</b><span>Posts</span></div>
+                  <div class="m"><b id="statMedia">0</b><span>Media</span></div>
+                  <div class="m"><b id="statComments">0</b><span>Comments</span></div>
+                  <div class="m"><b id="statFailed">0</b><span>Failed</span></div>
+                </div>
+
+                <!-- session request budget: the ceiling that ends a run cleanly -->
+                <div class="budget" id="budgetRow">
+                  <div class="budget-head">
+                    <span class="eyebrow">Session requests</span>
+                    <span id="budgetText">0 / 0</span>
+                  </div>
+                  <div class="meter"><div id="budgetBar" class="bar"></div></div>
+                </div>
+
+                <p class="note hidden" id="paginationNote"></p>
+              </div>
+
+              <!-- profile -->
+              <div id="profileBox" class="card card-pad profile hidden">
+                <img id="avatar" class="avatar" alt="" referrerpolicy="no-referrer" />
+                <div class="who">
+                  <div id="pName" class="pname"></div>
+                  <div id="pHeadline" class="pbio"></div>
+                  <div id="pStats" class="pstats"></div>
+                </div>
+              </div>
+
+              <!-- export -->
+              <div class="card card-pad">
+                <div class="section-head"><span class="eyebrow">Export</span></div>
+                <button id="btnZip" class="btn primary block" disabled>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v11m0 0l-4-4m4 4l4-4M4 17.5V19a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-1.5"/></svg>
+                  <span id="zipLabel">Download everything as ZIP</span>
+                </button>
+                <div id="zipProgress" class="zip-progress hidden">
+                  <div class="progress" style="margin-top:var(--s2)"><div id="zipBar" class="bar"></div></div>
+                  <div class="zip-meta">
+                    <span id="zipText"></span>
+                    <button id="btnZipCancel" class="btn ghost sm">Cancel</button>
+                  </div>
+                </div>
+                <div class="divider"></div>
+                <button id="btnClear" class="btn ghost sm block">Clear stored results</button>
+              </div>
+            </div>
+          </section>
+
+          <!-- ── Activity ───────────────────────────────────── -->
+          <section class="view view-activity" data-view="activity">
+            <div class="list-head">
+              <span class="eyebrow">Event log</span>
+              <span class="eyebrow" id="logCount"></span>
+            </div>
+            <ul id="log" class="log scroll">
+              <li class="empty"></li>
+            </ul>
+          </section>
+
+          <!-- ── Settings ───────────────────────────────────── -->
+          <section class="view view-settings scroll" data-view="settings">
+            <div class="section-head"><span class="eyebrow">Appearance</span></div>
+            <div class="setting">
+              <div>
+                <div class="label">Theme</div>
+                <div class="hint">Follows your system by default</div>
+              </div>
+              <div class="control">
+                <div class="segmented theme-seg" id="themeSeg">
+                  <span class="thumb" aria-hidden="true"></span>
+                  <button type="button" data-theme-opt="light">Light</button>
+                  <button type="button" data-theme-opt="system">System</button>
+                  <button type="button" data-theme-opt="dark">Dark</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="section-head" style="margin-top:var(--s3)"><span class="eyebrow">Pacing</span></div>
+            <div class="setting">
+              <div><div class="label">Minimum request gap</div><div class="hint">A floor, not a default. Raise it in utils.js — never lower it.</div></div>
+              <div class="control"><span class="kbd" id="kbdGap">3s</span></div>
+            </div>
+            <div class="setting">
+              <div><div class="label">Session request budget</div><div class="hint">The run ends cleanly here rather than pushing into restriction territory</div></div>
+              <div class="control"><span class="kbd" id="kbdBudget">300</span></div>
+            </div>
+            <div class="setting">
+              <div><div class="label">Comment ceiling</div><div class="hint">Per post, across a capped number of pages</div></div>
+              <div class="control"><span class="kbd" id="kbdComments">150</span></div>
+            </div>
+
+            <div class="section-head" style="margin-top:var(--s3)"><span class="eyebrow">Keyboard</span></div>
+            <div class="setting">
+              <div><div class="label">Command palette</div><div class="hint">Jump anywhere, run any action</div></div>
+              <div class="control"><span class="kbd" id="kbdPalette">Ctrl K</span></div>
+            </div>
+            <div class="setting">
+              <div><div class="label">Switch section</div><div class="hint">Scrape · Activity · Settings</div></div>
+              <div class="control"><span class="kbd">1</span><span class="kbd">2</span><span class="kbd">3</span></div>
+            </div>
+
+            <div class="section-head" style="margin-top:var(--s3)"><span class="eyebrow">About</span></div>
+            <div class="setting">
+              <div><div class="label">LinkedIn Scraper By Sumon</div><div class="hint">Runs entirely on your own logged-in session. Never solves a challenge.</div></div>
+              <div class="control"><span class="wordmark">Content Daddy</span></div>
+            </div>
+          </section>
+        </div>
+
+        <footer class="statusbar">
+          <span id="statusPill" class="pill idle"><i class="lamp"></i><span id="statusText">Idle</span></span>
+          <span class="sep"></span>
+          <span class="metric"><b id="footPosts">0</b> posts</span>
+        </footer>
+      </div>
+    </div>
+
+    <div class="toasts" id="toasts" aria-live="polite"></div>
+
+    <script src="utils.js"></script>
+    <script src="popup.js"></script>
+    <script src="ui/shell.js"></script>
+  </body>
+</html>

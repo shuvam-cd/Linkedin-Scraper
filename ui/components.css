@@ -1,0 +1,494 @@
+/* ══════════════════════════════════════════════════════════════════
+   components.css — the reusable layer.
+
+   Every rule here is view-agnostic: nothing knows about scraping. New
+   screens compose these primitives instead of inventing controls, which
+   is what keeps a growing product visually coherent.
+
+   Contract: components read tokens, never literals.
+   ══════════════════════════════════════════════════════════════════ */
+
+/* ══ Button ═════════════════════════════════════════════════════
+   .btn                  neutral, bordered
+   .btn.primary          brand fill
+   .btn.ghost            no chrome until hover
+   .btn.danger           destructive
+   .btn.sm / .btn.lg     size
+   .btn.block            full width
+   .btn.busy             swaps a spinner in front of the label
+   ══════════════════════════════════════════════════════════════ */
+.btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s1);
+  height: 38px;
+  padding: 0 var(--s2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-btn);
+  background: var(--surface);
+  color: var(--text);
+  font: var(--t-label);
+  letter-spacing: var(--track-tight);
+  white-space: nowrap;
+  box-shadow: var(--e1);
+  transition:
+    background var(--dur-1) var(--ease),
+    border-color var(--dur-1) var(--ease),
+    color var(--dur-1) var(--ease),
+    box-shadow var(--dur-2) var(--ease),
+    transform var(--dur-1) var(--ease);
+}
+.btn:hover:not(:disabled) { background: var(--hover); border-color: var(--border-strong); }
+.btn:active:not(:disabled) { background: var(--press); transform: scale(.982); box-shadow: none; }
+.btn:disabled { color: var(--text-3); box-shadow: none; cursor: default; }
+.btn svg { width: 15px; height: 15px; }
+
+/* Navy at rest, indigo on hover — the guideline's own pairing, and the
+   one place in the shell where the two brand colours meet. */
+.btn.primary {
+  background: var(--brand);
+  border-color: transparent;
+  color: var(--on-brand);
+  box-shadow: var(--e-brand);
+}
+.btn.primary:hover:not(:disabled) { background: var(--brand-2); border-color: transparent; }
+.btn.primary:active:not(:disabled) { background: var(--brand-press); }
+.btn.primary:disabled { background: var(--sunken); color: var(--text-3); box-shadow: none; }
+
+.btn.ghost { background: transparent; border-color: transparent; box-shadow: none; color: var(--text-2); }
+.btn.ghost:hover:not(:disabled) { background: var(--hover); color: var(--text); border-color: transparent; }
+
+.btn.danger { color: var(--danger-ink); }
+.btn.danger:hover:not(:disabled) { background: var(--danger-soft); border-color: transparent; }
+
+.btn.sm { height: 30px; padding: 0 var(--s2); border-radius: var(--r-sm); font: var(--t-meta); font-weight: 500; }
+.btn.sm svg { width: 13px; height: 13px; }
+.btn.lg { height: 44px; padding: 0 var(--s3); }
+.btn.block { width: 100%; }
+
+.btn.busy { pointer-events: none; }
+.btn.busy::before {
+  content: "";
+  width: 14px; height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  opacity: .9;
+  animation: spin .62s linear infinite;
+}
+.btn.primary.busy:disabled { background: var(--brand); color: var(--on-brand); }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* icon-only */
+.icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 32px; height: 32px;
+  border-radius: var(--r-sm);
+  color: var(--text-2);
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease), transform var(--dur-1) var(--ease);
+}
+.icon-btn:hover { background: var(--hover); color: var(--text); }
+.icon-btn:active { transform: scale(.9); }
+.icon-btn svg { width: 16px; height: 16px; }
+
+/* ══ Input ══════════════════════════════════════════════════════ */
+.input {
+  display: flex;
+  align-items: center;
+  gap: var(--s1);
+  height: 40px;
+  padding: 0 var(--s2);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+  box-shadow: var(--e1);
+  transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-2) var(--ease), background var(--dur-1) var(--ease);
+}
+.input:focus-within { border-color: var(--brand-2); box-shadow: 0 0 0 3px var(--brand-soft); }
+.input > input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0; outline: 0; background: none; padding: 0;
+  font: var(--t-body);
+  letter-spacing: var(--track-tight);
+}
+.input > input::placeholder { color: var(--text-3); }
+.input > input:disabled { color: var(--text-2); }
+.input .affix { color: var(--text-3); font: var(--t-body); flex: none; }
+.input .affix.unit {
+  font: var(--t-eyebrow); letter-spacing: var(--track-eyebrow); text-transform: uppercase;
+}
+.input svg { width: 15px; height: 15px; color: var(--text-3); }
+.input > input[type="number"]::-webkit-inner-spin-button,
+.input > input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+
+/* ══ Segmented control ══════════════════════════════════════════ */
+.segmented {
+  position: relative;
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  background: var(--sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--r-input);
+}
+.segmented .thumb {
+  position: absolute;
+  top: 3px; left: 0;
+  width: 0; height: calc(100% - 6px);
+  background: var(--raised);
+  border-radius: 9px;
+  box-shadow: var(--e2);
+  opacity: 0;
+  pointer-events: none;
+  transition: transform var(--dur-2) var(--ease-soft), width var(--dur-2) var(--ease-soft), opacity var(--dur-1) linear;
+}
+.segmented.ready .thumb { opacity: 1; }
+.segmented button {
+  position: relative;
+  flex: 1 1 0;
+  height: 28px;
+  border-radius: 9px;
+  color: var(--text-2);
+  font: var(--t-meta); font-weight: 500;
+  transition: color var(--dur-1) var(--ease), transform var(--dur-1) var(--ease);
+}
+.segmented button:hover:not(:disabled):not(.on) { color: var(--text); }
+.segmented button.on { color: var(--brand); font-weight: 600; }
+.segmented button:active:not(:disabled) { transform: scale(.95); }
+.segmented button:disabled { color: var(--text-3); cursor: default; }
+:root[data-theme="dark"] .segmented button.on { color: var(--text); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .segmented button.on { color: var(--text); }
+}
+
+/* ══ Checkbox ═══════════════════════════════════════════════════ */
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s1);
+  padding: 6px 0;
+  color: var(--text-2);
+  font: var(--t-label);
+  cursor: pointer;
+  user-select: none;
+  transition: color var(--dur-1) var(--ease);
+}
+.check:hover { color: var(--text); }
+.check input { position: absolute; opacity: 0; pointer-events: none; }
+.check .box {
+  position: relative;
+  width: 18px; height: 18px;
+  flex: none;
+  background: var(--surface);
+  border: 1.5px solid var(--border-strong);
+  border-radius: 6px;
+  transition: background var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease), transform var(--dur-2) var(--ease);
+}
+.check .box::after {
+  content: "";
+  position: absolute; left: 5.5px; top: 2.4px;
+  width: 4px; height: 8.5px;
+  border: solid var(--on-brand);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg) scale(.3);
+  opacity: 0;
+  transition: opacity var(--dur-1) var(--ease), transform var(--dur-2) var(--ease);
+}
+.check input:checked ~ .box { background: var(--brand); border-color: var(--brand); }
+.check input:checked ~ .box::after { opacity: 1; transform: rotate(45deg) scale(1); }
+.check input:focus-visible ~ .box { box-shadow: 0 0 0 3px var(--brand-soft); }
+.check:has(input:checked) { color: var(--text); }
+.check:has(input:disabled) { color: var(--text-3); cursor: default; }
+.check:has(input:disabled) .box { background: var(--sunken); border-color: var(--border); }
+.check:has(input:checked:disabled) .box { background: var(--text-3); border-color: var(--text-3); }
+
+/* ══ Card ═══════════════════════════════════════════════════════ */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  box-shadow: var(--e2);
+}
+.card.flat { box-shadow: none; }
+.card-pad { padding: var(--s2); }
+
+/* ══ Badge / Chip ═══════════════════════════════════════════════
+   The shape the logo's "QUALITY ASSURED" chip uses: a soft pill,
+   caps, wide tracking. */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 var(--s1);
+  border-radius: var(--r-pill);
+  background: var(--brand-soft);
+  color: var(--brand);
+  font: var(--t-eyebrow);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+:root[data-theme="dark"] .badge { color: var(--brand-3); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .badge { color: var(--brand-3); }
+}
+.badge.neutral { background: var(--hover); color: var(--text-2); }
+.badge.success { background: var(--success-soft); color: var(--success-ink); }
+.badge.warning { background: var(--warning-soft); color: var(--warning-ink); }
+.badge.danger  { background: var(--danger-soft);  color: var(--danger-ink); }
+
+/* ══ Progress ═══════════════════════════════════════════════════ */
+.progress {
+  position: relative;
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--sunken);
+  overflow: hidden;
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.progress > .bar {
+  height: 100%;
+  width: 0%;
+  border-radius: var(--r-pill);
+  /* Navy into indigo: the fill reads as the brand rather than as a
+     generic accent, and the gradient makes small percentages visible. */
+  background: linear-gradient(90deg, var(--navy), var(--indigo));
+  transition: width var(--dur-3) var(--ease-soft);
+}
+:root[data-theme="dark"] .progress > .bar { background: linear-gradient(90deg, var(--indigo), var(--brand-3)); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .progress > .bar { background: linear-gradient(90deg, var(--indigo), var(--brand-3)); }
+}
+.progress > .bar.live::after {
+  content: "";
+  position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .45), transparent);
+  animation: sheen 1.5s var(--ease) infinite;
+}
+@keyframes sheen { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+
+/* ══ Empty state ════════════════════════════════════════════════ */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: var(--s5) var(--s3);
+}
+.empty-state .art {
+  display: grid;
+  place-items: center;
+  width: 56px; height: 56px;
+  margin-bottom: var(--s2);
+  border-radius: var(--r-card);
+  background: var(--brand-softer);
+  color: var(--brand);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+:root[data-theme="dark"] .empty-state .art { color: var(--brand-3); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .empty-state .art { color: var(--brand-3); }
+}
+.empty-state .art svg { width: 24px; height: 24px; }
+.empty-state h3 { font: var(--t-title); letter-spacing: var(--track-display); }
+.empty-state p {
+  margin-top: 6px;
+  max-width: 30ch;
+  font: var(--t-body);
+  color: var(--text-2);
+}
+.empty-state .cta { display: flex; gap: var(--s1); margin-top: var(--s3); }
+
+/* ══ Toast ══════════════════════════════════════════════════════ */
+.toasts {
+  position: fixed;
+  left: 50%; bottom: calc(var(--statusbar) + var(--s2));
+  z-index: var(--z-toast);
+  display: flex;
+  flex-direction: column-reverse;
+  align-items: center;
+  gap: var(--s1);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+.toast {
+  display: flex;
+  align-items: center;
+  gap: var(--s1);
+  max-width: 340px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  /* Not a pill: an error message wraps to two or three lines, and a 999px
+     radius on a block that tall bulges into a lozenge. */
+  border-radius: var(--r-btn);
+  align-items: flex-start;
+  background: var(--card);
+  color: var(--text);
+  font: var(--t-label);
+  box-shadow: var(--e4);
+  animation: toast-in var(--dur-3) var(--ease) both;
+}
+.toast.out { animation: toast-out 160ms var(--ease-in) both; }
+.toast svg { width: 15px; height: 15px; }
+.toast.success svg { color: var(--success-ink); }
+.toast.warning svg { color: var(--warning-ink); }
+.toast.danger svg  { color: var(--danger-ink); }
+@keyframes toast-in  { from { opacity: 0; transform: translateY(10px) scale(.96); } to { opacity: 1; transform: none; } }
+@keyframes toast-out { to   { opacity: 0; transform: translateY(6px) scale(.98); } }
+
+/* ══ Overlay + Command palette ══════════════════════════════════ */
+.overlay {
+  position: fixed; inset: 0;
+  z-index: var(--z-overlay);
+  display: flex;
+  justify-content: center;
+  padding-top: 64px;
+  background: var(--overlay);
+  backdrop-filter: blur(3px);
+  animation: fade var(--dur-2) var(--ease) both;
+}
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+
+.palette {
+  /* Never wider than the frame it lives in — the popup is 480px and a
+     fixed 400px leaves too little air at the sides on the narrow build. */
+  width: min(400px, calc(100vw - var(--s4)));
+  max-height: 420px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--card);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-card);
+  box-shadow: var(--e4);
+  animation: pop var(--dur-3) var(--ease) both;
+}
+@keyframes pop { from { opacity: 0; transform: translateY(-8px) scale(.97); } to { opacity: 1; transform: none; } }
+
+.palette-field {
+  display: flex;
+  align-items: center;
+  gap: var(--s1);
+  padding: 0 var(--s2);
+  height: 48px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+.palette-field svg { width: 16px; height: 16px; color: var(--text-3); }
+.palette-field input {
+  flex: 1; min-width: 0; border: 0; outline: 0; background: none;
+  font: var(--t-body);
+}
+.palette-field input::placeholder { color: var(--text-3); }
+.palette-field input:focus-visible { box-shadow: none; }
+
+.palette-list { padding: var(--s1); }
+.palette-group {
+  padding: var(--s1) var(--s1) 4px;
+  font: var(--t-eyebrow);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.palette-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 10px;
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font: var(--t-label);
+  text-align: left;
+}
+.palette-item .ico { display: grid; place-items: center; width: 20px; color: var(--text-2); }
+.palette-item .ico svg { width: 15px; height: 15px; }
+.palette-item .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.palette-item[aria-selected="true"] { background: var(--brand-soft); }
+.palette-item[aria-selected="true"] .ico { color: var(--brand); }
+:root[data-theme="dark"] .palette-item[aria-selected="true"] .ico { color: var(--brand-3); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .palette-item[aria-selected="true"] .ico { color: var(--brand-3); }
+}
+.palette-empty { padding: var(--s4) var(--s2); text-align: center; color: var(--text-3); font: var(--t-body); }
+
+/* ══ Keycap ═════════════════════════════════════════════════════ */
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px; height: 18px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text-3);
+  font: 500 10px/1 var(--font);
+}
+
+/* ══ Tooltip (CSS-only, rail + icon buttons) ════════════════════
+
+   Placement is explicit rather than always-right. The rail sits at the
+   left edge, so its tips open to the right and stay inside the frame —
+   but the topbar's controls sit against the *right* edge, where the
+   same rule put the tip 74px outside a 480px popup: invisible behind
+   `overflow: hidden`, and wide enough to stretch the document past the
+   popup frame Chrome sizes itself to. Those tips drop downward and
+   align to the button's right edge instead.
+   ══════════════════════════════════════════════════════════════ */
+[data-tip] { position: relative; }
+[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  left: calc(100% + var(--tip-gap));
+  top: 50%;
+  z-index: var(--z-toast);
+  padding: 5px 9px;
+  border-radius: var(--r-xs);
+  background: var(--near-black);
+  color: #FFFFFF;
+  font: var(--t-meta);
+  white-space: nowrap;
+  opacity: 0;
+  transform: translateY(-50%) translateX(-4px);
+  pointer-events: none;
+  transition: opacity var(--dur-1) var(--ease), transform var(--dur-1) var(--ease);
+}
+[data-tip]:hover::after { opacity: 1; transform: translateY(-50%); transition-delay: 320ms; }
+
+[data-tip][data-tip-at="below-end"]::after {
+  left: auto;
+  right: 0;
+  top: calc(100% + var(--tip-gap));
+  transform: translateY(-4px);
+}
+[data-tip][data-tip-at="below-end"]:hover::after { transform: none; }
+
+:root[data-theme="dark"] [data-tip]::after { background: var(--raised); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) [data-tip]::after { background: var(--raised); }
+}
+
+/* ══ Section heading ════════════════════════════════════════════ */
+.eyebrow {
+  font: var(--t-eyebrow);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s2);
+  margin-bottom: var(--s1);
+}
+
+/* ══ Divider ════════════════════════════════════════════════════ */
+.divider { height: 1px; background: var(--border); border: 0; margin: var(--s2) 0; }

@@ -1,0 +1,387 @@
+/* ══════════════════════════════════════════════════════════════════
+   app.css — the workspace shell and its views.
+
+   Layout is a fixed rail + a column that owns its own scrolling. Views
+   are siblings that swap via [data-view] on the shell, so adding CRM or
+   an AI panel later is one nav item and one <section> — no relayout.
+   ══════════════════════════════════════════════════════════════════ */
+
+.app {
+  display: grid;
+  grid-template-columns: var(--rail) minmax(0, 1fr);
+  /* minmax(0,…) on the row too: a bare 1fr floors at min-content and the
+     status bar gets pushed past the bottom of the frame. */
+  grid-template-rows: minmax(0, 1fr);
+  height: 100%;
+}
+
+/* ══ Rail ═══════════════════════════════════════════════════════ */
+.rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s-half);
+  padding: 12px 0 var(--s1);
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+}
+
+/* The Content Daddy mark on its navy plate — the reversed lockup the
+   guideline approves for navy, indigo and photographic grounds.
+
+   Flat on purpose. Misuse rule 03 rules out drop shadows, glows and bevels
+   on the logo, so the plate carries no elevation even though every other
+   raised surface in the shell does. */
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 34px; height: 34px;
+  margin-bottom: 10px;
+  border-radius: var(--r-sm);
+  background: var(--brand);
+  color: var(--on-brand);
+  flex: none;
+}
+.brand-mark svg { width: 20px; height: 20px; }
+
+.rail-btn {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 38px; height: 38px;
+  border-radius: 11px;
+  color: var(--text-3);
+  transition: color var(--dur-1) var(--ease), background var(--dur-1) var(--ease), transform var(--dur-1) var(--ease);
+}
+.rail-btn svg { width: 18px; height: 18px; }
+.rail-btn:hover { color: var(--text); background: var(--hover); }
+.rail-btn:active { transform: scale(.92); }
+.rail-btn[aria-current="true"] { color: var(--brand); background: var(--brand-soft); }
+:root[data-theme="dark"] .rail-btn[aria-current="true"] { color: var(--brand-3); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .rail-btn[aria-current="true"] { color: var(--brand-3); }
+}
+
+/* the active marker slides between items */
+.rail-btn::before {
+  content: "";
+  position: absolute;
+  left: -9px; top: 50%;
+  width: 3px; height: 0;
+  border-radius: 0 3px 3px 0;
+  background: var(--brand-2);
+  transform: translateY(-50%);
+  transition: height var(--dur-2) var(--ease-soft);
+}
+.rail-btn[aria-current="true"]::before { height: 20px; }
+
+.rail-spacer { flex: 1; }
+
+/* ══ Main column ════════════════════════════════════════════════ */
+.main {
+  display: grid;
+  /* The column must be declared: an implicit `auto` track sizes to the
+     widest row's max-content and would burst out of the popup frame. */
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: var(--topbar) minmax(0, 1fr) var(--statusbar);
+  min-width: 0;
+  background: var(--bg);
+}
+
+/* ── topbar ─────────────────────────────────────────────────── */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: var(--s1);
+  min-width: 0;
+  padding: 0 var(--s2);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.topbar .title { flex: 1; min-width: 0; }
+.topbar h1 {
+  font: var(--t-title);
+  letter-spacing: var(--track-display);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.topbar .sub {
+  font: var(--t-meta);
+  color: var(--text-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* the ⌘K affordance, deliberately visible so the shortcut is discoverable */
+.cmdk-trigger {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 8px 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--sunken);
+  color: var(--text-3);
+  font: var(--t-meta);
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease);
+}
+.cmdk-trigger:hover { background: var(--surface); color: var(--text); border-color: var(--border-strong); }
+.cmdk-trigger svg { width: 14px; height: 14px; }
+
+/* ── view stack ─────────────────────────────────────────────── */
+.views { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+.view { display: none; height: 100%; padding: var(--s2); }
+.view.on { display: block; animation: view-in var(--dur-2) var(--ease) both; }
+@keyframes view-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+/* ── statusbar ──────────────────────────────────────────────── */
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: var(--s1);
+  min-width: 0;
+  padding: 0 var(--s2);
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  font: var(--t-meta);
+  color: var(--text-3);
+}
+.statusbar .sep { flex: 1; }
+.statusbar .metric { color: var(--text-2); }
+.statusbar .metric b { color: var(--text); font-weight: 500; }
+
+/* status pill — popup.js rewrites className to "pill <status>".
+
+   The lamp takes the saturated value and the label takes the -ink one:
+   the same amber that reads perfectly as a 6px dot is around 1.9:1
+   against white as text, which is not a state anyone can read at a
+   glance — and glanceability is the entire job of a status pill. */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: var(--t-eyebrow);
+  letter-spacing: var(--track-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-2);
+}
+.pill .lamp { width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); flex: none; }
+.pill.starting, .pill.running, .pill.stopping { color: var(--brand); }
+.pill.starting .lamp, .pill.running .lamp, .pill.stopping .lamp {
+  background: var(--brand-2);
+  box-shadow: 0 0 0 3px var(--brand-soft);
+  animation: lamp 1.4s var(--ease) infinite;
+}
+:root[data-theme="dark"] .pill.starting, :root[data-theme="dark"] .pill.running,
+:root[data-theme="dark"] .pill.stopping { color: var(--brand-3); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .pill.starting,
+  :root:not([data-theme="light"]) .pill.running,
+  :root:not([data-theme="light"]) .pill.stopping { color: var(--brand-3); }
+}
+.pill.paused .lamp, .pill.stopped .lamp, .pill.interrupted .lamp,
+.pill.session_limit_reached .lamp { background: var(--warning); }
+.pill.paused, .pill.stopped, .pill.interrupted,
+.pill.session_limit_reached { color: var(--warning-ink); }
+.pill.done .lamp { background: var(--success); }
+.pill.done { color: var(--success-ink); }
+.pill.error .lamp { background: var(--danger); }
+.pill.error { color: var(--danger-ink); }
+@keyframes lamp { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+/* ══════════════════════════════════════════════════════════════
+   View: Scrape
+   ══════════════════════════════════════════════════════════════ */
+.stack { display: flex; flex-direction: column; gap: var(--s2); }
+
+.field-row { display: flex; gap: var(--s1); }
+.field-row .input.grow { flex: 1 1 auto; min-width: 0; }
+.field-row .input.qty { flex: 0 0 132px; }
+
+.opts { display: flex; flex-wrap: wrap; gap: 0 var(--s3); }
+
+/* run readout */
+.readout { display: flex; align-items: flex-end; justify-content: space-between; gap: var(--s2); }
+.readout .figure {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s1);
+  font: var(--t-display);
+  letter-spacing: var(--track-display);
+}
+.readout .figure .of { font: var(--t-body); color: var(--text-3); }
+.readout .right { text-align: right; }
+.readout .pct { font: var(--t-title); letter-spacing: var(--track-display); }
+.readout .eta { font: var(--t-meta); color: var(--text-3); }
+.readout .eta:empty { display: none; }
+
+/* four-up metrics, separated by rules rather than boxed */
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  margin-top: var(--s2);
+  padding-top: var(--s2);
+  border-top: 1px solid var(--border);
+}
+.metrics .m { min-width: 0; padding-left: 12px; border-left: 1px solid var(--border); }
+.metrics .m:first-child { padding-left: 0; border-left: 0; }
+.metrics .m b {
+  display: block;
+  font: var(--t-title); font-size: 17px;
+  letter-spacing: var(--track-display);
+}
+.metrics .m span { display: block; margin-top: 2px; font: var(--t-meta); color: var(--text-3); }
+
+/* session request budget — the ceiling that ends a run cleanly */
+.budget { margin-top: var(--s2); padding-top: var(--s2); border-top: 1px solid var(--border); }
+.budget-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s2);
+  margin-bottom: 6px;
+  font: var(--t-meta);
+  color: var(--text-2);
+}
+.meter {
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: var(--sunken);
+  overflow: hidden;
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.meter > .bar {
+  height: 100%;
+  width: 0%;
+  border-radius: var(--r-pill);
+  background: var(--text-3);
+  transition: width var(--dur-3) var(--ease-soft), background var(--dur-2) var(--ease);
+}
+/* Amber past three-quarters, red at the ceiling — the run stops there. */
+.meter > .bar.warn { background: var(--warning); }
+.meter > .bar.full { background: var(--danger); }
+
+/* pagination honesty line */
+.note {
+  margin-top: var(--s2);
+  padding-top: var(--s2);
+  border-top: 1px solid var(--border);
+  font: var(--t-meta);
+  color: var(--text-2);
+  line-height: 1.5;
+}
+
+/* profile card */
+.profile { display: flex; gap: var(--s2); align-items: flex-start; }
+.profile .avatar {
+  width: 44px; height: 44px;
+  flex: none;
+  border-radius: var(--r-sm);
+  object-fit: cover;
+  background: var(--sunken);
+  box-shadow: 0 0 0 1px var(--border);
+}
+.profile.no-avatar .avatar { display: none; }
+.profile .who { flex: 1; min-width: 0; }
+.profile .pname { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font: var(--t-label); font-weight: 600; }
+.profile .pbio {
+  margin-top: 4px;
+  font: var(--t-meta);
+  color: var(--text-2);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.profile .pstats { margin-top: 6px; font: var(--t-meta); color: var(--text-3); }
+
+/* attention notice */
+.notice {
+  display: flex;
+  gap: var(--s1);
+  padding: 12px var(--s2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warning);
+  border-radius: var(--r-sm);
+  background: var(--warning-soft);
+}
+.notice.is-error { border-left-color: var(--danger); background: var(--danger-soft); }
+.notice svg { width: 16px; height: 16px; color: var(--warning-ink); margin-top: 1px; }
+.notice.is-error svg { color: var(--danger-ink); }
+.notice .body { flex: 1; min-width: 0; }
+.notice p { font: var(--t-meta); color: var(--text); line-height: 1.5; }
+.notice p:empty { display: none; }
+.notice .acts { display: flex; gap: var(--s1); margin-top: 10px; }
+
+/* export */
+.zip-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s2);
+  margin-top: var(--s1);
+  font: var(--t-meta);
+  color: var(--text-2);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   View: Activity
+   ══════════════════════════════════════════════════════════════ */
+.view-activity { flex-direction: column; gap: var(--s1); }
+.view-activity.on { display: flex; }
+.list-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s2); flex: none; }
+.log { flex: 1; min-height: 0; margin: 0 calc(var(--s1) * -1); }
+.log li {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px var(--s1);
+  border-radius: var(--r-xs);
+  font: var(--t-meta);
+  color: var(--text-2);
+  line-height: 1.5;
+  word-break: break-word;
+}
+.log li + li { box-shadow: inset 0 1px 0 var(--border); }
+.log li .lv {
+  width: 6px; height: 6px;
+  margin-top: 6px;
+  border-radius: 50%;
+  background: var(--text-3);
+  flex: none;
+}
+.log li.warn .lv    { background: var(--warning); }
+.log li.error .lv   { background: var(--danger); }
+.log li.success .lv { background: var(--success); }
+.log li.error .msg  { color: var(--danger-ink); }
+.log li .msg { flex: 1; min-width: 0; }
+.log li .t { flex: none; font-family: var(--mono); font-size: 10.5px; color: var(--text-3); margin-top: 1px; }
+.log li.empty { display: block; padding: 0; box-shadow: none; }
+.log li.empty + li { box-shadow: none; }
+/* A message the popup raised itself — it is not in the worker's log and
+   is dropped on the next re-render, so it is marked as transient. */
+.log li.transient { background: var(--brand-softer); }
+
+/* ══════════════════════════════════════════════════════════════
+   View: Settings
+   ══════════════════════════════════════════════════════════════ */
+
+.setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s2);
+  padding: 12px 0;
+}
+.setting + .setting { border-top: 1px solid var(--border); }
+.setting .label { font: var(--t-label); }
+.setting .hint { margin-top: 2px; font: var(--t-meta); color: var(--text-3); }
+.setting .control { flex: none; display: flex; align-items: center; gap: var(--s-half); }
+.theme-seg { width: 168px; }
+
+/* the wordmark in About — set in the display face, tight, as the logo is */
+.wordmark {
+  font: 700 13px/1.2 var(--font-display);
+  letter-spacing: var(--track-display);
+  color: var(--brand);
+}
+:root[data-theme="dark"] .wordmark { color: var(--brand-3); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .wordmark { color: var(--brand-3); }
+}

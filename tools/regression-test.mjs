@@ -982,7 +982,17 @@ check('a video post survives with its text and counts', () => {
 });
 
 check('a stripped video post is re-typed by what is left', () => {
-  ok(/post\.type = post\.media\.length \? 'image' : 'text'/.test(stripBody), 'so it files under the right folder');
+  // By the same rule the detail pass uses, so a surviving document files under
+  // Documents rather than Photos.
+  ok(/post\.type = classifyByMedia\(post\.media, 'text'\)/.test(stripBody), 'so it files under the right folder');
+  ok(!/post\.media\.length \? 'image' : 'text'/.test(stripBody), 'the old rule called a document an image');
+});
+
+check('classifyByMedia prefers a document over an image', () => {
+  eq(E.classifyByMedia([{ type: 'document' }, { type: 'image' }], 'video'), 'document');
+  eq(E.classifyByMedia([{ type: 'image' }], 'video'), 'image');
+  eq(E.classifyByMedia([], 'video'), 'video');
+  eq(E.classifyByMedia([], 'text'), 'text');
 });
 
 check('the detail pass cannot put the skipped video back', () => {
@@ -1003,6 +1013,61 @@ check('a post whose media proved unobtainable is not retried forever', () => {
   const body = CS_SRC.slice(CS_SRC.indexOf('async function detailPass'));
   ok(/post\.mediaIncomplete = false;/.test(body), 'the permalink is the authoritative source');
   ok(/post\.mediaUnavailable = true;/.test(body), 'recorded rather than silently dropped');
+});
+
+/* ================================================================== *
+ * Strategy escalation
+ * ================================================================== */
+group('the feed scroll runs wherever the tab already is');
+
+check('being on the activity page does not skip the DOM strategy', () => {
+  const body = CS_SRC.slice(CS_SRC.indexOf('const onActivityPage'), CS_SRC.indexOf("if (phase === 'posts-dom'"));
+  // The guard must not mention onActivityPage at all: deciding *whether* to
+  // escalate on where the tab happens to be is what skipped the strategy.
+  ok(
+    /if \(CFG\.dom\.enabled && via !== 'voyager' && S\.collected < cfg\.maxPosts\) \{/.test(body),
+    'escalation is decided by the shortfall alone'
+  );
+  ok(/if \(onActivityPage\) \{/.test(body), 'where the tab is only chooses scroll-here vs move-there');
+  ok(/harvestViaDom\(add\)/.test(body), 'scroll here rather than navigating to where we already are');
+  ok(/MSG\.C_NAVIGATE/.test(body), 'the move is still there for the profile page');
+});
+
+/* ================================================================== *
+ * A retry that succeeds must undo the failure it recorded
+ * ================================================================== */
+group('recovering from a failed detail fetch');
+
+check('the content script clears the error rather than deleting the key', () => {
+  const body = CS_SRC.slice(CS_SRC.indexOf('async function detailPass'));
+  ok(/post\.error = '';/.test(body), 'assigned empty');
+  ok(!/delete post\.error/.test(body), 'a delete cannot survive the worker\'s Object.assign merge');
+});
+
+check('the worker drops the post from its failure list', () => {
+  ok(/function dropFailure\(/.test(BG_SRC), 'dropFailure exists');
+  const body = BG_SRC.slice(BG_SRC.indexOf('function upsertPosts'));
+  ok(/if \(!posts\[at\]\.error\) dropFailure/.test(body), 'called from the merge branch');
+});
+
+/* ================================================================== *
+ * Nothing in the archive may silently overwrite anything else
+ * ================================================================== */
+group('archive path collisions');
+
+check('documents are numbered like every other media kind', () => {
+  const body = BG_SRC.slice(BG_SRC.indexOf('function zipEntries'));
+  ok(/let docNo = 0;/.test(body), 'a counter exists');
+  ok(!/`\$\{folder\}\/document\.txt`/.test(body), 'the fixed path is what collided');
+});
+
+check('a final pass guarantees every path is unique', () => {
+  ok(/function dedupePaths\(/.test(BG_SRC), 'dedupePaths exists');
+  ok(/return dedupePaths\(items\);/.test(BG_SRC), 'zipEntries returns through it');
+  // Renamed, never dropped — losing the file is the worse archive.
+  const body = BG_SRC.slice(BG_SRC.indexOf('function dedupePaths'));
+  ok(!/splice|filter|continue;\s*\}\s*$/.test(body.slice(0, body.indexOf('return items'))) || /item\.path = /.test(body),
+     'collisions are renamed');
 });
 
 /* ---------------- summary ---------------- */

@@ -721,6 +721,14 @@ chrome.runtime.onConnect.addListener((port) => {
   });
 });
 
+/** Forgets a recorded failure once that post has been captured after all. */
+function dropFailure(activityId) {
+  const at = state.failed.findIndex((f) => f.activityId === activityId);
+  if (at < 0) return;
+  state.failed.splice(at, 1);
+  state.failedCount = Math.max(0, state.failedCount - 1);
+}
+
 function upsertPosts(incoming) {
   if (!Array.isArray(incoming) || !incoming.length) return;
   for (const p of incoming) {
@@ -736,6 +744,10 @@ function upsertPosts(incoming) {
       // updates merge over the harvest pass's placeholder.
       posts[at] = Object.assign({}, posts[at], p, { index: posts[at].index });
       dirtyChunks.add(chunkOf(at));
+      // A post that failed and then succeeded on a retry stops being a
+      // failure, so the popup's Failed tile counts what is still broken
+      // rather than every failure the run has ever seen.
+      if (!posts[at].error) dropFailure(p.activityId);
     }
   }
   state.collected = posts.length;
@@ -1223,6 +1235,7 @@ function zipEntries() {
 
     let mediaNo = 0;
     let videoNo = 0;
+    let docNo = 0;
     // Posters are numbered independently of videos: a stranded stream gets a
     // poster but never a video file, so sharing one counter made the next
     // video's poster reuse a number that was already taken.
@@ -1231,14 +1244,23 @@ function zipEntries() {
 
     for (const m of media) {
       if (m.type === 'document') {
+        /*
+         * Numbered like every other media kind. A post carrying two documents
+         * wrote `document.txt` twice — the same path, so the second entry
+         * shadowed the first on extraction and one document's record was lost.
+         * The first keeps the plain name so the common single-document post
+         * looks the way it always has.
+         */
+        docNo++;
+        const stem = docNo === 1 ? 'document' : `document_${U.pad(docNo, 2)}`;
         if (m.url && /^https?:/i.test(m.url)) {
           items.push({
-            path: `${folder}/${U.sanitizeSegment(m.title || 'document')}.${U.extFromUrl(m.url, 'pdf')}`,
+            path: `${folder}/${U.sanitizeSegment(m.title || stem)}.${U.extFromUrl(m.url, 'pdf')}`,
             url: m.url
           });
         }
         items.push({
-          path: `${folder}/document.txt`,
+          path: `${folder}/${stem}.txt`,
           text: crlf(
             [
               kv('From post', post.postUrl || 'unknown'),
@@ -1291,6 +1313,40 @@ function zipEntries() {
   items.push({ path: `${root}/posts.csv`, text: postsCsv(posts) });
   items.push({ path: `${root}/README.txt`, text: readmeFileText(stats) });
 
+  return dedupePaths(items);
+}
+
+/**
+ * Guarantees every entry lands on its own path.
+ *
+ * A ZIP will happily carry the same path twice and every extractor keeps
+ * whichever it reads last, so a collision is silent data loss — the archive
+ * completes, just missing a file, which is the failure mode this whole export
+ * is written to avoid. The numbering above stops the collisions that are
+ * predictable; this catches the ones that come from the data. Two documents on
+ * one post sharing a title is the common case, and a document actually titled
+ * "post" or "metadata" is the nasty one, because it lands on the post body or
+ * its engagement record.
+ *
+ * Renamed rather than dropped: a `_2` suffix is a worse filename, and losing
+ * the file is a worse archive.
+ */
+function dedupePaths(items) {
+  const taken = new Set();
+  for (const item of items) {
+    if (!taken.has(item.path)) {
+      taken.add(item.path);
+      continue;
+    }
+    const slash = item.path.lastIndexOf('/');
+    const dot = item.path.lastIndexOf('.');
+    const stem = dot > slash ? item.path.slice(0, dot) : item.path;
+    const ext = dot > slash ? item.path.slice(dot) : '';
+    let n = 2;
+    while (taken.has(`${stem}_${n}${ext}`)) n++;
+    item.path = `${stem}_${n}${ext}`;
+    taken.add(item.path);
+  }
   return items;
 }
 

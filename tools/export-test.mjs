@@ -193,7 +193,10 @@ function loadFixture(opts) {
   s.pagination = (opts && opts.pagination) || { stoppedEarly: true, reason: 'Voyager feed returned a page with no new posts after 4 page(s).', pages: 4 };
   s.failedCount = (opts && opts.failedCount) || 0;
   s.options = Object.assign({ includePosts: true, includeComments: false, skipVideos: false, includeProfileMedia: true }, (opts && opts.options) || {});
-  BG.load(s, POSTS.map((p) => Object.assign({}, p)));
+  // `posts` lets a case drive the layout over a shape the shared fixture does
+  // not carry, without every other case having to know about it.
+  const rows = (opts && opts.posts) || POSTS;
+  BG.load(s, rows.map((p) => Object.assign({}, p)));
   return s;
 }
 
@@ -670,6 +673,69 @@ check('archive paths are unique — nothing silently overwrites', () => {
   const dupes = paths.filter((p, i) => paths.indexOf(p) !== i);
   if (dupes.length) throw new Error(`duplicates: ${[...new Set(dupes)].join(', ')}`);
   return `${paths.length} unique`;
+});
+
+/*
+ * A ZIP holds duplicate paths happily and every extractor keeps whichever it
+ * reads last, so a collision is silent data loss. These are the shapes that
+ * produced one: two documents on a post, and a document whose title lands on a
+ * name the layout already uses.
+ */
+const docPost = (media) => ({
+  activityId: '7100000000000000099',
+  urn: 'urn:li:activity:7100000000000000099',
+  postUrl: 'https://www.linkedin.com/feed/update/urn:li:activity:7100000000000000099/',
+  type: 'document',
+  text: 'Slides from the talk.',
+  publishedAt: 1735689600000,
+  reactions: 4,
+  comments: 0,
+  reposts: 0,
+  media
+});
+
+check('a single document is still plainly document.txt', () => {
+  loadFixture({ posts: [docPost([{ type: 'document', url: 'https://media.licdn.com/a.pdf', title: 'Deck', pages: 9 }])] });
+  const paths = pathsOf(BG.zipEntries());
+  ok(paths.some((p) => p.endsWith('/document.txt')), 'the common case keeps the documented name');
+});
+
+check('a second document on a post does not overwrite the first', () => {
+  loadFixture({
+    posts: [
+      docPost([
+        { type: 'document', url: 'https://media.licdn.com/a.pdf', title: 'Deck', pages: 9 },
+        { type: 'document', url: 'https://media.licdn.com/b.pdf', title: 'Deck', pages: 4 }
+      ])
+    ]
+  });
+  const paths = pathsOf(BG.zipEntries());
+  const dupes = [...new Set(paths.filter((p, i) => paths.indexOf(p) !== i))];
+  if (dupes.length) throw new Error(`duplicates: ${dupes.join(', ')}`);
+  ok(paths.some((p) => p.endsWith('/document.txt')), 'first');
+  ok(paths.some((p) => p.endsWith('/document_02.txt')), 'second');
+  // Same title on both, so the payload names have to diverge too.
+  eq(paths.filter((p) => /\/Deck.*\.pdf$/.test(p)).length, 2, 'both PDFs are written');
+});
+
+check('a document titled "post" cannot land on the post body', () => {
+  loadFixture({
+    posts: [
+      docPost([
+        { type: 'document', url: 'https://media.licdn.com/a.txt', title: 'post' },
+        { type: 'document', url: 'https://media.licdn.com/b.txt', title: 'metadata' }
+      ])
+    ]
+  });
+  const entries = BG.zipEntries();
+  const paths = pathsOf(entries);
+  const dupes = [...new Set(paths.filter((p, i) => paths.indexOf(p) !== i))];
+  if (dupes.length) throw new Error(`duplicates: ${dupes.join(', ')}`);
+  // The body and the engagement record must still be the ones the layout wrote.
+  const body = entries.find((e) => e.path.endsWith('/post.txt'));
+  const meta = entries.find((e) => e.path.endsWith('/metadata.txt'));
+  ok(body && typeof body.text === 'string' && /Slides from the talk/.test(body.text), 'post.txt is the post');
+  ok(meta && typeof meta.text === 'string' && /Post URL/.test(meta.text), 'metadata.txt is the record');
 });
 
 /* ================================================================== */

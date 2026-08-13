@@ -89,14 +89,14 @@ their API" from the outside. So it lives in its own file, has no DOM or
 `chrome.*` dependency, and is tested in isolation:
 
 ```
-node tools/test.mjs               320 assertions, no dependencies
+node tools/test.mjs               329 assertions, no dependencies
 
   resolver-test.mjs   58   URN resolution, session cookies, Rest.li encoding
   utils-test.mjs      33   public-id normalisation, CSV escaping
   engine-test.mjs     53   session detection, entity mapping, profile media, paging
-  export-test.mjs     48   archive tree, CSV, README
+  export-test.mjs     51   archive tree, CSV, README, path collisions
   wiring-check.mjs    34   manifest / popup / message wiring, safety limits
-  regression-test.mjs 94   tab navigation, timers, media scope, video frames
+  regression-test.mjs 100  tab navigation, timers, media scope, strategy escalation
 ```
 
 None of it can talk to LinkedIn, which is the point — it covers exactly the
@@ -645,6 +645,44 @@ rendered text for the counts; and the `#experience` / `#education` / `#skills`
 anchor ids, which are what the profile's own in-page navigation targets. The
 embedded-JSON reader got the same CDN-path fallback, so a shape change that
 moves `profilePicture` no longer blanks the photo there either.
+
+## Four more, found by probing rather than reading
+
+- **The archive could silently lose a file.** Every entry a post's documents
+  produced was written to one fixed path — `document.txt` — so a post carrying
+  two documents wrote it twice. A ZIP holds duplicate paths happily and every
+  extractor keeps whichever it reads last, so the archive completed one file
+  short with nothing to say so. Two documents sharing a title collided the same
+  way, and a document actually titled *post* or *metadata* landed on the post
+  body or its engagement record. Documents are numbered now, and `zipEntries()`
+  returns through a final pass that guarantees uniqueness — renaming a
+  collision rather than dropping it, because a `_2` suffix is a worse filename
+  and a missing file is a worse archive.
+- **A post that failed and then succeeded stayed failed.** The detail pass did
+  `delete post.error` on a retry, but the worker merges updates over the stored
+  post with `Object.assign`, and a key that is simply *absent* from the incoming
+  object cannot un-set the one already there. So `metadata.txt` reported
+  "Detail error: HTTP 500" for posts that had been captured perfectly, and the
+  popup's Failed tile counted them forever. The error is cleared explicitly
+  now, and the worker drops the post from its failure list when it arrives
+  clean.
+- **Starting a run on the activity page collected one page and stopped.** The
+  escalation to the feed scroll was guarded on the tab *not* already being on
+  the activity page — because the branch's job was to move the tab there. But
+  the run's phase is still `main` at that point, so the feed-scroll branch
+  further down never ran either: the DOM strategy was skipped entirely, and the
+  run kept whatever the server-rendered first page held. Which is
+  indistinguishable from "this profile only has 20 posts". Where the tab is now
+  chooses *scroll here* versus *move there*, not whether to scroll at all.
+- **"Skip video" could file a document under Photos.** Re-typing a stripped
+  post called anything left over an image, so a post carrying a video *and* a
+  document ended up in `Posts/Photos/` with a PDF in it and `image` in
+  posts.csv. It uses `classifyByMedia` now — the same rule the detail pass
+  already used, so the two paths agree.
+
+All four are covered: the archive ones by real calls into `zipEntries` in
+`export-test.mjs`, the other two by `regression-test.mjs`, which pins the shape
+of code whose failure mode needs a live Chrome tab to reproduce.
 
 ## Fixed alongside the rebrand
 

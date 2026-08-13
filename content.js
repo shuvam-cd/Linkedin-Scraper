@@ -2112,7 +2112,13 @@
     post.media = post.media.filter((m) => m.type !== 'video');
     post.mediaCount = post.media.length;
     post.videosSkipped = true;
-    if (post.type === 'video') post.type = post.media.length ? 'image' : 'text';
+    /*
+     * Re-typed by the same rule the detail pass uses, so both paths agree.
+     * The old rule here called whatever survived an image if the list was not
+     * empty — so a post carrying a video *and* a document filed under
+     * Posts/Photos/ with a PDF in it, and posts.csv said `image`.
+     */
+    if (post.type === 'video') post.type = classifyByMedia(post.media, 'text');
     return true;
   }
 
@@ -2253,7 +2259,15 @@
           post.mediaIncomplete = false;
           if (!post.media || !post.media.length) post.mediaUnavailable = true;
         }
-        delete post.error;
+        /*
+         * Cleared, not deleted. The worker merges an update over the stored
+         * post with Object.assign, and a key that is simply absent from the
+         * incoming object cannot un-set the one already there — so a post that
+         * failed a detail fetch and then succeeded on a resume kept its old
+         * error forever, and metadata.txt reported "Detail error" for a post
+         * that had in fact been captured perfectly.
+         */
+        post.error = '';
         emit(MSG.C_POST_UPDATE, { post });
         done++;
         streak = 0;
@@ -2437,6 +2451,7 @@
         const r = await fetchComments(post);
         post.commentList = r.list;
         post.commentsTruncated = r.truncated;
+        post.commentError = ''; // same merge rule as post.error above
         emit(MSG.C_POST_UPDATE, { post });
         done++;
         streak = 0;
@@ -2600,22 +2615,38 @@
            * budget to rediscover the same posts.
            */
           const onActivityPage = /\/recent-activity\//.test(location.pathname);
-          if (CFG.dom.enabled && !onActivityPage && via !== 'voyager' && S.collected < cfg.maxPosts) {
-            // The activity feed lives at its own URL, so the DOM strategy needs
-            // the tab moved. The worker restarts the run there, carrying
-            // everything collected so far so nothing is re-fetched.
-            flush();
-            log(
-              'info',
-              `Have ${S.collected} of ${cfg.maxPosts} — moving the tab to the activity feed to scroll for more.`
-            );
-            S.navigating = true;
-            emit(MSG.C_NAVIGATE, {
-              url: U.activityUrl(cfg.publicId),
-              phase: 'posts-dom',
-              profile
-            });
-            throw new Abort('navigating');
+          if (CFG.dom.enabled && via !== 'voyager' && S.collected < cfg.maxPosts) {
+            if (onActivityPage) {
+              /*
+               * Already where the feed lives, so scroll it here.
+               *
+               * This used to be `!onActivityPage &&` on the condition above,
+               * which skipped the escalation whenever the tab was already on
+               * the activity page — and since `phase` is still 'main' at that
+               * point, the feed-scroll branch below never ran either. Starting
+               * a run from the target's own activity page therefore collected
+               * Strategy B's one server-rendered page and stopped, which is
+               * indistinguishable from "this profile only has 20 posts".
+               */
+              log('info', `Have ${S.collected} of ${cfg.maxPosts} — scrolling this activity feed for more.`);
+              await tryStrategy('Feed scroll', () => harvestViaDom(add));
+            } else {
+              // The activity feed lives at its own URL, so the DOM strategy
+              // needs the tab moved. The worker restarts the run there,
+              // carrying everything collected so far so nothing is re-fetched.
+              flush();
+              log(
+                'info',
+                `Have ${S.collected} of ${cfg.maxPosts} — moving the tab to the activity feed to scroll for more.`
+              );
+              S.navigating = true;
+              emit(MSG.C_NAVIGATE, {
+                url: U.activityUrl(cfg.publicId),
+                phase: 'posts-dom',
+                profile
+              });
+              throw new Abort('navigating');
+            }
           }
         }
 

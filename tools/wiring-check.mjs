@@ -318,7 +318,11 @@ check('every path the spec names is produced by zipEntries', () => {
     '/post.txt',
     '/metadata.txt',
     '_comments.txt',
-    '/document.txt',
+    // `document.txt` is deliberately absent: its name is computed now, because
+    // a post carrying two documents used to write that one fixed path twice
+    // and lose a file. A source grep cannot see a computed path, so it is
+    // asserted for real in export-test.mjs — "a second document on a post
+    // does not overwrite the first".
     '/posts.csv',
     '/README.txt',
     '/video_not_downloaded.txt',

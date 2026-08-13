@@ -773,6 +773,21 @@ const padWidth = () => 3;
 const mediaOf = (post) => (Array.isArray(post.media) ? post.media : []);
 const postedAt = (post) => U.fmtTimestamp(post.publishedAt);
 
+/*
+ * The profile sections beyond experience/education/skills, and the headings
+ * they print under. Kept in the same order the profile itself renders them.
+ * The keys match PROFILE_SECTIONS in content.js — wiring-check pins that.
+ */
+const PROFILE_SECTION_LABELS = [
+  ['certifications', 'LICENSES & CERTIFICATIONS'],
+  ['languages', 'LANGUAGES'],
+  ['volunteering', 'VOLUNTEERING'],
+  ['projects', 'PROJECTS'],
+  ['honors', 'HONORS & AWARDS'],
+  ['courses', 'COURSES'],
+  ['publications', 'PUBLICATIONS']
+];
+
 function profileFileText(p) {
   const out = [];
   out.push(p.fullName || p.publicId);
@@ -805,6 +820,29 @@ function profileFileText(p) {
     out.push(`SKILLS (${p.skills.length})`);
     out.push(RULE);
     out.push(p.skills.join(', '));
+    out.push('');
+  }
+
+  /*
+   * The rest of the profile. Every one of these sections is the same shape —
+   * a name, a qualifier, a date range and some prose — so one loop renders
+   * all of them, and a section the profile does not have prints nothing
+   * rather than an empty heading.
+   */
+  for (const [key, label] of PROFILE_SECTION_LABELS) {
+    const rows = Array.isArray(p[key]) ? p[key] : [];
+    if (!rows.length) continue;
+    out.push(`${label} (${rows.length})`);
+    out.push(RULE);
+    rows.forEach((r, i) => {
+      out.push(`${String(i + 1).padStart(3)}. ${r.name}`);
+      const line = [r.detail, r.dates].filter(Boolean).join('   ·   ');
+      if (line) out.push(`     ${line}`);
+      if (r.url) out.push(`     ${r.url}`);
+      if (r.description) {
+        for (const l of String(r.description).split(/\r?\n/)) out.push(`     ${l}`);
+      }
+    });
     out.push('');
   }
 
@@ -891,7 +929,59 @@ function metadataFileText(post) {
 
   out.push(kv('Comments', nOf(post.comments)));
   out.push(kv('Reposts', nOf(post.reposts)));
+  if (Array.isArray(post.hashtags) && post.hashtags.length) {
+    out.push(kv('Hashtags', post.hashtags.map((h) => '#' + h).join(' ')));
+  }
   out.push('');
+
+  /*
+   * What makes this post the kind of post it is. Three of the seven types
+   * used to reach the archive as a type label and nothing else: an article
+   * with no link, a poll with no result, a reshare with no idea whose post
+   * it was.
+   */
+  if (post.repost) {
+    out.push('RESHARED FROM');
+    out.push(RULE);
+    out.push(kv('Author', post.repost.author || '(not returned)'));
+    if (post.repost.authorHeadline) out.push(kv('Headline', post.repost.authorHeadline));
+    if (post.repost.authorUrl) out.push(kv('Profile', post.repost.authorUrl));
+    out.push(kv('Original post', post.repost.postUrl || '(not returned)'));
+    if (post.repost.text) {
+      out.push('');
+      for (const line of String(post.repost.text).split(/\r?\n/)) out.push(`  ${line}`);
+    }
+    out.push('');
+  }
+
+  if (post.article) {
+    out.push('LINKED ARTICLE');
+    out.push(RULE);
+    out.push(kv('Title', post.article.title || '(untitled)'));
+    if (post.article.subtitle) out.push(kv('Subtitle', post.article.subtitle));
+    out.push(kv('URL', post.article.url || '(not returned)'));
+    if (post.article.domain) out.push(kv('Domain', post.article.domain));
+    out.push('');
+  }
+
+  if (post.poll) {
+    const opts = Array.isArray(post.poll.options) ? post.poll.options : [];
+    out.push(`POLL (${opts.length} option${opts.length === 1 ? '' : 's'})`);
+    out.push(RULE);
+    if (post.poll.question) out.push(post.poll.question);
+    out.push(kv('Total votes', nOf(post.poll.totalVotes)));
+    if (post.poll.closed) out.push(kv('Status', 'closed'));
+    out.push('');
+    opts.forEach((o, i) => {
+      // A share only means something when the total is known, and a poll the
+      // viewer has not voted in often reports neither.
+      const share =
+        o.votes != null && post.poll.totalVotes ? ` (${Math.round((o.votes / post.poll.totalVotes) * 100)}%)` : '';
+      out.push(`${String(i + 1).padStart(3)}. ${o.text}`);
+      out.push(`     ${nOf(o.votes)} vote(s)${share}`);
+    });
+    out.push('');
+  }
 
   const media = mediaOf(post);
   out.push(`MEDIA (${media.length})`);
@@ -1001,7 +1091,12 @@ function videoNoteText(videos) {
 function postsCsv(list) {
   // `folder` is what makes the type-grouped tree navigable from a spreadsheet:
   // sort or filter on any column and the path to that post's files is on the row.
-  const head = ['post_url', 'date', 'type', 'folder', 'text', 'reactions', 'comments', 'reposts', 'media_count'];
+  const head = [
+    'post_url', 'date', 'type', 'folder', 'text', 'reactions', 'comments', 'reposts', 'media_count',
+    // Everything past here is flat by necessity — the structured form of all
+    // of it is in posts.json, which is what these columns point at.
+    'hashtags', 'article_url', 'poll_votes', 'reshared_from', 'reshared_url'
+  ];
   // A BOM so Excel opens UTF-8 correctly instead of mangling every accent.
   let out = '﻿' + U.csvRow(head);
   let n = 0;
@@ -1016,10 +1111,42 @@ function postsCsv(list) {
       p.reactions == null ? '' : p.reactions,
       p.comments == null ? '' : p.comments,
       p.reposts == null ? '' : p.reposts,
-      mediaOf(p).length
+      mediaOf(p).length,
+      Array.isArray(p.hashtags) ? p.hashtags.map((h) => '#' + h).join(' ') : '',
+      (p.article && p.article.url) || '',
+      p.poll && p.poll.totalVotes != null ? p.poll.totalVotes : '',
+      (p.repost && p.repost.author) || '',
+      (p.repost && p.repost.postUrl) || ''
     ]);
   }
   return out;
+}
+
+/**
+ * posts.json — the same posts with nothing flattened away.
+ *
+ * posts.csv is for a spreadsheet, so it carries one row per post and one
+ * value per cell: a media *count* rather than the URLs, a vote total rather
+ * than the split across options. The article card, the poll breakdown, the
+ * reshare provenance and every media URL are structure, and structure does
+ * not survive a CSV. This is the record the scraper actually holds.
+ *
+ * `commentList` is stripped deliberately. Comments are third-party personal
+ * data and the archive keeps every one of them under Comments/ precisely so
+ * they can be reviewed or deleted in one place; copying them in here would
+ * quietly break that.
+ */
+function postsJson(list) {
+  return JSON.stringify(
+    list.map((p) => {
+      const out = Object.assign({}, p);
+      delete out.commentList;
+      delete out.index; // an internal position, not part of the record
+      return out;
+    }),
+    null,
+    2
+  );
 }
 
 function readmeFileText(stats) {
@@ -1066,6 +1193,9 @@ function readmeFileText(stats) {
   }
   out.push('posts.csv       one row per post, for spreadsheet work. The `folder`');
   out.push('                column points at that post\'s folder in this archive.');
+  out.push('posts.json      the same posts with nothing flattened: every media URL,');
+  out.push('                the poll breakdown, the article card, the reshare it came');
+  out.push('                from. Comments are not duplicated here — see below.');
   out.push('');
 
   out.push('COMPLETENESS');
@@ -1233,6 +1363,18 @@ function zipEntries() {
       });
     }
 
+    /*
+     * An article post's hero image is on the card, not in `media`, so nothing
+     * ever downloaded it — the post folder held two text files and no picture
+     * for a post that is visually a picture and a headline.
+     */
+    if (post.article && post.article.thumbnail && /^https?:/i.test(post.article.thumbnail)) {
+      items.push({
+        path: `${folder}/article_cover.${U.extFromUrl(post.article.thumbnail, 'jpg')}`,
+        url: post.article.thumbnail
+      });
+    }
+
     let mediaNo = 0;
     let videoNo = 0;
     let docNo = 0;
@@ -1311,6 +1453,7 @@ function zipEntries() {
 
   /* ---- top level ---- */
   items.push({ path: `${root}/posts.csv`, text: postsCsv(posts) });
+  items.push({ path: `${root}/posts.json`, text: postsJson(posts) });
   items.push({ path: `${root}/README.txt`, text: readmeFileText(stats) });
 
   return dedupePaths(items);

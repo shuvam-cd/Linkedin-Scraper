@@ -531,6 +531,164 @@ check('a missing count is null rather than zero', () => {
   eq(E.countFromText(null, 'connections?'), null);
 });
 
+/* ================================================================== *
+ * The kinds that carry more than media
+ *
+ * classifyPost recognised articles, polls and reposts all along — it has to,
+ * to file them — but nothing read what makes them what they are, so three of
+ * the seven types reached the archive as a label on an empty shell.
+ * ================================================================== */
+group('article cards');
+
+const ARTICLE_NODE = {
+  entityUrn: 'urn:li:activity:1',
+  content: {
+    articleComponent: {
+      title: { text: 'Why watch time is the only number that matters' },
+      subtitle: { text: 'contentdaddy.in · 6 min read' },
+      navigationContext: { actionTarget: 'https://contentdaddy.in/blog/watch-time?utm=li' },
+      largeImage: { rootUrl: 'https://media.licdn.com/dms/image/A/', artifacts: [{ fileIdentifyingUrlPathSegment: '800/hero.jpg', width: 800 }] }
+    }
+  }
+};
+
+check('reads the headline, the link and the domain', () => {
+  const a = E.articleFrom(ARTICLE_NODE);
+  eq(a.title, 'Why watch time is the only number that matters');
+  eq(a.url, 'https://contentdaddy.in/blog/watch-time?utm=li');
+  eq(a.domain, 'contentdaddy.in', 'the domain is what makes a link scannable in a spreadsheet');
+  eq(a.thumbnail, 'https://media.licdn.com/dms/image/A/800/hero.jpg');
+});
+
+check('the type and the record agree about what an article is', () => {
+  // Both go through isArticleCard, so they cannot disagree.
+  eq(E.classifyPost(ARTICLE_NODE, []), 'article');
+  ok(E.articleFrom(ARTICLE_NODE), 'and the record is there to back the label');
+});
+
+check('a plain text post has no article card', () => {
+  eq(E.articleFrom({ entityUrn: 'urn:li:activity:2', commentary: { text: 'Just a thought.' } }), null);
+});
+
+group('polls');
+
+const POLL_NODE = {
+  entityUrn: 'urn:li:activity:3',
+  content: {
+    pollComponent: {
+      question: { text: 'How do you repurpose podcast footage?' },
+      pollOptions: [
+        { option: { text: 'Shorts only' }, voteCount: 42 },
+        { option: { text: 'Shorts + carousels' }, voteCount: 118 }
+      ],
+      pollSummary: { totalVotes: 160, pollClosed: true }
+    }
+  }
+};
+
+check('reads the question, every option and the split', () => {
+  const p = E.pollFrom(POLL_NODE);
+  eq(p.question, 'How do you repurpose podcast footage?');
+  eq(p.options.length, 2);
+  eq(p.options[1], { text: 'Shorts + carousels', votes: 118 });
+  eq(p.totalVotes, 160);
+  eq(p.closed, true);
+});
+
+check('a total LinkedIn withheld is summed from the options', () => {
+  const p = E.pollFrom({ content: { pollOptions: [{ option: { text: 'A' }, voteCount: 3 }, { option: { text: 'B' }, voteCount: 4 }] } });
+  eq(p.totalVotes, 7);
+  eq(p.closed, null, 'not stated is not the same as open');
+});
+
+check('a post with no poll reads as no poll', () => {
+  eq(E.pollFrom({ entityUrn: 'urn:li:activity:4', commentary: { text: 'x' } }), null);
+});
+
+group('reshares');
+
+check('records whose post it was', () => {
+  const r = E.repostFrom({
+    entityUrn: 'urn:li:activity:5',
+    commentary: { text: 'This is exactly right.' },
+    resharedUpdate: {
+      entityUrn: 'urn:li:activity:999',
+      actor: { name: { text: 'Grace Hopper' }, description: { text: 'Rear Admiral' }, publicIdentifier: 'grace-hopper' },
+      commentary: { text: 'We have always done it this way.' }
+    }
+  });
+  eq(r.author, 'Grace Hopper');
+  eq(r.authorHeadline, 'Rear Admiral');
+  eq(r.authorUrl, 'https://www.linkedin.com/in/grace-hopper/');
+  eq(r.activityId, '999');
+  eq(r.postUrl, 'https://www.linkedin.com/feed/update/urn:li:activity:999/');
+  eq(r.text, 'We have always done it this way.', 'the original body, not the reposter\'s comment');
+});
+
+check('an unresolved reshare still yields a permalink', () => {
+  const r = E.repostFrom({ entityUrn: 'urn:li:activity:6', '*resharedUpdate': 'urn:li:activity:12345' });
+  eq(r.activityId, '12345');
+  eq(r.postUrl, 'https://www.linkedin.com/feed/update/urn:li:activity:12345/');
+});
+
+check('an original post is not a reshare', () => {
+  eq(E.repostFrom({ entityUrn: 'urn:li:activity:7', commentary: { text: 'Mine.' } }), null);
+});
+
+group('hashtags');
+
+check('deduped, case-insensitively, in the order written', () => {
+  eq(E.hashtagsFrom('#ContentStrategy and #podcasting and #contentstrategy'), ['ContentStrategy', 'podcasting']);
+});
+
+check('reads a tag in parentheses but not a mid-word hash', () => {
+  eq(E.hashtagsFrom('(#B2B) email#notatag #Q4'), ['B2B', 'Q4']);
+});
+
+check('non-latin tags survive', () => {
+  eq(E.hashtagsFrom('#содержание #コンテンツ'), ['содержание', 'コンテンツ']);
+});
+
+check('no text, no tags', () => {
+  eq(E.hashtagsFrom(''), []);
+  eq(E.hashtagsFrom(null), []);
+});
+
+group('the rest of the profile');
+
+const SECTION_POOL = {
+  included: [
+    { $type: 'com.linkedin.voyager.dash.identity.profile.Certification', entityUrn: 'urn:li:c:1', name: { text: 'Google Analytics' }, authority: { text: 'Google' }, url: 'https://cert.example/1', dateRange: { start: { year: 2023, month: 4 } } },
+    { $type: 'com.linkedin.voyager.dash.identity.profile.Language', entityUrn: 'urn:li:l:1', name: { text: 'Bengali' }, proficiency: { text: 'Native or bilingual' } },
+    { $type: 'com.linkedin.voyager.dash.identity.profile.VolunteerExperience', entityUrn: 'urn:li:v:1', role: { text: 'Mentor' }, companyName: { text: 'STEM India' } },
+    { $type: 'com.linkedin.voyager.dash.identity.profile.Honor', entityUrn: 'urn:li:h:1', title: { text: 'Creator of the Year' }, issuer: { text: 'Podcast Awards' } }
+  ]
+};
+
+check('reads every section the table names', () => {
+  const s = E.readProfileSections(SECTION_POOL);
+  eq(Object.keys(s).sort(), E.PROFILE_SECTIONS.map((x) => x.key).sort());
+  eq(s.certifications.length, 1);
+  eq(s.languages[0], { name: 'Bengali', detail: 'Native or bilingual', dates: '', url: null, description: '' });
+});
+
+check('a certificate is issued on a date, not held until Present', () => {
+  const s = E.readProfileSections(SECTION_POOL);
+  eq(s.certifications[0].dates, 'Apr 2023');
+  eq(s.certifications[0].url, 'https://cert.example/1');
+});
+
+check('a volunteer entry leads with the role, not the organisation', () => {
+  const s = E.readProfileSections(SECTION_POOL);
+  eq(s.volunteering[0].name, 'Mentor');
+  eq(s.volunteering[0].detail, 'STEM India');
+});
+
+check('a section the profile does not have is empty, not absent', () => {
+  const s = E.readProfileSections({ included: [] });
+  for (const sec of E.PROFILE_SECTIONS) eq(Array.isArray(s[sec.key]), true, sec.key);
+});
+
 /* ================================================================== */
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
 

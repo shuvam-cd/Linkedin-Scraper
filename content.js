@@ -635,21 +635,37 @@
 
   const num = (v) => (typeof v === 'number' && isFinite(v) ? v : null);
 
+  const MONTHS = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+  /** "Mar 2019" from a Rest.li Date. */
+  function monthYear(d) {
+    if (!d || typeof d !== 'object') return '';
+    const y = d.year ? String(d.year) : '';
+    const m = d.month && MONTHS[d.month] ? MONTHS[d.month] : '';
+    return [m, y].filter(Boolean).join(' ');
+  }
+
   /** "Mar 2019 – Present" from a Rest.li DateRange. */
   function dateRangeText(r) {
     if (!r || typeof r !== 'object') return '';
-    const MONTHS = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    const one = (d) => {
-      if (!d || typeof d !== 'object') return '';
-      const y = d.year ? String(d.year) : '';
-      const m = d.month && MONTHS[d.month] ? MONTHS[d.month] : '';
-      return [m, y].filter(Boolean).join(' ');
-    };
-    const a = one(r.start);
-    const b = one(r.end);
+    const a = monthYear(r.start);
+    const b = monthYear(r.end);
     if (a && b) return `${a} – ${b}`;
     if (a) return `${a} – Present`;
     return b || '';
+  }
+
+  /**
+   * One date rather than a span.
+   *
+   * A certificate, an award, a course and a publication all happen *on* a
+   * date; they are not held from one to another. Running them through
+   * dateRangeText printed "Apr 2023 – Present" for a certificate, which reads
+   * as an ongoing engagement and is simply not what the profile said.
+   */
+  function datePointText(r) {
+    if (!r || typeof r !== 'object') return '';
+    return monthYear(r.start || r);
   }
 
   /**
@@ -1031,6 +1047,155 @@
     return out;
   }
 
+  /* ------------------------------------------------------------------ *
+   * The kinds that carry more than media
+   *
+   * classifyPost() below already recognises articles, polls and reposts — it
+   * has to, to file them — but nothing ever read what makes them what they
+   * are. So an article post exported with no link to the article, a poll with
+   * no question and no result, and a repost with no trace of whose post it
+   * was: three of the seven post types reached the archive as an empty shell
+   * with a type label on it.
+   * ------------------------------------------------------------------ */
+
+  /**
+   * A link-out card: a navigation target plus a headline. `navigationContext`
+   * on its own is far too common to key off, so the subtitle-or-image test is
+   * part of the identity — and classifyPost shares this predicate, so the type
+   * and the record can never disagree about what an article is.
+   */
+  const isArticleCard = (n) =>
+    !!n.articleComponent ||
+    !!(
+      n.navigationContext &&
+      n.navigationContext.actionTarget &&
+      n.title != null &&
+      (n.subtitle != null || n.largeImage != null)
+    );
+
+  function articleFrom(node) {
+    const found = collectContent(node, isArticleCard, { limit: 1 })[0];
+    if (!found) return null;
+    const c = found.articleComponent || found;
+    const nav = c.navigationContext || found.navigationContext || {};
+    const url = typeof nav.actionTarget === 'string' && /^https?:/i.test(nav.actionTarget) ? nav.actionTarget : null;
+    const title = textOf(c.title) || textOf(found.title);
+    if (!url && !title) return null;
+
+    let domain = '';
+    if (url) {
+      try {
+        domain = new URL(url).hostname.replace(/^www\./, '');
+      } catch (_) {
+        /* a malformed target still leaves the title worth keeping */
+      }
+    }
+    return {
+      title,
+      subtitle: textOf(c.subtitle) || textOf(found.subtitle) || '',
+      url,
+      domain,
+      thumbnail: VY.vectorImageUrl(c.largeImage || c.smallImage || found.largeImage) || null
+    };
+  }
+
+  /** Question, options and the vote split. The result *is* the post. */
+  function pollFrom(node) {
+    const found = collectContent(
+      node,
+      (n) => Array.isArray(n.pollOptions) || !!n.pollComponent || !!n.pollSummary,
+      { limit: 1 }
+    )[0];
+    if (!found) return null;
+
+    const c = found.pollComponent || found;
+    const summary = c.pollSummary || found.pollSummary || {};
+    const raw = Array.isArray(c.pollOptions) ? c.pollOptions : Array.isArray(found.pollOptions) ? found.pollOptions : [];
+    const options = raw
+      .map((o) => ({
+        text: textOf(o.option) || textOf(o.optionText) || textOf(o.text) || '',
+        votes: num(o.voteCount) ?? num(o.numVotes) ?? null
+      }))
+      .filter((o) => o.text);
+
+    const counted = options.reduce((a, b) => a + (b.votes || 0), 0);
+    const total = num(summary.totalVotes) ?? num(summary.voteCount) ?? (counted || null);
+    if (!options.length && total == null) return null;
+
+    return {
+      question: textOf(c.question) || textOf(found.question) || '',
+      options,
+      totalVotes: total,
+      // `null` where LinkedIn did not say, which is not the same as "open".
+      closed: summary.pollClosed === true || c.pollClosed === true ? true : null
+    };
+  }
+
+  /**
+   * Who wrote the post this one reshares.
+   *
+   * A repost's media and body already come through, because `resharedUpdate`
+   * is deliberately absent from CHROME_KEYS — the original's photos are the
+   * repost's photos. What was missing is provenance: without it a repost row
+   * in posts.csv is indistinguishable from something the profile wrote.
+   */
+  function repostFrom(node) {
+    let reshared = linked(node, 'resharedUpdate');
+    if (!reshared) {
+      const holder = collectContent(node, (n) => n.resharedUpdate != null || n['*resharedUpdate'] != null, { limit: 1 })[0];
+      if (holder) reshared = linked(holder, 'resharedUpdate');
+    }
+    if (!reshared) return null;
+
+    // Unresolved it is just the URN, which is still enough for a permalink.
+    if (typeof reshared === 'string') {
+      const id = VY.activityId(reshared);
+      return id ? { author: '', authorHeadline: '', authorUrl: null, activityId: id, postUrl: U.postUrlFromActivityId(id), text: '' } : null;
+    }
+    if (typeof reshared !== 'object') return null;
+
+    const actor = reshared.actor || reshared.author || {};
+    const author =
+      textOf(actor.name) ||
+      textOf(actor.title) ||
+      [textOf(actor.firstName), textOf(actor.lastName)].filter(Boolean).join(' ');
+    const publicId = actor.publicIdentifier || (actor.miniProfile && actor.miniProfile.publicIdentifier) || '';
+    const navTarget = actor.navigationContext && actor.navigationContext.actionTarget;
+
+    const own = VY.activityId(reshared.entityUrn || reshared['*entityUrn'] || '');
+    const scanned = VY.findUrns(reshared, 'urn:li:activity:');
+    const id = own || (scanned.length ? VY.activityId(scanned[0]) : null);
+
+    return {
+      author,
+      authorHeadline: textOf(actor.description) || textOf(actor.headline) || '',
+      authorUrl: publicId ? U.profileUrl(publicId) : typeof navTarget === 'string' ? navTarget : null,
+      activityId: id,
+      postUrl: id ? U.postUrlFromActivityId(id) : null,
+      // The original's body, read with the chrome skipped as everywhere else.
+      text: postTextFrom(reshared)
+    };
+  }
+
+  /*
+   * Hashtags are how a LinkedIn post is found, so they are worth a column of
+   * their own rather than being left buried in the body text. Unicode-aware:
+   * #ContentStrategy and #содержание are both tags.
+   */
+  const HASHTAG = /(?:^|[^\p{L}\p{N}_#])#([\p{L}\p{N}_]{2,60})/gu;
+
+  function hashtagsFrom(text) {
+    const out = [];
+    const seen = new Set();
+    for (const m of String(text == null ? '' : text).matchAll(HASHTAG)) {
+      const key = m[1].toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(m[1]);
+    }
+    return out;
+  }
+
   /**
    * Post kind, decided from the shapes present rather than from a $type
    * whitelist — LinkedIn renames model classes far more often than it changes
@@ -1046,16 +1211,9 @@
     if (media.some((m) => m.type === 'video')) return 'video';
     if (has((n) => Array.isArray(n.pollOptions) || n.pollSummary || n.pollComponent)) return 'poll';
     // An article card is a link-out: a navigation target plus a headline.
-    // `navigationContext` alone is far too common to key off.
-    if (
-      has(
-        (n) =>
-          !!n.articleComponent ||
-          !!(n.navigationContext && n.navigationContext.actionTarget && n.title != null && (n.subtitle != null || n.largeImage != null))
-      )
-    ) {
-      return 'article';
-    }
+    // `navigationContext` alone is far too common to key off. Shared with
+    // articleFrom() so the type and the record cannot disagree.
+    if (has(isArticleCard)) return 'article';
     if (media.some((m) => m.type === 'image')) return 'image';
     return 'text';
   }
@@ -1160,7 +1318,7 @@
       if (!banner) banner = pickImageByPath(urls, PROFILE_BANNER_PATH);
     }
 
-    return {
+    return Object.assign(readProfileSections(pool || p, index), {
       publicId: p.publicIdentifier || '',
       profileUrn: p.entityUrn || null,
       fullName,
@@ -1180,7 +1338,7 @@
       currentPosition: null, // filled in below
       profileUrl: p.publicIdentifier ? U.profileUrl(p.publicIdentifier) : null,
       scrapedAt: new Date().toISOString()
-    };
+    });
   }
 
   /*
@@ -1265,6 +1423,100 @@
     return out;
   }
 
+  /* ------------------------------------------------------------------ *
+   * The rest of the profile
+   *
+   * Experience, education and skills were the only three sections read, so a
+   * profile's certifications, languages, volunteering, projects, awards,
+   * courses and publications were all on screen and none of them reached the
+   * export.
+   *
+   * One table drives both strategies: `type` matches the entity in an embedded
+   * payload, `anchor` is the section id the profile's own in-page navigation
+   * targets. Neither needs a per-section reader, because every one of these
+   * sections is the same shape — a name, a qualifier, a date range and some
+   * prose.
+   * ------------------------------------------------------------------ */
+  const PROFILE_SECTIONS = [
+    // `point` marks the sections that happen *on* a date rather than spanning
+    // one — a certificate is issued, an award is given.
+    { key: 'certifications', type: /\.Certification$/,       anchor: 'licenses_and_certifications', point: true },
+    { key: 'languages',      type: /\.Language$/,            anchor: 'languages' },
+    { key: 'volunteering',   type: /\.VolunteerExperience$/, anchor: 'volunteering_experience' },
+    { key: 'projects',       type: /\.Project$/,             anchor: 'projects' },
+    { key: 'honors',         type: /\.Honor$/,               anchor: 'honors_and_awards', point: true },
+    { key: 'courses',        type: /\.Course$/,              anchor: 'courses', point: true },
+    { key: 'publications',   type: /\.Publication$/,         anchor: 'publications', point: true }
+  ];
+
+  /** The fields these sections share, whichever one an entity belongs to. */
+  function sectionEntry(n, section) {
+    /*
+     * `role` sits ahead of `companyName` because a volunteer entry is
+     * "Mentor — STEM India", not "STEM India — Mentor": the thing the person
+     * did is the heading, and the organisation qualifies it. Every other
+     * section names itself through `name` or `title`.
+     */
+    const name = textOf(n.name) || textOf(n.title) || textOf(n.role) || textOf(n.schoolName) || textOf(n.companyName);
+    if (!name) return null;
+    const range = n.dateRange || n.timePeriod || n.issuedOn || n.issueDate;
+    return {
+      name,
+      detail:
+        textOf(n.authority) ||
+        textOf(n.proficiency) ||
+        textOf(n.publisher) ||
+        textOf(n.companyName) ||
+        textOf(n.issuer) ||
+        textOf(n.occupation) ||
+        '',
+      dates: (section && section.point ? datePointText(range) : dateRangeText(range)) || '',
+      url: typeof n.url === 'string' && /^https?:/i.test(n.url) ? n.url : null,
+      description: textOf(n.description)
+    };
+  }
+
+  function readProfileSections(pool, index) {
+    const out = {};
+    for (const s of PROFILE_SECTIONS) {
+      const rows = [];
+      const seen = new Set();
+      for (const raw of VY.collect(pool, (x) => typeof x.$type === 'string' && s.type.test(x.$type))) {
+        const e = sectionEntry(resolveAgainst(pool, raw, index), s);
+        if (!e) continue;
+        const key = `${e.name}|${e.detail}|${e.dates}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        rows.push(e);
+      }
+      out[s.key] = rows;
+    }
+    return out;
+  }
+
+  /** The same seven sections, read off the rendered page. */
+  function profileSectionsFromDom() {
+    const out = {};
+    for (const s of PROFILE_SECTIONS) {
+      const rows = [];
+      const seen = new Set();
+      for (const spans of sectionRows(s.anchor, 60)) {
+        const name = spans[0];
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+        rows.push({
+          name,
+          detail: spans[1] || '',
+          dates: spans[2] || '',
+          url: null,
+          description: spans.slice(3).join(' ')
+        });
+      }
+      out[s.key] = rows;
+    }
+    return out;
+  }
+
   function withCurrentPosition(profile) {
     if (!profile) return profile;
     const cur = (profile.experience || []).find((e) => e.current) || (profile.experience || [])[0] || null;
@@ -1334,13 +1586,20 @@
     const derived = timestampFromActivityId(activityId);
     const timestampSource = publishedAt ? 'api' : derived ? 'derived-from-urn' : 'unknown';
     const incomplete = cleaned.length === 0 && declaresMedia(node);
+    const text = postTextFrom(node);
 
     return {
       activityId,
       urn: ownUrn,
       postUrl: U.postUrlFromActivityId(activityId),
       type,
-      text: postTextFrom(node),
+      text,
+      // Present only where the post actually is one of these, so a text post
+      // does not carry three nulls into every export.
+      article: articleFrom(node),
+      poll: pollFrom(node),
+      repost: repostFrom(node),
+      hashtags: hashtagsFrom(text),
       publishedAt: publishedAt || derived || null,
       timestampSource,
       reactions: social.reactions,
@@ -1511,7 +1770,7 @@
     // down the page other people's follower counts appear too.
     const topText = textOfNode(root || (document && document.body)).slice(0, 3000);
 
-    return {
+    return Object.assign(profileSectionsFromDom(), {
       publicId,
       profileUrn: null,
       fullName: name,
@@ -1532,7 +1791,7 @@
       profileUrl: U.profileUrl(publicId),
       scrapedAt: new Date().toISOString(),
       source: 'dom'
-    };
+    });
   }
 
   /** innerText where the page offers it, textContent otherwise. */
@@ -2798,6 +3057,12 @@
       needsDetail,
       mediaFromHtml,
       classifyByMedia,
+      articleFrom,
+      pollFrom,
+      repostFrom,
+      hashtagsFrom,
+      readProfileSections,
+      PROFILE_SECTIONS,
       pickImageByPath,
       allImageUrls,
       imageUrlsIn,

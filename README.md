@@ -60,13 +60,22 @@ carry the run until you fill A in.
 
 **The profile, always.** Full name, headline, public identifier, location,
 industry, current position, full experience history, education, skills, about
-text, follower and connection counts, profile photo, banner.
+text, follower and connection counts, profile photo, banner — plus licences and
+certifications, languages, volunteering, projects, honours and awards, courses
+and publications. Read from the embedded payload where LinkedIn ships one, and
+off the rendered page otherwise.
 
 **That profile's posts.** Per post: the activity URN, permalink, body text,
 publish timestamp, type (text / image / document / video / article / repost /
 poll), reaction count broken down by type where LinkedIn returns it, comment
-count, repost count, and every attached media URL. Images and documents are
-fetched into the archive.
+count, repost count, hashtags, and every attached media URL. Images and
+documents are fetched into the archive.
+
+And what makes each kind that kind, which used to be dropped: an **article**'s
+headline, subtitle, link, domain and cover image; a **poll**'s question, every
+option, the votes on each and whether it closed; a **reshare**'s original
+author, their headline and profile, the original permalink and its body. Three
+of the seven types used to reach the archive as a type label on an empty shell.
 
 **Comments, off by default, behind a chip.** Per comment: author display name,
 headline, profile URL, text, timestamp, reaction count. Hard-capped at
@@ -89,12 +98,12 @@ their API" from the outside. So it lives in its own file, has no DOM or
 `chrome.*` dependency, and is tested in isolation:
 
 ```
-node tools/test.mjs               329 assertions, no dependencies
+node tools/test.mjs               357 assertions, no dependencies
 
   resolver-test.mjs   58   URN resolution, session cookies, Rest.li encoding
   utils-test.mjs      33   public-id normalisation, CSV escaping
-  engine-test.mjs     53   session detection, entity mapping, profile media, paging
-  export-test.mjs     51   archive tree, CSV, README, path collisions
+  engine-test.mjs     70   session detection, entity mapping, post kinds, profile
+  export-test.mjs     62   archive tree, CSV, JSON, README, path collisions
   wiring-check.mjs    34   manifest / popup / message wiring, safety limits
   regression-test.mjs 100  tab navigation, timers, media scope, strategy escalation
 ```
@@ -645,6 +654,63 @@ rendered text for the counts; and the `#experience` / `#education` / `#skills`
 anchor ids, which are what the profile's own in-page navigation targets. The
 embedded-JSON reader got the same CDN-path fallback, so a shape change that
 moves `profilePicture` no longer blanks the photo there either.
+
+## What the export gained, and how the saving was checked
+
+Three of the seven post types were recognised but never read. `classifyPost`
+had to spot an article, a poll and a reshare in order to file them — and then
+nothing looked at what it had found, so those posts reached the archive as a
+type label on an empty shell. All three are recorded now:
+
+| Kind | What is captured |
+| --- | --- |
+| Article | headline, subtitle, link, domain, and the cover image, downloaded into the post folder |
+| Poll | question, every option, votes per option and the share of the total, whether it closed |
+| Reshare | original author, their headline and profile URL, the original permalink, and the original body |
+
+Plus **hashtags** on every post, and the seven profile sections that were never
+read at all — licences and certifications, languages, volunteering, projects,
+honours and awards, courses, publications. One table in `content.js` drives
+both strategies: a `$type` for the embedded payload, a section anchor id for
+the rendered page. Two details that only show up in the output: a certificate
+is *issued on* a date rather than held until Present, and a volunteer entry
+leads with the role rather than the organisation.
+
+**`posts.json` is new.** `posts.csv` is for a spreadsheet, so it flattens —
+one row per post, a media *count* rather than the URLs, a vote total rather
+than the split. The article card, the poll breakdown, the reshare provenance
+and every media URL are structure, and structure does not survive a CSV. The
+CSV also gained `hashtags`, `article_url`, `poll_votes`, `reshared_from` and
+`reshared_url` as flat projections. `commentList` is deliberately *not* in
+`posts.json`: comments are third-party personal data and the archive keeps all
+of it under `Comments/` so it can be reviewed or deleted in one place.
+
+### The saving process, checked end to end
+
+Not by reading it. `zipwriter.js` was loaded into Chromium, driven with the
+real `zipEntries()` output, and the archive it produced was written to disk and
+opened with standard `unzip`:
+
+```
+unzip -t roundtrip.zip     No errors detected in compressed data
+18 entries, every one extracting with its CRC intact
+```
+
+Then the case that actually worries me. The classic end-of-central-directory
+record counts entries in 16 bits, so an archive of more than 65,535 files needs
+the ZIP64 record and its locator — code that had never run. That is not a
+hypothetical here: frame extraction writes one still per second, capped at 900
+per video, so roughly 73 videos is enough to cross it. Built with 70,000
+entries:
+
+```
+unzip -l zip64.zip         70000 files
+unzip -t zip64.zip         No errors detected in compressed data
+unzip -p … frame_069999    f69999
+```
+
+The ZIP64 path is correct, and an entry past the 16-bit ceiling extracts with
+the right bytes.
 
 ## Four more, found by probing rather than reading
 

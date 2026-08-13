@@ -346,7 +346,11 @@ check('posts.csv has exactly the specified columns, in order', () => {
   const m = backgroundJs.match(/const head = \[([^\]]+)\]/);
   if (!m) throw new Error('csv header not found');
   const cols = m[1].match(/'([^']+)'/g).map((s) => s.replace(/'/g, ''));
-  const want = ['post_url', 'date', 'type', 'folder', 'text', 'reactions', 'comments', 'reposts', 'media_count'];
+  const want = [
+    'post_url', 'date', 'type', 'folder', 'text', 'reactions', 'comments', 'reposts', 'media_count',
+    // Flat projections of what posts.json carries structurally.
+    'hashtags', 'article_url', 'poll_votes', 'reshared_from', 'reshared_url'
+  ];
   if (JSON.stringify(cols) !== JSON.stringify(want)) {
     throw new Error(`got ${cols.join(',')}`);
   }
@@ -366,7 +370,14 @@ check('a downloadable video is queued for frame extraction', () => {
 
 check('README.txt carries the third-party data note when comments are on', () => {
   const i = backgroundJs.indexOf('function readmeFileText');
-  const body = backgroundJs.slice(i, i + 4000);
+  /*
+   * To the end of the function, not a fixed 4000 characters. A window that
+   * silently stops short reports "the note is missing" the moment anything is
+   * added above it — which is exactly what happened when posts.json was
+   * described in the same README.
+   */
+  const end = backgroundJs.indexOf('\n/* ---', i);
+  const body = backgroundJs.slice(i, end < 0 ? undefined : end);
   if (!/third-party personal data/i.test(body)) throw new Error('note text missing');
   if (!/state\.options\.includeComments/.test(body)) throw new Error('note is not conditional');
 });

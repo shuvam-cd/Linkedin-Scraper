@@ -67,7 +67,7 @@ const factory = new Function(
   'chrome',
   `${read('background.js')}
    return {
-     zipEntries, postsCsv, readmeFileText, metadataFileText, profileFileText,
+     zipEntries, postsCsv, postsJson, readmeFileText, metadataFileText, profileFileText,
      commentsFileText, videoNoteText, experienceFileText, educationFileText,
      blankState,
      load: (s, p) => { state = s; posts = p; reindex(); }
@@ -404,7 +404,8 @@ check('header is exactly the specified columns', () => {
   loadFixture();
   eq(
     csvRows(BG.postsCsv(POSTS))[0],
-    '"post_url","date","type","folder","text","reactions","comments","reposts","media_count"'
+    '"post_url","date","type","folder","text","reactions","comments","reposts","media_count",' +
+      '"hashtags","article_url","poll_votes","reshared_from","reshared_url"'
   );
 });
 
@@ -421,11 +422,11 @@ check('a multi-line post body never splits a row', () => {
   eq(rows.length, 6, 'row count is unaffected by the embedded newline');
 });
 
-check('every row has exactly nine fields', () => {
+check('every row has exactly fourteen fields', () => {
   loadFixture();
   for (const row of csvRows(BG.postsCsv(POSTS))) {
     const n = csvFields(row).length;
-    if (n !== 9) throw new Error(`${n} fields in: ${row.slice(0, 70)}…`);
+    if (n !== 14) throw new Error(`${n} fields in: ${row.slice(0, 70)}…`);
   }
 });
 
@@ -716,6 +717,151 @@ check('a second document on a post does not overwrite the first', () => {
   ok(paths.some((p) => p.endsWith('/document_02.txt')), 'second');
   // Same title on both, so the payload names have to diverge too.
   eq(paths.filter((p) => /\/Deck.*\.pdf$/.test(p)).length, 2, 'both PDFs are written');
+});
+
+/* ================================================================== *
+ * The kinds that carry more than media
+ * ================================================================== */
+group('article, poll and reshare records');
+
+const RICH = [
+  {
+    activityId: '7100000000000000011',
+    urn: 'urn:li:activity:7100000000000000011',
+    postUrl: 'https://www.linkedin.com/feed/update/urn:li:activity:7100000000000000011/',
+    type: 'article',
+    text: 'New piece. #ContentStrategy #podcasting',
+    publishedAt: 1735689600000,
+    reactions: 88, reactionsByType: { LIKE: 88 }, comments: 9, reposts: 3, media: [],
+    hashtags: ['ContentStrategy', 'podcasting'],
+    article: {
+      title: 'Why watch time is the only number that matters',
+      subtitle: 'contentdaddy.in · 6 min read',
+      url: 'https://contentdaddy.in/blog/watch-time',
+      domain: 'contentdaddy.in',
+      thumbnail: 'https://media.licdn.com/dms/image/A/hero.jpg'
+    }
+  },
+  {
+    activityId: '7100000000000000012',
+    urn: 'urn:li:activity:7100000000000000012',
+    postUrl: 'https://www.linkedin.com/feed/update/urn:li:activity:7100000000000000012/',
+    type: 'poll',
+    text: 'How do you repurpose podcast footage?',
+    publishedAt: 1735776000000,
+    reactions: 12, reactionsByType: {}, comments: 4, reposts: 0, media: [], hashtags: [],
+    poll: {
+      question: 'How do you repurpose podcast footage?',
+      options: [{ text: 'Shorts only', votes: 40 }, { text: 'Shorts + carousels', votes: 160 }],
+      totalVotes: 200, closed: true
+    }
+  },
+  {
+    activityId: '7100000000000000013',
+    urn: 'urn:li:activity:7100000000000000013',
+    postUrl: 'https://www.linkedin.com/feed/update/urn:li:activity:7100000000000000013/',
+    type: 'repost',
+    text: 'This is exactly right.',
+    publishedAt: 1735862400000,
+    reactions: 5, reactionsByType: {}, comments: 0, reposts: 0, media: [], hashtags: [],
+    repost: {
+      author: 'Grace Hopper', authorHeadline: 'Rear Admiral, US Navy',
+      authorUrl: 'https://www.linkedin.com/in/grace-hopper/',
+      activityId: '999', postUrl: 'https://www.linkedin.com/feed/update/urn:li:activity:999/',
+      text: 'We have always done it this way.'
+    }
+  }
+];
+
+check('metadata.txt carries the article link, not just the type label', () => {
+  const t = BG.metadataFileText(RICH[0]);
+  ok(/LINKED ARTICLE/.test(t), 'section');
+  ok(/Why watch time is the only number/.test(t), 'title');
+  ok(/contentdaddy\.in\/blog\/watch-time/.test(t), 'the link is the whole point');
+  ok(/#ContentStrategy #podcasting/.test(t), 'hashtags');
+});
+
+check('the article cover is downloaded, not just referenced', () => {
+  loadFixture({ posts: [RICH[0]] });
+  const cover = BG.zipEntries().find((e) => /article_cover\./.test(e.path));
+  ok(cover, 'an article post is a picture and a headline; the picture belongs in the folder');
+  eq(cover.url, 'https://media.licdn.com/dms/image/A/hero.jpg');
+});
+
+check('metadata.txt carries the poll result, with each option’s share', () => {
+  const t = BG.metadataFileText(RICH[1]);
+  ok(/POLL \(2 options\)/.test(t), 'heading');
+  ok(/Total votes\s+: 200/.test(t), 'total');
+  ok(/Shorts \+ carousels/.test(t), 'option text');
+  ok(/160 vote\(s\) \(80%\)/.test(t), 'share of the vote');
+  ok(/closed/.test(t), 'status');
+});
+
+check('metadata.txt says whose post a reshare was', () => {
+  const t = BG.metadataFileText(RICH[2]);
+  ok(/RESHARED FROM/.test(t), 'section');
+  ok(/Grace Hopper/.test(t), 'author');
+  ok(/in\/grace-hopper/.test(t), 'their profile');
+  ok(/urn:li:activity:999/.test(t), 'the original permalink');
+  ok(/We have always done it this way/.test(t), 'and the original body');
+});
+
+check('a text post carries none of those sections', () => {
+  const t = BG.metadataFileText({ activityId: '1', postUrl: 'u', type: 'text', text: 'x', media: [] });
+  ok(!/LINKED ARTICLE|POLL \(|RESHARED FROM/.test(t), 'no empty headings for a plain post');
+});
+
+group('posts.csv and posts.json');
+
+check('the flat columns project the structured record', () => {
+  const rows = csvRows(BG.postsCsv(RICH));
+  ok(/"#ContentStrategy #podcasting"/.test(rows[1]), 'hashtags');
+  ok(/contentdaddy\.in\/blog\/watch-time/.test(rows[1]), 'article_url');
+  ok(/"200"/.test(rows[2]), 'poll_votes');
+  ok(/"Grace Hopper"/.test(rows[3]), 'reshared_from');
+  ok(/urn:li:activity:999/.test(rows[3]), 'reshared_url');
+});
+
+check('posts.json keeps the structure the CSV has to flatten', () => {
+  const j = JSON.parse(BG.postsJson(RICH));
+  eq(j.length, 3);
+  eq(j[1].poll.options[1], { text: 'Shorts + carousels', votes: 160 }, 'the split survives');
+  eq(j[0].article.domain, 'contentdaddy.in');
+  eq(j[2].repost.author, 'Grace Hopper');
+});
+
+check('posts.json does not duplicate third-party comments', () => {
+  // They live under Comments/ so they can be reviewed or deleted in one place.
+  loadFixture({ options: { includeComments: true } });
+  const j = JSON.parse(BG.postsJson(POSTS));
+  ok(POSTS.some((p) => Array.isArray(p.commentList) && p.commentList.length), 'the fixture has comments');
+  ok(j.every((p) => !('commentList' in p)), 'and none of them are in posts.json');
+});
+
+check('posts.json is in the archive', () => {
+  loadFixture();
+  ok(pathsOf(BG.zipEntries()).some((p) => p.endsWith('/posts.json')));
+});
+
+group('the rest of the profile');
+
+check('profile.txt renders every section the profile has', () => {
+  const t = BG.profileFileText(
+    Object.assign({}, PROFILE, {
+      certifications: [{ name: 'Google Analytics', detail: 'Google', dates: 'Apr 2023', url: 'https://cert.example/1', description: '' }],
+      languages: [{ name: 'Bengali', detail: 'Native or bilingual', dates: '', url: null, description: '' }],
+      volunteering: [{ name: 'Mentor', detail: 'STEM India', dates: '2021 – 2022', url: null, description: 'Weekend workshops.' }]
+    })
+  );
+  ok(/LICENSES & CERTIFICATIONS \(1\)/.test(t), 'certifications');
+  ok(/Google Analytics/.test(t) && /cert\.example/.test(t), 'with its credential link');
+  ok(/LANGUAGES \(1\)/.test(t) && /Native or bilingual/.test(t), 'languages');
+  ok(/VOLUNTEERING \(1\)/.test(t) && /Weekend workshops/.test(t), 'volunteering');
+});
+
+check('a section the profile does not have prints no heading', () => {
+  const t = BG.profileFileText(PROFILE);
+  ok(!/PUBLICATIONS|HONORS & AWARDS|COURSES/.test(t), 'no empty headings');
 });
 
 check('a document titled "post" cannot land on the post body', () => {

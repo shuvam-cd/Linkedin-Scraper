@@ -98,14 +98,14 @@ their API" from the outside. So it lives in its own file, has no DOM or
 `chrome.*` dependency, and is tested in isolation:
 
 ```
-node tools/test.mjs               357 assertions, no dependencies
+node tools/test.mjs               368 assertions, no dependencies
 
   resolver-test.mjs   58   URN resolution, session cookies, Rest.li encoding
   utils-test.mjs      33   public-id normalisation, CSV escaping
-  engine-test.mjs     70   session detection, entity mapping, post kinds, profile
+  engine-test.mjs     76   session detection, entity mapping, post kinds, profile
   export-test.mjs     62   archive tree, CSV, JSON, README, path collisions
   wiring-check.mjs    34   manifest / popup / message wiring, safety limits
-  regression-test.mjs 100  tab navigation, timers, media scope, strategy escalation
+  regression-test.mjs 105  tab navigation, timers, media scope, strategy escalation
 ```
 
 None of it can talk to LinkedIn, which is the point — it covers exactly the
@@ -435,6 +435,7 @@ trademark position.
 |---|---|
 | Posts | Off collects the profile only — a fast, cheap way to build a prospect list. |
 | Comments | Off by default. On, adds `comments.txt` per post and the data-handling note to `README.txt`. Roughly doubles the run's cost. |
+| Full history | On by default. Follows LinkedIn's "Show all" pages so experience, education and skills are the whole list rather than the two or three rows the profile card previews. One request per section, only for sections the profile actually links to — typically three. Off, the export carries whatever the card showed. |
 | Skip video | Drops the **video**, not the post. The body text, counts and permalink are kept; the post re-files under Photos or Text depending on what is left, and `metadata.txt` says the video was skipped. (Before 1.0.4 this discarded the whole post.) |
 | Profile media | Off skips the profile picture and banner; the text files are still written. |
 
@@ -654,6 +655,60 @@ rendered text for the counts; and the `#experience` / `#education` / `#skills`
 anchor ids, which are what the profile's own in-page navigation targets. The
 embedded-JSON reader got the same CDN-path fallback, so a shape change that
 moves `profilePicture` no longer blanks the photo there either.
+
+## The profile card is a preview, and it was being read as the history
+
+Symptom: two jobs in `experience.txt` for someone with twelve, one school for
+someone with four, two skills out of thirty-one. Or nothing at all.
+
+A LinkedIn profile card **is a preview**. It renders two or three roles and
+puts the rest behind *Show all 12 experiences*, which is its own URL:
+`/in/<id>/details/experience/`. The scraper read only the card, and
+`experience.txt` said so in as many words — "LinkedIn renders the full history
+behind a 'Show all' page that this scraper does not follow". That is an honest
+note about a hole, and it was still a hole.
+
+Those pages are followed now. Which ones exist is not guessed: the card links
+to exactly the sections the profile has, so the links are collected while the
+profile is being read — off the document already in hand, so finding them costs
+no request — and only those are fetched. A profile with three "Show all" links
+costs three extra requests out of the 300-request session budget.
+
+Driven end to end against a card showing 2 roles, 1 school and 2 skills, with
+the full lists behind their pages:
+
+```
+experience: 12    education: 4    skills: 10
+pages fetched: /in/sumon/  …/details/experience/  …/details/education/  …/details/skills/
+```
+
+Merging is additive and keyed on identity, so a role that appears on both the
+card and the page is counted once, and a page that fails to load leaves what
+the card found intact. Three other things came out of building it:
+
+- **The section container is no longer only `closest('section')`.** The anchor
+  is an empty div LinkedIn drops in for its own navigation; if the card around
+  it ever stops being a `<section>`, every section reads as empty — and an
+  empty education list is indistinguishable from a profile with no education.
+  The walk up now settles for whatever ancestor actually contains a list.
+- **Generic profile components are read.** Modern LinkedIn ships sections as
+  components rather than typed `Position`/`Education` entities — a title, a
+  subtitle, a caption and a metadata line, which is the same four fields in the
+  same order the markup prints. On a details page the URL already says which
+  section it is, so those rows feed the same mappers with no ambiguity.
+- **A load-order bug the tests caught.** The page table is built at load time
+  and names the row mappers, which were `const` arrows declared further down —
+  so the table hit their temporal dead zone and threw before the content script
+  registered a single listener. They are function declarations now, and
+  `regression-test.mjs` pins that.
+
+**Full history** is a chip in the popup, on by default. Turn it off and the
+export carries what the card showed, at three fewer requests.
+
+Recommendations and interests have "Show all" pages too and are deliberately
+not followed: both are other people's words and identities, and this archive
+keeps all third-party data under `Comments/` so it can be reviewed or deleted
+in one place. Adding them would quietly break that.
 
 ## What the export gained, and how the saving was checked
 

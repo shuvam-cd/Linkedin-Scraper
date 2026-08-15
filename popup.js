@@ -22,6 +22,7 @@
     optIncludeComments: $('optIncludeComments'),
     optSkipVideos: $('optSkipVideos'),
     optIncludeProfileMedia: $('optIncludeProfileMedia'),
+    optFullProfile: $('optFullProfile'),
     btnStart: $('btnStart'),
     startLabel: $('startLabel'),
     btnStop: $('btnStop'),
@@ -63,7 +64,8 @@
     el.optIncludePosts,
     el.optIncludeComments,
     el.optSkipVideos,
-    el.optIncludeProfileMedia
+    el.optIncludeProfileMedia,
+    el.optFullProfile
   ].concat(presets);
 
   const BUSY = ['starting', 'running', 'stopping'];
@@ -114,7 +116,8 @@
         includePosts: el.optIncludePosts.checked,
         includeComments: el.optIncludeComments.checked,
         skipVideos: el.optSkipVideos.checked,
-        includeProfileMedia: el.optIncludeProfileMedia.checked
+        includeProfileMedia: el.optIncludeProfileMedia.checked,
+        fullProfile: el.optFullProfile.checked
       }
     };
   }
@@ -129,6 +132,7 @@
     el.optIncludeComments.checked = o.includeComments === true;
     el.optSkipVideos.checked = !!o.skipVideos;
     el.optIncludeProfileMedia.checked = o.includeProfileMedia !== false;
+    el.optFullProfile.checked = o.fullProfile !== false;
   }
 
   const saveForm = () => chrome.storage.local.set({ [U.KEYS.FORM]: readForm() });
@@ -518,7 +522,8 @@
     el.optIncludePosts,
     el.optIncludeComments,
     el.optSkipVideos,
-    el.optIncludeProfileMedia
+    el.optIncludeProfileMedia,
+    el.optFullProfile
   ].forEach((c) => c.addEventListener('change', saveForm));
 
   el.maxPosts.addEventListener('input', syncPresets);

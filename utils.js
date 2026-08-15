@@ -72,7 +72,11 @@ if (!globalThis.LIS) {
       includePosts: true,
       includeComments: false, // third-party personal data — opt in explicitly
       skipVideos: false,
-      includeProfileMedia: true
+      includeProfileMedia: true,
+      // Follow LinkedIn's "Show all" pages so experience and education are the
+      // full history rather than the two rows that fitted on the card. One
+      // request per section, only for sections the profile actually links to.
+      fullProfile: true
     };
 
     /*

@@ -122,6 +122,9 @@
     requests: 0,
     startedAt: 0,
     profile: null,
+    // "Show all" links seen while reading the profile, so the full-history
+    // pass costs no extra page fetch to find them.
+    detailLinks: null,
     pagination: null // { stoppedEarly, reason, pages }
   };
 
@@ -1497,23 +1500,7 @@
   /** The same seven sections, read off the rendered page. */
   function profileSectionsFromDom() {
     const out = {};
-    for (const s of PROFILE_SECTIONS) {
-      const rows = [];
-      const seen = new Set();
-      for (const spans of sectionRows(s.anchor, 60)) {
-        const name = spans[0];
-        if (!name || seen.has(name)) continue;
-        seen.add(name);
-        rows.push({
-          name,
-          detail: spans[1] || '',
-          dates: spans[2] || '',
-          url: null,
-          description: spans.slice(3).join(' ')
-        });
-      }
-      out[s.key] = rows;
-    }
+    for (const s of PROFILE_SECTIONS) out[s.key] = entriesFromRows(sectionRows(s.anchor, 60));
     return out;
   }
 
@@ -1617,7 +1604,25 @@
   /* ------------------------------------------------------------------ *
    * Profile — three strategies
    * ------------------------------------------------------------------ */
+  /**
+   * The profile, then the pages the profile card only links to.
+   *
+   * readProfile() reads the card — which is a preview. Whatever it produces,
+   * the "Show all" pages are then followed and merged in, so `experience` is
+   * the whole history rather than the two roles that fitted on screen.
+   */
   async function getProfile(publicId) {
+    const profile = await readProfile(publicId);
+    if (!profile) return profile;
+    if (S.cfg && S.cfg.fullProfile === false) return profile;
+
+    // Collected while the profile was being read, off whichever document that
+    // read used — fetching the page a second time just to look at its links
+    // would spend a request for something already in hand.
+    return enrichFromDetailPages(publicId, profile, S.detailLinks || new Set());
+  }
+
+  async function readProfile(publicId) {
     // A — Voyager
     if (CFG.profile.enabled) {
       try {
@@ -1639,9 +1644,21 @@
     // B — the payload the server rendered into the page
     if (CFG.embeddedJson.enabled) {
       try {
-        const pool = onProfilePageFor(publicId)
-          ? mergePayloads(payloadsFromRoot(document))
-          : await fetchPagePayloads(U.profileUrl(publicId));
+        let pool;
+        if (onProfilePageFor(publicId)) {
+          pool = mergePayloads(payloadsFromRoot(document));
+          rememberDetailLinks(document);
+        } else {
+          // One fetch, read twice: the embedded payload for the entities and
+          // the markup for the "Show all" links.
+          const html = await apiGet(U.profileUrl(publicId), { expectJson: false });
+          pool = mergePayloads(payloadsFromHtml(html));
+          try {
+            rememberDetailLinks(new DOMParser().parseFromString(html, 'text/html'));
+          } catch (_) {
+            /* the payload read still stands */
+          }
+        }
         const p = pickProfileEntity(pool, publicId);
         if (p) {
           log('success', 'Profile read from the embedded page payload.');
@@ -1656,6 +1673,7 @@
 
     // C — read the rendered page
     log('warn', 'Reading the profile off the rendered page. Expect fewer fields.');
+    rememberDetailLinks(document);
     return withCurrentPosition(profileFromDom(publicId));
   }
 
@@ -1803,6 +1821,164 @@
     }
   }
 
+  /* ------------------------------------------------------------------ *
+   * The "Show all" pages
+   *
+   * A LinkedIn profile card is a *preview*. It renders two or three roles and
+   * a couple of schools and puts the rest behind "Show all 12 experiences",
+   * which is its own URL: /in/<id>/details/experience/. Reading only the card
+   * meant the export carried whatever happened to fit above the fold and
+   * silently called it the full history — the one failure mode this scraper
+   * is otherwise written to avoid.
+   *
+   * Which pages exist is not guessed. The card links to exactly the ones the
+   * profile has, so the links are collected and followed, and nothing is
+   * spent on a section the profile does not have.
+   * ------------------------------------------------------------------ */
+  const DETAILS_PAGES = [
+    { key: 'experience',    path: 'experience',              map: experienceFromRows, id: (r) => `${r.title}|${r.company}|${r.dates}` },
+    { key: 'education',     path: 'education',               map: educationFromRows,  id: (r) => `${r.school}|${r.degree}|${r.dates}` },
+    // Skills are bare names rather than records, so the row's first span is
+    // the whole thing and the name is its own identity.
+    { key: 'skills',        path: 'skills',                  map: (rows) => rows.map((s) => s[0]).filter(Boolean), id: (r) => String(r) },
+    { key: 'certifications', path: 'certifications',         map: entriesFromRows,    id: entryKey },
+    { key: 'volunteering',  path: 'volunteering-experiences', map: entriesFromRows,   id: entryKey },
+    { key: 'projects',      path: 'projects',                map: entriesFromRows,    id: entryKey },
+    { key: 'honors',        path: 'honors',                  map: entriesFromRows,    id: entryKey },
+    { key: 'languages',     path: 'languages',               map: entriesFromRows,    id: entryKey },
+    { key: 'courses',       path: 'courses',                 map: entriesFromRows,    id: entryKey },
+    { key: 'publications',  path: 'publications',            map: entriesFromRows,    id: entryKey }
+  ];
+
+  function entryKey(r) {
+    return `${r.name}|${r.detail}|${r.dates}`;
+  }
+
+  /** A hard ceiling on what this costs: one request per page, at most. */
+  const MAX_DETAILS_PAGES = 10;
+
+  /**
+   * Rows out of a details page's *embedded* payload.
+   *
+   * Modern LinkedIn ships profile sections as generic components rather than
+   * typed Position/Education entities — a title, a subtitle, a caption and a
+   * metadata line, which is the same four fields in the same order the markup
+   * prints. On a details page the URL already says which section it is, so
+   * there is no ambiguity about what those rows are.
+   */
+  function componentRows(pool) {
+    const out = [];
+    for (const n of VY.collect(pool, (x) => !!x.entityComponent || (x.components && x.components.entityComponent))) {
+      const c = n.entityComponent || (n.components && n.components.entityComponent);
+      if (!c || typeof c !== 'object') continue;
+      const spans = [
+        textOf(c.titleV2) || textOf(c.title),
+        textOf(c.subtitle),
+        textOf(c.caption),
+        textOf(c.metadata)
+      ].filter(Boolean);
+      if (spans.length) out.push(spans);
+    }
+    return out;
+  }
+
+  /** Records the "Show all" links seen while reading a profile document. */
+  function rememberDetailLinks(root) {
+    if (!S.detailLinks) S.detailLinks = new Set();
+    for (const name of linkedDetailPages(root)) S.detailLinks.add(name);
+  }
+
+  /** The /details/<name>/ pages this profile actually links to. */
+  function linkedDetailPages(root) {
+    const found = new Set();
+    let anchors;
+    try {
+      anchors = (root || document).querySelectorAll('a[href*="/details/"]');
+    } catch (_) {
+      return found;
+    }
+    for (const a of anchors) {
+      const href = a.getAttribute('href') || '';
+      const m = href.match(/\/details\/([a-z-]+)/i);
+      if (m) found.add(m[1].toLowerCase());
+    }
+    return found;
+  }
+
+  /**
+   * Follows those pages and merges what they hold into the profile.
+   *
+   * Additive by construction: a details page is a superset of the card, so
+   * merging can only ever grow a list. Nothing the card already found is
+   * dropped if a page fails to load.
+   */
+  async function enrichFromDetailPages(publicId, profile, linked) {
+    if (!profile) return profile;
+
+    const wanted = DETAILS_PAGES.filter((d) => {
+      if (linked.has(d.path)) return true;
+      // Follow the two that matter even when no link was seen — a card that
+      // renders everything inline has no "Show all", and so does one whose
+      // markup we failed to read.
+      return (d.key === 'experience' || d.key === 'education') && !(profile[d.key] || []).length;
+    }).slice(0, MAX_DETAILS_PAGES);
+
+    if (!wanted.length) return profile;
+    log('info', `Following ${wanted.length} "Show all" page(s) for the full profile history.`);
+
+    let added = 0;
+    for (const d of wanted) {
+      if (S.stop) break;
+      await waitWhilePaused();
+      const url = `${ORIGIN}/in/${encodeURIComponent(publicId)}/details/${d.path}/`;
+      try {
+        const html = await apiGet(url, { expectJson: false });
+        let doc = null;
+        try {
+          doc = new DOMParser().parseFromString(html, 'text/html');
+        } catch (_) {
+          /* fall through to the payload read */
+        }
+
+        // The rendered list first — it is what the page is for. The embedded
+        // components are the backstop for when LinkedIn ships no markup.
+        let rows = doc ? rowsFrom(doc.querySelector('main') || doc.body, 200) : [];
+        if (!rows.length) rows = componentRows(mergePayloads(payloadsFromHtml(html)));
+        if (!rows.length) continue;
+
+        const before = (profile[d.key] || []).length;
+        profile[d.key] = mergeById(profile[d.key], d.map(rows), d.id);
+        added += profile[d.key].length - before;
+      } catch (err) {
+        if (err instanceof Abort) throw err;
+        log('warn', `Could not read the full ${d.key} list (${err.message}) — keeping what the profile card showed.`);
+      }
+      await U.sleep(U.randOf(L.PAGE_DELAY));
+    }
+
+    if (added) log('success', `Full profile history added ${added} row(s) the profile card did not show.`);
+    return profile;
+  }
+
+  /** Union of two row lists, keyed on identity, first occurrence winning. */
+  function mergeById(existing, incoming, id) {
+    const out = [];
+    const seen = new Set();
+    for (const r of [].concat(Array.isArray(existing) ? existing : [], Array.isArray(incoming) ? incoming : [])) {
+      if (!r) continue;
+      let key;
+      try {
+        key = id(r);
+      } catch (_) {
+        key = JSON.stringify(r);
+      }
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(r);
+    }
+    return out;
+  }
+
   function parseCompact(s) {
     if (!s) return null;
     const m = String(s).replace(/,/g, '').match(/([\d.]+)\s*([KMB])?/i);
@@ -1824,20 +2000,60 @@
    *
    * Returns the raw span lists; each caller knows its own field order.
    */
-  function sectionRows(anchorId, limit) {
-    const rows = [];
-    let section = null;
+  /**
+   * The element that holds a section's rows.
+   *
+   * The anchor is an empty div LinkedIn drops in for its own in-page
+   * navigation; the rows live in the card around it. `closest('section')` is
+   * right today, but if that card ever stops being a `<section>` every section
+   * reads as empty — and an empty education list is indistinguishable from a
+   * profile with no education. So the walk up settles for whatever ancestor
+   * actually contains a list.
+   */
+  function sectionContainer(anchorId, root) {
+    const doc = root || document;
+    let anchor = null;
     try {
-      const anchor = document.querySelector('#' + anchorId);
-      section = anchor ? anchor.closest('section') : null;
+      anchor = doc.getElementById ? doc.getElementById(anchorId) : doc.querySelector('#' + anchorId);
+    } catch (_) {
+      return null;
+    }
+    if (!anchor) return null;
+
+    let best = null;
+    try {
+      best = anchor.closest ? anchor.closest('section') : null;
     } catch (_) {
       /* ignore */
     }
-    if (!section) return rows;
+    if (best && best.querySelector('li')) return best;
 
+    let el = anchor.parentElement;
+    for (let i = 0; el && i < 4; i++) {
+      try {
+        if (el.querySelector && el.querySelector('li')) return el;
+      } catch (_) {
+        /* ignore */
+      }
+      el = el.parentElement;
+    }
+    return best;
+  }
+
+  /**
+   * Every row under a root, as span lists.
+   *
+   * LinkedIn prints each field twice — once visible with aria-hidden, once for
+   * a screen reader — so taking only the aria-hidden spans avoids doubling
+   * every string. The order is stable across the profile card and the
+   * "Show all" page, which is what lets both feed the same mappers.
+   */
+  function rowsFrom(root, limit) {
+    const rows = [];
+    if (!root) return rows;
     let items;
     try {
-      items = section.querySelectorAll('li');
+      items = root.querySelectorAll('li');
     } catch (_) {
       return rows;
     }
@@ -1852,6 +2068,8 @@
     return rows;
   }
 
+  const sectionRows = (anchorId, limit) => rowsFrom(sectionContainer(anchorId), limit);
+
   /** The longest string in a section — its body copy rather than its chrome. */
   function sectionText(anchorId) {
     let best = '';
@@ -1861,8 +2079,19 @@
     return best;
   }
 
-  function experienceFromDom() {
-    return sectionRows('experience').map((spans) => ({
+  /*
+   * The row mappers are separate from where the rows came from, because the
+   * profile card and the "Show all" page render the same fields in the same
+   * order — so both feed these, and so does the generic component payload.
+   */
+  /*
+   * Declarations, not `const` arrows: DETAILS_PAGES is built at load time and
+   * names all three, so an arrow assigned further down the file is still in
+   * its temporal dead zone when that table is evaluated — which throws before
+   * the content script has registered a single listener.
+   */
+  function experienceFromRows(rows) {
+    return rows.map((spans) => ({
       title: spans[0] || '',
       company: (spans[1] || '').split('·')[0].trim(),
       location: spans[3] || '',
@@ -1872,6 +2101,38 @@
     }));
   }
 
+  function educationFromRows(rows) {
+    return rows
+      .filter((spans) => spans[0])
+      .map((spans) => {
+        // "Bachelor of Commerce, Accounting and Finance" is one span.
+        const parts = (spans[1] || '').split(',').map((s) => s.trim()).filter(Boolean);
+        return {
+          school: spans[0],
+          degree: parts[0] || '',
+          field: parts.slice(1).join(', '),
+          dates: spans[2] || '',
+          description: spans.slice(3).join(' ')
+        };
+      });
+  }
+
+  function entriesFromRows(rows) {
+    return rows
+      .filter((spans) => spans[0])
+      .map((spans) => ({
+        name: spans[0],
+        detail: spans[1] || '',
+        dates: spans[2] || '',
+        url: null,
+        description: spans.slice(3).join(' ')
+      }));
+  }
+
+  function experienceFromDom() {
+    return experienceFromRows(sectionRows('experience'));
+  }
+
   /*
    * Education and skills used to be hardcoded empty here, so a run that fell
    * through to the DOM strategy produced education.txt saying "(no education
@@ -1879,21 +2140,7 @@
    * both on screen.
    */
   function educationFromDom() {
-    const rows = [];
-    for (const spans of sectionRows('education')) {
-      const school = spans[0] || '';
-      if (!school) continue;
-      // "Bachelor of Technology, Computer Science" is one span on LinkedIn.
-      const parts = (spans[1] || '').split(',').map((s) => s.trim()).filter(Boolean);
-      rows.push({
-        school,
-        degree: parts[0] || '',
-        field: parts.slice(1).join(', '),
-        dates: spans[2] || '',
-        description: spans.slice(3).join(' ')
-      });
-    }
-    return rows;
+    return educationFromRows(sectionRows('education'));
   }
 
   function skillsFromDom() {
@@ -2793,6 +3040,7 @@
     S.target = cfg.maxPosts;
     S.startedAt = Date.now();
     S.pagination = null;
+    S.detailLinks = new Set();
     connectPort();
     emitProgress(true); // publish the carried-over request count immediately
 
@@ -3075,6 +3323,14 @@
        * reader can be run against a saved profile page in a browser.
        */
       profileFromDom,
+      getProfile,
+      linkedDetailPages,
+      rowsFrom,
+      componentRows,
+      experienceFromRows,
+      educationFromRows,
+      mergeById,
+      DETAILS_PAGES,
       PROFILE_PHOTO_PATH,
       PROFILE_BANNER_PATH
     });

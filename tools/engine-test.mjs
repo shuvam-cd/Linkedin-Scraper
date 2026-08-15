@@ -689,6 +689,76 @@ check('a section the profile does not have is empty, not absent', () => {
   for (const sec of E.PROFILE_SECTIONS) eq(Array.isArray(s[sec.key]), true, sec.key);
 });
 
+/* ================================================================== *
+ * The "Show all" pages
+ *
+ * A profile card is a preview: two or three roles, a school or two, and the
+ * rest behind /in/<id>/details/<section>/. Reading only the card and calling
+ * it the full history is the one thing this scraper is written not to do.
+ * ================================================================== */
+group('following the full history');
+
+check('the sections that have a page are all covered', () => {
+  const keys = E.DETAILS_PAGES.map((d) => d.key);
+  for (const need of ['experience', 'education', 'skills']) ok(keys.includes(need), need);
+  // Every profile section the export renders can be filled from its page.
+  for (const s of E.PROFILE_SECTIONS) ok(keys.includes(s.key), `no page for ${s.key}`);
+});
+
+check('every page maps rows and can identify a duplicate', () => {
+  for (const d of E.DETAILS_PAGES) {
+    ok(typeof d.map === 'function', `${d.key} map`);
+    ok(typeof d.id === 'function', `${d.key} id`);
+    ok(typeof d.path === 'string' && d.path.length, `${d.key} path`);
+  }
+  return `${E.DETAILS_PAGES.length} pages`;
+});
+
+check('a role from the page and the same role from the card merge to one', () => {
+  const card = E.experienceFromRows([['Founder', 'Content Daddy · Full-time', 'Jan 2023 - Present', 'Kolkata']]);
+  const page = E.experienceFromRows([
+    ['Founder', 'Content Daddy · Full-time', 'Jan 2023 - Present', 'Kolkata'],
+    ['Video Editor', 'Freelance · Self-employed', 'Mar 2019 - Dec 2022', 'Remote']
+  ]);
+  const d = E.DETAILS_PAGES.find((x) => x.key === 'experience');
+  const merged = E.mergeById(card, page, d.id);
+  eq(merged.length, 2, 'the shared role is not counted twice');
+  eq(merged[0].title, 'Founder', 'and what the card found stays first');
+  eq(merged[1].title, 'Video Editor');
+});
+
+check('merging can only grow a list, never shrink it', () => {
+  const d = E.DETAILS_PAGES.find((x) => x.key === 'education');
+  const card = E.educationFromRows([['University of Calcutta', 'B.Com, Accounting', '2015 - 2018']]);
+  // A page that fails to parse hands back nothing; the card must survive it.
+  eq(E.mergeById(card, [], d.id).length, 1);
+  eq(E.mergeById(card, null, d.id).length, 1);
+});
+
+check('skills merge by name because a skill is just a name', () => {
+  const d = E.DETAILS_PAGES.find((x) => x.key === 'skills');
+  eq(d.map([['Video Editing', '12 endorsements'], ['Content Strategy']]), ['Video Editing', 'Content Strategy']);
+  eq(E.mergeById(['Video Editing'], ['Video Editing', 'Copywriting'], d.id), ['Video Editing', 'Copywriting']);
+});
+
+check('generic profile components read as the same four fields the markup prints', () => {
+  // Modern LinkedIn ships sections as components rather than typed entities.
+  const rows = E.componentRows({
+    included: [
+      { entityComponent: {
+          titleV2: { text: { text: 'Founder' } },
+          subtitle: { text: 'Content Daddy · Full-time' },
+          caption: { text: 'Jan 2023 - Present · 2 yrs' },
+          metadata: { text: 'Kolkata, India' } } }
+    ]
+  });
+  eq(rows, [['Founder', 'Content Daddy · Full-time', 'Jan 2023 - Present · 2 yrs', 'Kolkata, India']]);
+  const exp = E.experienceFromRows(rows);
+  eq(exp[0].title, 'Founder');
+  eq(exp[0].company, 'Content Daddy', 'the employment type is split off');
+  eq(exp[0].current, true);
+});
+
 /* ================================================================== */
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
 

@@ -396,6 +396,7 @@ function runCfg(extra) {
       includeComments: state.options.includeComments,
       skipVideos: state.options.skipVideos,
       includeProfileMedia: state.options.includeProfileMedia,
+      fullProfile: state.options.fullProfile !== false,
       knownActivityIds: posts.map((p) => p.activityId),
       alreadyCollected: posts.length,
       pendingPosts: needy.slice(0, HANDOFF_LIMIT),
@@ -857,8 +858,10 @@ function experienceFileText(p) {
   if (!rows.length) {
     out.push('(no experience captured)');
     out.push('');
-    out.push('LinkedIn renders the full history behind a "Show all" page that this');
-    out.push('scraper does not follow. What is here is what the profile page carried.');
+    out.push('The profile card is a preview and the full history sits behind a');
+    out.push('"Show all" page, which this scraper does follow — so an empty list');
+    out.push('here means neither carried anything readable, not that it stopped at');
+    out.push('the card. Turning off "Full history" also produces this.');
     return crlf(out);
   }
   rows.forEach((e, i) => {

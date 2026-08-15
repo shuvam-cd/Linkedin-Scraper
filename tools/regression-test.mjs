@@ -1070,6 +1070,46 @@ check('a final pass guarantees every path is unique', () => {
      'collisions are renamed');
 });
 
+/* ================================================================== *
+ * The profile card is a preview, not the history
+ * ================================================================== */
+group('the full history is followed, not assumed');
+
+check('getProfile reads the card and then follows the Show all pages', () => {
+  const body = CS_SRC.slice(CS_SRC.indexOf('async function getProfile'), CS_SRC.indexOf('async function readProfile'));
+  ok(/readProfile\(publicId\)/.test(body), 'the card first');
+  ok(/enrichFromDetailPages\(/.test(body), 'then the pages it links to');
+  ok(/S\.cfg\.fullProfile === false/.test(body), 'and the option can turn it off');
+});
+
+check('the links come from the document already fetched, not a second fetch', () => {
+  const body = CS_SRC.slice(CS_SRC.indexOf('async function getProfile'), CS_SRC.indexOf('async function readProfile'));
+  ok(/S\.detailLinks/.test(body), 'collected during the read');
+  ok(!/apiGet\(/.test(body), 'looking at the links must not cost a request of its own');
+});
+
+check('the row mappers are hoisted, because the page table names them at load', () => {
+  // `const experienceFromRows = …` leaves DETAILS_PAGES referencing it inside
+  // its temporal dead zone, which throws before a single listener registers.
+  for (const fn of ['experienceFromRows', 'educationFromRows', 'entriesFromRows']) {
+    ok(new RegExp(`function ${fn}\\(`).test(CS_SRC), `${fn} must be a declaration`);
+    ok(!new RegExp(`const ${fn}\\s*=`).test(CS_SRC), `${fn} must not be a const arrow`);
+  }
+});
+
+check('the cost of following them is bounded and paced', () => {
+  const body = CS_SRC.slice(CS_SRC.indexOf('async function enrichFromDetailPages'));
+  ok(/MAX_DETAILS_PAGES/.test(body), 'a ceiling on how many pages');
+  ok(/U\.sleep\(U\.randOf\(L\.PAGE_DELAY\)\)/.test(body), 'paced like every other page fetch');
+  ok(/if \(S\.stop\) break/.test(body), 'and Stop still stops it');
+});
+
+check('a section that fails keeps whatever the card found', () => {
+  const body = CS_SRC.slice(CS_SRC.indexOf('async function enrichFromDetailPages'));
+  ok(/keeping what the profile card showed/.test(body), 'says so');
+  ok(/mergeById\(profile\[d\.key\]/.test(body), 'and merges rather than replaces');
+});
+
 /* ---------------- summary ---------------- */
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
 if (failures.length) {

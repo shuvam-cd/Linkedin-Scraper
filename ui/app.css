@@ -259,6 +259,18 @@
 .meter > .bar.warn { background: var(--warning); }
 .meter > .bar.full { background: var(--danger); }
 
+/* which pass is running — only shown once harvesting is done */
+.stageline {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s2);
+  margin-top: var(--s1);
+  font: var(--t-meta);
+  color: var(--text-2);
+}
+.stageline b { font-weight: 500; color: var(--text); }
+
 /* pagination honesty line */
 .note {
   margin-top: var(--s2);

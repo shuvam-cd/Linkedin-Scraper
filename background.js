@@ -39,6 +39,11 @@ function blankState() {
     // How pagination ended, so the UI can be honest about it rather than
     // implying the account was exhausted.
     pagination: null, // {stoppedEarly, reason, pages}
+    // The pass the content script is on: harvest | detail | comments | done.
+    stage: 'harvest',
+    stageDone: 0,
+    stageTotal: 0,
+    stageStartedAt: null,
     phase: 'main',
     startedAt: null,
     finishedAt: null,
@@ -643,6 +648,15 @@ chrome.runtime.onConnect.addListener((port) => {
         state.target = msg.target || state.target;
         state.skippedVideos = msg.skippedVideos || 0;
         if (msg.requests != null) state.requests = msg.requests;
+        // Which pass is running. Named `stage` rather than `phase` because
+        // `state.phase` already means something else here — main vs posts-dom,
+        // which is about where the tab is, not what the run is doing.
+        if (msg.stage) {
+          state.stage = msg.stage;
+          state.stageDone = msg.stageDone || 0;
+          state.stageTotal = msg.stageTotal || 0;
+          state.stageStartedAt = msg.stageStartedAt || null;
+        }
         broadcast();
         return;
 

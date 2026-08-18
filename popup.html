@@ -128,6 +128,9 @@
                 </div>
 
                 <div class="progress" style="margin-top:var(--s2)"><div id="barFill" class="bar"></div></div>
+                <!-- Which pass is running. Harvesting is only the first of
+                     three, and the two after it move nothing on the bar. -->
+                <div class="stageline hidden" id="stageLine"></div>
 
                 <div class="metrics">
                   <div class="m"><b id="statPosts">0</b><span>Posts</span></div>

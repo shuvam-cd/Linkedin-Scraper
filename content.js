@@ -110,7 +110,6 @@
     active: false,
     stop: false,
     paused: false,
-    navigating: false,
     cfg: null,
     port: null,
     heartbeat: null,
@@ -121,6 +120,20 @@
     skippedVideos: 0,
     requests: 0,
     startedAt: 0,
+    /*
+     * Which pass is running, and how far through it.
+     *
+     * Harvesting is only the first of three. Once it reaches the target the
+     * "Collected x / y" bar is pinned at 100% while the detail pass and then
+     * the comment pass run — which on a 100-post run is another quarter of an
+     * hour with nothing on screen moving. That reads exactly like a run that
+     * has finished and refuses to stop, so the pass and its own progress are
+     * reported rather than left to the log.
+     */
+    stage: 'harvest',
+    stageDone: 0,
+    stageTotal: 0,
+    stageStartedAt: 0,
     profile: null,
     // "Show all" links seen while reading the profile, so the full-history
     // pass costs no extra page fetch to find them.
@@ -196,8 +209,27 @@
       collected: S.collected,
       target: S.target,
       skippedVideos: S.skippedVideos,
-      requests: S.requests
+      requests: S.requests,
+      stage: S.stage,
+      stageDone: S.stageDone,
+      stageTotal: S.stageTotal,
+      stageStartedAt: S.stageStartedAt
     });
+  }
+
+  /** Moves to a pass and publishes it immediately. */
+  function setStage(stage, total) {
+    S.stage = stage;
+    S.stageDone = 0;
+    S.stageTotal = total || 0;
+    S.stageStartedAt = Date.now();
+    emitProgress(true);
+  }
+
+  /** One unit of the current pass done. */
+  function bumpStage(n) {
+    S.stageDone += n == null ? 1 : n;
+    emitProgress();
   }
 
   /** Cursor handed back by the worker when a run is being continued. */
@@ -214,6 +246,25 @@
   function requireAttention(kind, message) {
     S.paused = true;
     emit(MSG.C_ATTENTION, { kind, message, url: location.href });
+  }
+
+  /**
+   * A sleep that Stop can cut short.
+   *
+   * The pacing delays run to nine seconds and the scroll pauses to seven, so a
+   * plain sleep meant Stop was not noticed for that long — long enough that
+   * the worker's twelve-second settle fired first and the popup said
+   * "Stopped" while the tab was visibly still working. Same total wait when
+   * nothing interrupts it; the politeness floors are untouched.
+   */
+  async function pause(ms) {
+    const until = Date.now() + ms;
+    for (;;) {
+      if (S.stop) return;
+      const left = until - Date.now();
+      if (left <= 0) return;
+      await U.sleep(Math.min(400, left));
+    }
   }
 
   async function waitWhilePaused() {
@@ -1953,7 +2004,7 @@
         if (err instanceof Abort) throw err;
         log('warn', `Could not read the full ${d.key} list (${err.message}) — keeping what the profile card showed.`);
       }
-      await U.sleep(U.randOf(L.PAGE_DELAY));
+      await pause(U.randOf(L.PAGE_DELAY));
     }
 
     if (added) log('success', `Full profile history added ${added} row(s) the profile card did not show.`);
@@ -2273,7 +2324,7 @@
         emit(MSG.C_CURSOR, { kind: 'voyager', value: start });
       }
 
-      await U.sleep(U.randOf(L.PAGE_DELAY));
+      await pause(U.randOf(L.PAGE_DELAY));
     }
 
     return S.collected > 0;
@@ -2529,11 +2580,25 @@
       // Randomised pauses: a metronome-steady scroll is the single most
       // obvious automation tell there is.
       window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
-      await U.sleep(U.randOf(L.PAGE_DELAY));
+      await pause(U.randOf(L.PAGE_DELAY));
       await clickShowMore();
 
+      /*
+       * A round that produced no new post is an idle round, full stop.
+       *
+       * This used to also require `document.body.scrollHeight` to be exactly
+       * unchanged, and a LinkedIn feed's height is never exactly unchanged —
+       * lazy images resolve, skeletons collapse, the "Show more results"
+       * button comes and goes. So the counter reset on almost every round, the
+       * loop never reached its idle ceiling, and a feed that had run out kept
+       * scrolling for the full 60 rounds at six to fourteen seconds each.
+       * That is the run that "does not stop" once the posts have ended.
+       *
+       * Height is still read, but only to stop sooner: a page that has also
+       * stopped growing is done twice over.
+       */
       const h = document.body.scrollHeight;
-      if (h === lastHeight && fresh === 0) idleRounds++;
+      if (fresh === 0) idleRounds += h === lastHeight ? 2 : 1;
       else idleRounds = 0;
       lastHeight = h;
 
@@ -2544,6 +2609,7 @@
       if (idleRounds >= CFG.dom.idleRoundsBeforeStop) {
         tracker.stoppedEarly = true;
         tracker.reason = 'The feed stopped loading new posts.';
+        log('info', `The feed stopped producing new posts — ending the scroll after ${round} round(s).`);
         break;
       }
     }
@@ -2564,7 +2630,7 @@
       });
       if (buttons.length) {
         buttons[buttons.length - 1].click();
-        await U.sleep(U.randOf(L.PAGE_DELAY));
+        await pause(U.randOf(L.PAGE_DELAY));
       }
     } catch (_) {
       /* the button is optional; infinite scroll usually carries it */
@@ -2732,6 +2798,7 @@
     let failed = 0;
     let streak = 0;
     const start = Date.now();
+    setStage('detail', pending.length);
 
     for (const post of pending) {
       if (S.stop) break;
@@ -2791,12 +2858,13 @@
       }
 
       const seen = done + failed;
+      bumpStage();
       if (seen % 10 === 0) {
         const rate = seen / ((Date.now() - start) / 1000);
         const left = rate > 0 ? ` · ~${fmtDuration((pending.length - seen) / rate)} left` : '';
         log('info', `Detail ${seen}/${pending.length}${left}`);
       }
-      if (seen < pending.length) await U.sleep(U.randOf(L.DETAIL_DELAY));
+      if (seen < pending.length) await pause(U.randOf(L.DETAIL_DELAY));
     }
     log(failed ? 'warn' : 'success', `Detail pass finished — ${done} ok, ${failed} failed.`);
   }
@@ -2896,7 +2964,7 @@
           start += size;
           if (post.comments != null && start >= post.comments) break;
           if (page + 1 >= L.MAX_COMMENT_PAGES) truncated = post.comments != null && post.comments > list.length;
-          await U.sleep(U.randOf(L.PAGE_DELAY));
+          await pause(U.randOf(L.PAGE_DELAY));
         }
         // A configured endpoint's answer is final, including "no comments" —
         // re-scraping the post page after it would only spend another request.
@@ -2949,6 +3017,7 @@
     let done = 0;
     let failed = 0;
     let streak = 0;
+    setStage('comments', pending.length);
 
     for (const post of pending) {
       if (S.stop) break;
@@ -2975,7 +3044,8 @@
           break;
         }
       }
-      if (done + failed < pending.length) await U.sleep(U.randOf(L.DETAIL_DELAY));
+      bumpStage();
+      if (done + failed < pending.length) await pause(U.randOf(L.DETAIL_DELAY));
     }
     log(failed ? 'warn' : 'success', `Comment pass finished — ${done} ok, ${failed} failed.`);
   }
@@ -3017,7 +3087,6 @@
     S.active = true;
     S.stop = false;
     S.paused = false;
-    S.navigating = false;
     S.cfg = cfg;
     S.seen = new Set(cfg.knownActivityIds || []);
     /*
@@ -3041,6 +3110,10 @@
     S.startedAt = Date.now();
     S.pagination = null;
     S.detailLinks = new Set();
+    S.stage = 'harvest';
+    S.stageDone = 0;
+    S.stageTotal = cfg.maxPosts || 0;
+    S.stageStartedAt = Date.now();
     connectPort();
     emitProgress(true); // publish the carried-over request count immediately
 
@@ -3067,6 +3140,7 @@
       post.publicId = cfg.publicId;
       S.posts.push(post);
       S.collected++;
+      if (S.stage === 'harvest') S.stageDone = S.collected;
       pending.push(post);
       if (pending.length >= 5) flush();
       emitProgress();
@@ -3146,7 +3220,6 @@
                 'info',
                 `Have ${S.collected} of ${cfg.maxPosts} — moving the tab to the activity feed to scroll for more.`
               );
-              S.navigating = true;
               emit(MSG.C_NAVIGATE, {
                 url: U.activityUrl(cfg.publicId),
                 phase: 'posts-dom',
@@ -3179,7 +3252,7 @@
       }
 
       flush();
-      emitProgress(true);
+      setStage('done', 0);
       finish(S.stop ? 'stopped' : 'done');
     } catch (err) {
       flush();

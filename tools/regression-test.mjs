@@ -1100,7 +1100,7 @@ check('the row mappers are hoisted, because the page table names them at load', 
 check('the cost of following them is bounded and paced', () => {
   const body = CS_SRC.slice(CS_SRC.indexOf('async function enrichFromDetailPages'));
   ok(/MAX_DETAILS_PAGES/.test(body), 'a ceiling on how many pages');
-  ok(/U\.sleep\(U\.randOf\(L\.PAGE_DELAY\)\)/.test(body), 'paced like every other page fetch');
+  ok(/pause\(U\.randOf\(L\.PAGE_DELAY\)\)/.test(body), 'paced like every other page fetch');
   ok(/if \(S\.stop\) break/.test(body), 'and Stop still stops it');
 });
 
@@ -1108,6 +1108,46 @@ check('a section that fails keeps whatever the card found', () => {
   const body = CS_SRC.slice(CS_SRC.indexOf('async function enrichFromDetailPages'));
   ok(/keeping what the profile card showed/.test(body), 'says so');
   ok(/mergeById\(profile\[d\.key\]/.test(body), 'and merges rather than replaces');
+});
+
+/* ================================================================== *
+ * A run has to end, and Stop has to mean now
+ * ================================================================== */
+group('terminating');
+
+check('an idle scroll round counts even when the page height moved', () => {
+  const body = CS_SRC.slice(CS_SRC.indexOf('async function harvestViaDom'));
+  // Requiring an exact scrollHeight match meant the idle counter reset on
+  // almost every round — a LinkedIn feed's height is never exactly unchanged
+  // — so a feed that had run out kept scrolling for the full round ceiling.
+  ok(!/if \(h === lastHeight && fresh === 0\)/.test(body), 'the height must not gate the count');
+  ok(/if \(fresh === 0\) idleRounds \+=/.test(body), 'no new posts is what idle means');
+  ok(/idleRounds >= CFG\.dom\.idleRoundsBeforeStop/.test(body), 'and it still stops on the ceiling');
+});
+
+check('every pacing delay can be cut short by Stop', () => {
+  ok(/async function pause\(ms\)/.test(CS_SRC), 'an interruptible sleep exists');
+  const body = CS_SRC.slice(CS_SRC.indexOf('async function pause'));
+  ok(/if \(S\.stop\) return;/.test(body.slice(0, 400)), 'it checks Stop');
+  // A plain sleep here is up to nine seconds of not noticing Stop, which is
+  // long enough for the worker's twelve-second settle to fire first.
+  ok(!/await U\.sleep\(U\.randOf\(/.test(CS_SRC), 'no raw pacing sleep is left');
+});
+
+check('the run reports which pass it is on, not just the collected count', () => {
+  ok(/function setStage\(/.test(CS_SRC) && /function bumpStage\(/.test(CS_SRC), 'stage helpers');
+  ok(/setStage\('detail'/.test(CS_SRC), 'the detail pass announces itself');
+  ok(/setStage\('comments'/.test(CS_SRC), 'so does the comment pass');
+  ok(/setStage\('done'/.test(CS_SRC), 'and the end is a stage too');
+  ok(/stage: S\.stage/.test(CS_SRC), 'and it rides on the progress message');
+});
+
+check('the worker keeps the stage apart from the navigation phase', () => {
+  // `state.phase` already means main vs posts-dom — where the tab is, not
+  // what the run is doing. Reusing it would have made both wrong.
+  ok(/stage: 'harvest'/.test(BG_SRC), 'blankState carries a stage');
+  ok(/phase: 'main'/.test(BG_SRC), 'and still carries the phase');
+  ok(/state\.stage = msg\.stage/.test(BG_SRC), 'the stage comes off the progress message');
 });
 
 /* ---------------- summary ---------------- */

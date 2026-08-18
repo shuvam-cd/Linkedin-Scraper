@@ -41,6 +41,7 @@
     budgetText: $('budgetText'),
     budgetBar: $('budgetBar'),
     paginationNote: $('paginationNote'),
+    stageLine: $('stageLine'),
     profileBox: $('profileBox'),
     avatar: $('avatar'),
     pName: $('pName'),
@@ -81,6 +82,9 @@
     interrupted: 'Interrupted',
     session_limit_reached: 'Session cap'
   };
+
+  // The pill is a glance, so it gets one word rather than the full label.
+  const STAGE_SHORT = { detail: 'Detail', comments: 'Comments' };
 
   let lastState = null;
 
@@ -148,7 +152,8 @@
     const live = busy || paused;
 
     el.statusPill.className = 'pill ' + state.status;
-    el.statusText.textContent = STATUS_LABEL[state.status] || state.status;
+    const stageWord = busy && STAGE[state.stage] ? STAGE_SHORT[state.stage] : null;
+    el.statusText.textContent = stageWord || STATUS_LABEL[state.status] || state.status;
 
     el.btnStart.disabled = live;
     el.btnStart.classList.toggle('busy', busy);
@@ -159,12 +164,22 @@
     /* progress */
     const total = state.target || state.maxPosts || 0;
     const got = state.postsCount || 0;
-    const ratio = total ? Math.min(1, got / total) : 0;
     el.progressText.textContent = `${got} / ${total || '—'}`;
-    el.pct.textContent = total ? Math.round(ratio * 100) + '%' : '—';
+
+    /*
+     * The bar follows whichever pass is running, not the collected count.
+     *
+     * Harvesting is the first of three. Once it hits the target the collected
+     * ratio is pinned at 100% while the detail pass and then the comment pass
+     * run — a quarter of an hour on a 100-post run with nothing on screen
+     * moving, which reads as a run that has finished and will not stop.
+     */
+    const st = renderStage(state, busy);
+    const ratio = st.ratio != null ? st.ratio : total ? Math.min(1, got / total) : 0;
+    el.pct.textContent = st.ratio != null || total ? Math.round(ratio * 100) + '%' : '—';
     el.barFill.style.width = ratio * 100 + '%';
     el.barFill.classList.toggle('live', busy);
-    el.eta.textContent = busy ? etaText(state, got, total) : '';
+    el.eta.textContent = busy ? st.eta || etaText(state, got, total) : '';
 
     syncPresets();
 
@@ -226,6 +241,45 @@
     }
 
     renderLog(state.log || []);
+  }
+
+  /*
+   * What each pass is called, and what it is counting. `harvest` is the one
+   * the "Collected x / y" figure above already describes, so it says nothing.
+   */
+  const STAGE = {
+    detail: { label: 'Fetching post detail', unit: 'posts' },
+    comments: { label: 'Fetching comments', unit: 'posts' }
+  };
+
+  /** Shows the running pass, and returns the ratio and ETA it implies. */
+  function renderStage(state, busy) {
+    const s = STAGE[state.stage];
+    const total = state.stageTotal || 0;
+    if (!s || !busy || !total) {
+      el.stageLine.classList.add('hidden');
+      el.stageLine.textContent = '';
+      return { ratio: null, eta: '' };
+    }
+
+    const done = Math.min(total, state.stageDone || 0);
+    const ratio = Math.min(1, done / total);
+
+    let eta = '';
+    if (state.stageStartedAt && done >= 3 && done < total) {
+      const rate = done / ((Date.now() - state.stageStartedAt) / 1000);
+      if (isFinite(rate) && rate > 0) eta = '~' + U.fmtDuration((total - done) / rate) + ' left';
+    }
+
+    el.stageLine.classList.remove('hidden');
+    el.stageLine.textContent = '';
+    const what = document.createElement('span');
+    what.textContent = s.label;
+    const count = document.createElement('b');
+    count.textContent = `${done} / ${total} ${s.unit}`;
+    el.stageLine.appendChild(what);
+    el.stageLine.appendChild(count);
+    return { ratio, eta };
   }
 
   /**

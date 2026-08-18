@@ -98,14 +98,14 @@ their API" from the outside. So it lives in its own file, has no DOM or
 `chrome.*` dependency, and is tested in isolation:
 
 ```
-node tools/test.mjs               368 assertions, no dependencies
+node tools/test.mjs               372 assertions, no dependencies
 
   resolver-test.mjs   58   URN resolution, session cookies, Rest.li encoding
   utils-test.mjs      33   public-id normalisation, CSV escaping
   engine-test.mjs     76   session detection, entity mapping, post kinds, profile
   export-test.mjs     62   archive tree, CSV, JSON, README, path collisions
   wiring-check.mjs    34   manifest / popup / message wiring, safety limits
-  regression-test.mjs 105  tab navigation, timers, media scope, strategy escalation
+  regression-test.mjs 109  tab navigation, timers, media scope, termination
 ```
 
 None of it can talk to LinkedIn, which is the point — it covers exactly the
@@ -655,6 +655,58 @@ rendered text for the counts; and the `#experience` / `#education` / `#skills`
 anchor ids, which are what the profile's own in-page navigation targets. The
 embedded-JSON reader got the same CDN-path fallback, so a shape change that
 moves `profilePicture` no longer blanks the photo there either.
+
+## The run that would not stop
+
+Two separate things, both of which look identical from the outside: the bar
+sits at 100% and the extension keeps going.
+
+**The feed kept scrolling after the posts ran out.** A round counted as *idle*
+only if it produced no new posts **and** `document.body.scrollHeight` was
+exactly unchanged. A LinkedIn feed's height is never exactly unchanged — lazy
+images resolve, skeletons collapse, the "Show more results" button comes and
+goes — so the idle counter reset on nearly every round, never reached its
+ceiling of 4, and the loop ran its full 60 rounds instead. At the real pacing
+delays that is **three to seven minutes of scrolling a feed that had already
+ended**. Driving the same fixture before and after, with a feed of 5 posts
+whose height drifts:
+
+```
+before   pagination.reason: "Reached the scroll-round ceiling."     36 scroll rounds
+after    pagination.reason: "The feed stopped loading new posts."    9 scroll rounds
+```
+
+No new posts is what idle means. Height is still read, but only to stop
+sooner — a page that has also stopped growing is done twice over.
+
+**Harvesting is the first of three passes, and only the first moved the bar.**
+Once the collected count hit the target the bar was pinned at 100% while the
+detail pass and then the comment pass ran — on a 100-post run that is another
+quarter of an hour with nothing on screen changing and no ETA, because the ETA
+is suppressed once collected ≥ target. The passes report themselves now:
+
+| Pass | Pill | Under the bar |
+| --- | --- | --- |
+| harvest | `SCRAPING` | — the "Collected x / y" figure already says it |
+| detail | `DETAIL` | Fetching post detail · 37 / 100 posts |
+| comments | `COMMENTS` | Fetching comments · 12 / 100 posts |
+
+The bar follows whichever pass is running, so it moves throughout, and each
+pass carries its own ETA measured from when that pass started.
+
+**Stop now means now.** Every pacing delay was a plain `sleep` of up to nine
+seconds, so Stop was not noticed for that long — long enough that the worker's
+own twelve-second settle fired first and the popup said "Stopped" while the tab
+was visibly still working. They all go through an interruptible pause that
+checks Stop four times a second. The politeness floors are untouched: the total
+wait is the same when nothing interrupts it.
+
+Also removed: `S.navigating`, written in two places and read in none. The flag
+that actually suppresses the interrupted-run report is the worker's own, and a
+dead one beside it just invites someone to trust it.
+
+An end-to-end run against a stubbed feed now reports
+`harvest -> detail -> done` and terminates on its own.
 
 ## The profile card is a preview, and it was being read as the history
 

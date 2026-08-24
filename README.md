@@ -98,14 +98,14 @@ their API" from the outside. So it lives in its own file, has no DOM or
 `chrome.*` dependency, and is tested in isolation:
 
 ```
-node tools/test.mjs               382 assertions, no dependencies
+node tools/test.mjs               409 assertions, no dependencies
 
   resolver-test.mjs   58   URN resolution, session cookies, Rest.li encoding
   utils-test.mjs      33   public-id normalisation, CSV escaping
   engine-test.mjs     81   session detection, entity mapping, post kinds, profile
   export-test.mjs     62   archive tree, CSV, JSON, README, path collisions
   wiring-check.mjs    34   manifest / popup / message wiring, safety limits
-  regression-test.mjs 114  tab navigation, timers, media scope, termination
+  regression-test.mjs 141  tab navigation, timeouts, Stop, profile reads, packaging
 ```
 
 None of it can talk to LinkedIn, which is the point — it covers exactly the
@@ -699,6 +699,125 @@ Three things followed from it:
   company alongside the title, so self-employed, freelance, and roles at a
   company LinkedIn has since deleted were dropped. A title plus a date range is
   a job.
+
+## Where he works — the other four ways it went missing
+
+Merging the readers was necessary and not sufficient. The same field went
+missing four more ways, each independent of the others, and each found by
+reading the code against a rendered page rather than against itself.
+
+**The current position was frozen before the history arrived.** It was computed
+at the end of the profile read, off the card — and the "Show all" pass runs
+*after* that, precisely when the card yielded no roles. So the case the pass
+exists for was the case that left `currentPosition` null forever, printed
+beside a full `experience` list. It is computed after enrichment now.
+
+**The DOM reader was skipped when it had nothing to read.** It parses the
+document strategy B already fetched; when *that* fetch failed the variable
+stayed null, and the reader — the only one that sees a component-rendered job
+history — quietly did nothing, directly beneath a log line promising it still
+ran. It fetches its own copy now.
+
+**A role with no company shifted every field left.** The component payload
+names its four slots — title, subtitle, caption, metadata — and every consumer
+reads them by position: company is `[1]`, dates `[2]`, location `[3]`. Dropping
+an empty one slid the rest along:
+
+```
+before   Independent Consultant   company "2015 - 2016"   dates ""
+after    Independent Consultant   company ""              dates "2015 - 2016"
+```
+
+Rendered markup has the same problem for a different reason — the spans are
+unlabelled, so an absent field is simply not there — and there the only signal
+available is the content: a date range sitting where a company belongs is
+unambiguous, so the blank goes back and the row lines up.
+
+**An empty experience card read the education list.** The section walk settles
+for "any ancestor holding an `<li>`", which reaches `<main>` — and `<main>`
+holds every other section's rows. A profile with nothing listed under
+experience therefore reported its first school as a job, and that school became
+the answer to "where does he work":
+
+```
+before   currentPosition: Some University @ B.Tech, Computer Science
+after    currentPosition: Head of Growth @ Acme Corp
+```
+
+Two smaller ones underneath: the education predicate never accepted the linked
+`*school` reference its own mapper resolves, so a school entered with no degree
+was dropped before the mapper saw it; and the entity index let a later, thinner
+projection of the same URN overwrite a richer one, so a reader could find a
+full Position and resolve it straight back into a `{entityUrn, $type}` stub.
+
+## Nothing waits forever
+
+`fetch()` has no timeout of its own, and neither half of this extension gave it
+one. A connection that is accepted and then held — a throttled response, a
+proxy stall, a machine sleeping mid-request — parked the run at an `await` no
+flag could reach.
+
+Driven in a browser with one held request:
+
+```
+shipped   run never returned · no DONE · S.active stuck true · Stop did nothing
+current   settles 0.0s after Stop · DONE "stopped" · S.active false
+```
+
+`S.active` stuck true is the part the user sees last: every later Start in that
+tab is refused with *"A scrape is already running in this tab."* until the page
+is reloaded. Requests carry a 45-second deadline that covers the body read as
+well as the headers, and Stop tears down what is in flight rather than waiting
+it out. The packer's media fetches get the same treatment at 60 seconds — its
+hole was worse, because a stalled fetch there parked one of four workers
+forever, so the batch never answered, `zip.building` never cleared, and every
+button including Cancel and Clear stayed disabled.
+
+Stop also has to leave the *run*, not a loop. Every long pass broke out of its
+own loop when the flag was set and then returned normally — which, to its
+caller, is indistinguishable from finishing — so the run walked on to the next
+step, and one of those steps navigates the tab to the activity feed and has the
+worker start the run again, where the stop flag begins life false. And
+`S.active` was set before the `try` that owns the cleanup, so a throw in the
+prologue was an unhandled rejection with no `finally` behind it: no DONE, no
+error line, and the tab wedged silently.
+
+## The archive is whole or it is not saved
+
+Four ways an export could lie about itself.
+
+Starting a run replaced the whole state object mid-package. The build's guard
+reads `state.zip.building` through that object, so every write from the running
+build landed somewhere nobody reads and the guard went back to answering false
+— a second build could start over the first, reset the shared writer, and lose
+everything the first had accumulated. Both Start and Clear refuse while a
+package is in flight now, and the popup's Start button says so.
+
+Cancel was only read between batches. A batch is twenty entries, so a small
+export is a single group — every cancel fell straight through to the finish and
+saved a truncated archive, reported as a success, with no record of what was
+left out. The flag is checked after the last batch, the packer stops pulling
+work mid-batch, and what it abandons is recorded rather than silently dropped.
+
+A persisted `building: true` survived a worker restart. `Object.assign` is
+shallow, so the stored block replaced the blank one wholesale, and only a
+`finally` the dead worker never ran would have cleared it — leaving the export
+permanently disabled behind "Already packaging.", with Clear, the only other
+way out, disabled by the same flag.
+
+And a failed storage write re-marked its chunks dirty without scheduling the
+retry its own comment promised. `dirtyChunks` is inert; only `schedulePersist`
+arms a write. The largest write is the likeliest to fail and the last write of
+a run has no event behind it, so the one case that matters had no retry at all.
+
+Driven through a browser, the packer now:
+
+```
+normal batch      3 added, 0 failed
+one stalled URL   1 added, "p/stall.jpg: no response within 60s" — and the batch returns
+cancel mid-batch  4 added, 8 abandoned and reported
+next archive      2 added, 0 failed — the cancel did not stick
+```
 
 ## The run that would not stop
 

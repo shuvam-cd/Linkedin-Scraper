@@ -98,14 +98,14 @@ their API" from the outside. So it lives in its own file, has no DOM or
 `chrome.*` dependency, and is tested in isolation:
 
 ```
-node tools/test.mjs               409 assertions, no dependencies
+node tools/test.mjs               416 assertions, no dependencies
 
   resolver-test.mjs   58   URN resolution, session cookies, Rest.li encoding
   utils-test.mjs      33   public-id normalisation, CSV escaping
   engine-test.mjs     81   session detection, entity mapping, post kinds, profile
   export-test.mjs     62   archive tree, CSV, JSON, README, path collisions
   wiring-check.mjs    34   manifest / popup / message wiring, safety limits
-  regression-test.mjs 141  tab navigation, timeouts, Stop, profile reads, packaging
+  regression-test.mjs 148  tab navigation, timeouts, Stop, profile reads, packaging
 ```
 
 None of it can talk to LinkedIn, which is the point — it covers exactly the
@@ -818,6 +818,83 @@ one stalled URL   1 added, "p/stall.jpg: no response within 60s" — and the bat
 cancel mid-batch  4 added, 8 abandoned and reported
 next archive      2 added, 0 failed — the cancel did not stick
 ```
+
+## Two contexts, one rule
+
+The content script decides which posts still need a detail fetch. The worker
+decides which posts to hand back when a run is re-hosted — moved to a new tab,
+or resumed. Both need the same answer, and they had each written it out
+separately. The worker's version had fallen behind: it checked only
+`detailFetched`, while the run also fetches a post with declared-but-missing
+media, with no text, or with null counts.
+
+The embedded-payload fallback is where that hurts. It produces URN-only stubs
+whose entire content comes from the detail pass — and stamps `detailFetched:
+true` on all of them. Handed to a continued run, every one was judged finished:
+
+```
+comments off, one URN-only stub (detailFetched true, no text, null counts)
+before   pendingPosts: []      — abandoned, exports "(no text)" and "unknown" for every count
+after    pendingPosts: ['1']   — handed back and filled in
+```
+
+Comments had a mirror of it. `comments === 0` is normal, such a post is never
+given a list, and a missing list read as *outstanding* — so with comments on,
+**every** post came back needy on every resume, and once more than the
+two-hundred handoff limit were in that state the posts that genuinely needed
+work sat past the slice and were never carried at all. The predicate is one
+function in `utils.js` now, and both contexts call it.
+
+`state.phase` was the same shape of problem: written on every handoff,
+persisted faithfully, and read by nothing. A run interrupted during the feed
+scroll resumed at `main` — back to the profile page, the whole profile re-read
+(with Full history, the card plus up to seven "Show all" pages, each behind the
+request floor), the activity page re-fetched, then back to the feed to scroll
+from the top. Roughly ten requests of the budget spent returning to where the
+run already was, on a run that was resumed because the budget ran out.
+
+## The export tells the truth about itself
+
+`README.txt` and `skipped.txt` exist to explain why an archive is short. Each
+of them was explaining something that had not happened.
+
+**A run stopped by hand read as a run that finished.** The COMPLETENESS section
+knew three cases — pagination stopped early, the ceiling was reached, or
+neither — and a Stop raises before any page returns zero, so `stoppedEarly` is
+still false when it lands:
+
+```
+before   Collected 40 posts. Pagination ended without an explicit stop signal.
+after    Stopped by hand with 40 post(s) kept. This is not everything the
+         account has posted, and not everything LinkedIn was willing to
+         return — the run was ended early. Resume continues from the cursor.
+```
+
+**A comment fetch that ran and came back empty was reported as one that never
+ran.** Success left `commentList = []`, no error, and a non-zero count — byte
+for byte the state of a post the pass never reached. With no comments endpoint
+configured the fallback reads whatever the permalink page server-rendered,
+which is frequently no thread at all, so this was the common path and not an
+edge case:
+
+```
+before   (not captured — the run ended before the comment pass)
+after    (the comment pass ran and LinkedIn returned none of the 4 it reports)
+```
+
+**The data-handling notice claimed the export held no third-party personal data
+whenever comments were off.** Reshare provenance writes the original author's
+name, headline, profile URL and post body into `metadata.txt`, `posts.json` and
+`posts.csv` either way. That notice is what an operator reads to decide
+retention and redistribution, so it is computed from the records now rather
+than from one option.
+
+**A video whose stills would not decode was counted as a missing file.** The
+video is in the archive; only its frames are not. The popup said "3 skipped",
+so did the saved-log line, and `skipped.txt` listed three directories under an
+expired-CDN-link explanation that had nothing to do with them — sending the
+user to re-run a scrape that would change nothing. The packer already kept the
+two apart internally and only ever exposed them merged.
 
 ## The run that would not stop
 

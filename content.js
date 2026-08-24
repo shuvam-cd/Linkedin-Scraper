@@ -3371,6 +3371,7 @@
       if (p.comments === 0 && !Array.isArray(p.commentList)) {
         p.commentList = [];
         p.commentsTruncated = false;
+        p.commentsFetchedAt = new Date().toISOString();
         emit(MSG.C_POST_UPDATE, { post: p });
       }
     }
@@ -3407,6 +3408,15 @@
         post.commentList = r.list;
         post.commentsTruncated = r.truncated;
         post.commentError = ''; // same merge rule as post.error above
+        /*
+         * That the pass ran, as a fact and not an inference. A successful fetch
+         * that returns nothing left exactly the state of a post the pass never
+         * reached — empty list, no error, a non-zero count — so comments.txt
+         * told the user "the run ended before the comment pass" for a post the
+         * pass had finished, and sent them to re-run the whole scrape for
+         * comments already established to be unobtainable.
+         */
+        post.commentsFetchedAt = new Date().toISOString();
         emit(MSG.C_POST_UPDATE, { post });
         done++;
         streak = 0;

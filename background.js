@@ -1132,7 +1132,16 @@ function commentsFileText(post) {
 
   if (!list.length) {
     if (post.commentError) out.push(`(could not be fetched: ${post.commentError})`);
-    else if (post.comments) out.push('(not captured — the run ended before the comment pass)');
+    else if (post.commentsFetchedAt && post.comments) {
+      /*
+       * The pass ran and came back with nothing. Without the marker this was
+       * indistinguishable from a post the pass never reached, and it is the
+       * common case rather than an edge one: with no comments endpoint
+       * configured the fallback reads whatever the permalink page
+       * server-rendered, which is often no thread at all.
+       */
+      out.push(`(the comment pass ran and LinkedIn returned none of the ${post.comments} it reports)`);
+    } else if (post.comments) out.push('(not captured — the run ended before the comment pass)');
     else out.push('(no comments)');
     return crlf(out);
   }
@@ -1304,7 +1313,25 @@ function readmeFileText(stats) {
 
   out.push('COMPLETENESS');
   out.push(RULE);
-  if (state.pagination && state.pagination.stoppedEarly) {
+  /*
+   * How the run ended comes first, because the pagination heuristics below
+   * cannot see it. A Stop raises before any page returns zero, so
+   * `stoppedEarly` is still false and a hand-stopped run was described as
+   * "pagination ended without an explicit stop signal" — the archive read as
+   * though LinkedIn had nothing more to give, in the one file whose whole job
+   * is to be honest about why the export is short.
+   */
+  if (state.status === 'stopped') {
+    out.push(`Stopped by hand with ${posts.length} post(s) kept. This is not everything the`);
+    out.push('account has posted, and not everything LinkedIn was willing to return —');
+    out.push('the run was ended early. Resume continues from the saved cursor.');
+  } else if (state.status === 'interrupted') {
+    out.push(`Contact with the LinkedIn tab was lost mid-run, with ${posts.length} post(s) kept.`);
+    out.push('Resume continues from the saved cursor.');
+  } else if (state.status === 'error') {
+    out.push(`The run ended with an error after ${posts.length} post(s).`);
+    if (state.error) out.push(`Reported: ${state.error}`);
+  } else if (state.pagination && state.pagination.stoppedEarly) {
     out.push(`LinkedIn stopped returning more posts after ${state.pagination.pages} page(s).`);
     out.push(`Reason recorded: ${state.pagination.reason}`);
     out.push('');
@@ -1335,6 +1362,14 @@ function readmeFileText(stats) {
 
   out.push('DATA HANDLING');
   out.push(RULE);
+  /*
+   * Checked against the records rather than the options. Reshare provenance
+   * writes the original author's name, headline, profile URL and post body
+   * into metadata.txt, posts.json and posts.csv — so the "no third-party
+   * personal data" line was a false statement in the file an operator reads
+   * to decide retention and redistribution.
+   */
+  const reshared = posts.filter((p) => p.repost && (p.repost.author || p.repost.authorUrl)).length;
   if (state.options.includeComments) {
     out.push('*** This export contains third-party personal data. ***');
     out.push('');
@@ -1346,9 +1381,27 @@ function readmeFileText(stats) {
     out.push('');
     out.push('No commenter profile was fetched. Only what appeared beside the comment');
     out.push('itself is here — this scraper deliberately does not follow those links.');
+    if (reshared) {
+      out.push('');
+      out.push(`${reshared} post(s) are reshares, so metadata.txt, posts.json and posts.csv`);
+      out.push('also carry the original authors\' names, headlines, profile URLs and the');
+      out.push('bodies of the posts they wrote.');
+    }
+  } else if (reshared) {
+    out.push('*** This export contains third-party personal data. ***');
+    out.push('');
+    out.push(`${reshared} post(s) are reshares. For each one, metadata.txt, posts.json and`);
+    out.push('posts.csv carry the original author\'s name, headline and profile URL, and');
+    out.push('the body of the post they wrote. Comments were not collected, so nothing');
+    out.push('beyond that reshare provenance is here — but that provenance is other');
+    out.push('people\'s data. Retention, lawful basis and deletion are your');
+    out.push('responsibility as the operator — under GDPR, UK GDPR, CCPA or whatever');
+    out.push('applies to you. Keep it only as long as you need it, and do not');
+    out.push('redistribute it.');
   } else {
-    out.push('Comments were not collected, so this export contains no third-party');
-    out.push('personal data beyond what the target profile published itself.');
+    out.push('Comments were not collected and nothing here was reshared from another');
+    out.push('account, so this export contains no third-party personal data beyond');
+    out.push('what the target profile published itself.');
   }
   out.push('');
   out.push('Collected from an ordinary logged-in browser session. LinkedIn\'s User');
@@ -1609,6 +1662,9 @@ async function buildZip() {
   const videoCount = items.filter((i) => i.video).length;
   zipCancelled = false;
   const skippedEntries = [];
+  // Kept apart from skippedEntries: these are stills that could not be
+  // decoded, not files the archive is missing.
+  const frameFailures = [];
   state.zip = { building: true, done: 0, total: items.length, bytes: 0, failed: 0, frames: 0, filename: '' };
   if (videoCount) {
     addLog(
@@ -1650,11 +1706,21 @@ async function buildZip() {
         addLog('info', `Extracted ${res.framesWritten} video frame(s).`);
       }
       if (res.failed && res.failed.length) {
-        state.zip.failed += res.failed.length;
+        /*
+         * A frame-decode failure is not a missing entry: the video is in the
+         * archive, only its stills are not. Counting them together reported a
+         * complete export as short, and headed skipped.txt with an
+         * expired-CDN-link explanation that had nothing to do with it.
+         */
+        const items = res.failed.filter((f) => f.kind !== 'frames');
+        const frames = res.failed.filter((f) => f.kind === 'frames');
+        state.zip.failed += items.length;
         // Expired signed CDN links are the usual cause; name a couple, then count.
-        for (const f of res.failed.slice(0, 2)) addLog('warn', `Skipped ${f.path}: ${f.error}`);
+        for (const f of items.slice(0, 2)) addLog('warn', `Skipped ${f.path}: ${f.error}`);
+        for (const f of frames.slice(0, 2)) addLog('warn', `Could not extract frames for ${f.path}: ${f.error}`);
         // Everything, so a partial archive can be reconciled against the source.
-        for (const f of res.failed) skippedEntries.push(f);
+        for (const f of items) skippedEntries.push(f);
+        for (const f of frames) frameFailures.push(f);
       }
       broadcast(true);
     }
@@ -1677,22 +1743,44 @@ async function buildZip() {
      * lighter than expected. Writing the list means a short export can be
      * reconciled against the source instead of guessed at.
      */
-    if (skippedEntries.length) {
+    if (skippedEntries.length || frameFailures.length) {
       const root = U.sanitizeSegment(state.publicId, 'profile');
       const lines = [
         `SKIPPED — ${skippedEntries.length} entr${skippedEntries.length === 1 ? 'y' : 'ies'}`,
         RULE,
-        '',
-        'These could not be written. LinkedIn signs its media URLs with a short',
-        'expiry, so the most common cause is simply time passing between the',
-        'scrape and this export — re-run the scrape and export straight after.',
         ''
       ];
+      if (skippedEntries.length) {
+        lines.push('These could not be written. LinkedIn signs its media URLs with a short');
+        lines.push('expiry, so the most common cause is simply time passing between the');
+        lines.push('scrape and this export — re-run the scrape and export straight after.');
+        lines.push('');
+      } else {
+        lines.push('Every file the layout declared is in this archive.');
+        lines.push('');
+      }
       for (const f of skippedEntries) {
         lines.push(f.path);
         lines.push(`     reason: ${f.error}`);
         if (f.url) lines.push(`     url:    ${f.url}`);
         lines.push('');
+      }
+      if (frameFailures.length) {
+        // Its own section and its own explanation: re-running the scrape does
+        // not help, because nothing was missing from the download.
+        lines.push(`FRAMES NOT EXTRACTED — ${frameFailures.length} video(s)`);
+        lines.push(RULE);
+        lines.push('');
+        lines.push('These videos are in the archive. Only the one-frame-per-second stills');
+        lines.push('beside them could not be produced — the browser could not decode the');
+        lines.push('file. Nothing is missing from the download and re-running will not');
+        lines.push('change it.');
+        lines.push('');
+        for (const f of frameFailures) {
+          lines.push(f.path);
+          lines.push(`     reason: ${f.error}`);
+          lines.push('');
+        }
       }
       await offscreenSend({
         type: 'ZIP_ADD',

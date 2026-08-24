@@ -1334,6 +1334,60 @@ check('a failed save actually retries', () => {
 });
 
 /* ================================================================== *
+ * The export tells the truth about itself
+ *
+ * README.txt and skipped.txt exist to explain why an archive is short.
+ * Each of these had them explaining something that had not happened.
+ * ================================================================== */
+group('the export tells the truth');
+
+check('a run that was stopped does not read as one that finished', () => {
+  // Comments stripped: the note explaining this fix names `stoppedEarly`, and
+  // an ordering check that a good comment can fail is not a check.
+  const body = stripComments(
+    BG_SRC.slice(BG_SRC.indexOf("out.push('COMPLETENESS')"), BG_SRC.indexOf("out.push('DATA HANDLING')"))
+  );
+  // Stop raises before any page returns zero, so `stoppedEarly` is still
+  // false — a hand-stopped run was described as pagination ending naturally.
+  ok(/state\.status === 'stopped'/.test(body), 'a stopped run says so');
+  ok(/state\.status === 'interrupted'/.test(body), 'so does an interrupted one');
+  ok(/state\.status === 'error'/.test(body), 'and an errored one');
+  ok(
+    body.indexOf("state.status === 'stopped'") < body.indexOf('stoppedEarly'),
+    'how the run ended is decided before why pagination did'
+  );
+});
+
+check('the data-handling notice is checked against the files, not the options', () => {
+  const body = stripComments(BG_SRC.slice(BG_SRC.indexOf("out.push('DATA HANDLING')")));
+  // Reshare provenance writes another person's name, headline, profile URL
+  // and post body into three files regardless of the comments setting.
+  ok(/const reshared = posts\.filter/.test(body), 'reshared posts are counted');
+  const noThirdParty = body.indexOf('no third-party personal data beyond');
+  ok(body.lastIndexOf('reshared', noThirdParty) > 0, 'and the claim is guarded on it');
+});
+
+check('an empty comment fetch is not reported as one that never ran', () => {
+  ok(/post\.commentsFetchedAt = new Date\(\)\.toISOString\(\)/.test(CS_SRC), 'the pass records that it ran');
+  const body = fnBody('function commentsFileText', BG_SRC);
+  // Without the marker, "the pass returned nothing" and "the pass never
+  // happened" are byte-for-byte the same state — and with no comments
+  // endpoint configured the first is the common case.
+  ok(/post\.commentsFetchedAt && post\.comments/.test(body), 'and the file tells them apart');
+});
+
+check('frames that would not decode are not counted as missing files', () => {
+  // The video is in the archive; only its stills are not. Counted together,
+  // a complete export reported itself short under an expired-CDN-link
+  // explanation that had nothing to do with it.
+  ok(/kind: 'frames'/.test(OS_SRC), 'the packer tags them');
+  ok(/kind: 'item'/.test(OS_SRC), 'and tags real item failures too');
+  const body = BG_SRC.slice(BG_SRC.indexOf('async function buildZip'));
+  ok(/f\.kind !== 'frames'/.test(body), 'the worker counts only item failures');
+  ok(/FRAMES NOT EXTRACTED/.test(body), 'and skipped.txt gives them their own section');
+});
+
+/* ================================================================== *
  * The window tells the truth
  * ================================================================== */
 group('the window tells the truth');

@@ -254,7 +254,7 @@
            */
           for (let item = queue.shift(); item; item = queue.shift()) {
             itemFailures++;
-            failed.push({ path: item.path, url: item.url || null, error: 'cancelled' });
+            failed.push({ kind: 'item', path: item.path, url: item.url || null, error: 'cancelled' });
           }
           return;
         }
@@ -297,11 +297,19 @@
             bytes += await zip.addText(`${item.video.framesDir}/frames.txt`, framesReadme(item, r));
             extraEntries++;
           } catch (err) {
-            failed.push({ path: `${item.video.framesDir}/`, url: null, error: `frames: ${err.message}` });
+            /*
+             * Tagged, because this is not a missing archive entry. The video
+             * itself landed; only its stills did not. Untagged, the worker
+             * counted these into "skipped", so an export where every declared
+             * file is present reported itself short — and sent the user to
+             * re-run a scrape over an expired-CDN-link explanation that had
+             * nothing to do with it.
+             */
+            failed.push({ kind: 'frames', path: `${item.video.framesDir}/`, url: null, error: err.message });
           }
         } catch (err) {
           itemFailures++;
-          failed.push({ path: item.path, url: item.url || null, error: err.message });
+          failed.push({ kind: 'item', path: item.path, url: item.url || null, error: err.message });
         }
       }
     });

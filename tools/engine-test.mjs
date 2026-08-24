@@ -759,6 +759,76 @@ check('generic profile components read as the same four fields the markup prints
   eq(exp[0].current, true);
 });
 
+/* ================================================================== *
+ * Every reader contributes; none of them is a fallback
+ *
+ * The reported bug: a real profile came back with a name, a headline and a
+ * photo, and no job history at all. LinkedIn still ships the Profile entity in
+ * the page payload, so the embedded strategy always "succeeded" and returned —
+ * but it no longer ships typed Position/Education entities beside it, so the
+ * lists that entity produced were empty and the DOM reader that can see the
+ * rendered rows was never reached.
+ * ================================================================== */
+group('profile sources merge rather than race');
+
+check('a later source fills lists an earlier one left empty', () => {
+  const thin = { fullName: 'Sumon Chowdhury', headline: 'Podcast growth partner', experience: [], education: [], skills: [] };
+  const rendered = {
+    fullName: '', headline: '',
+    experience: [{ title: 'Founder', company: 'Content Daddy', dates: 'Jan 2023 - Present' }],
+    education: [{ school: 'University of Calcutta', degree: 'B.Com', dates: '2015 - 2018' }],
+    skills: ['Video Editing']
+  };
+  const m = E.mergeProfiles(thin, rendered);
+  eq(m.fullName, 'Sumon Chowdhury', 'the richer scalar is not overwritten by an empty one');
+  eq(m.experience.length, 1, 'and the empty list is filled');
+  eq(m.education.length, 1);
+  eq(m.skills, ['Video Editing']);
+});
+
+check('the same role from two sources is one role', () => {
+  const a = { experience: [{ title: 'Founder', company: 'Content Daddy', dates: 'Jan 2023 - Present' }] };
+  const b = {
+    experience: [
+      { title: 'Founder', company: 'Content Daddy', dates: 'Jan 2023 - Present' },
+      { title: 'Video Editor', company: 'Freelance', dates: 'Mar 2019 - Dec 2022' }
+    ]
+  };
+  eq(E.mergeProfiles(a, b).experience.length, 2);
+});
+
+check('merging never shrinks a list', () => {
+  const a = { experience: [{ title: 'Founder', company: 'Content Daddy', dates: 'x' }], skills: ['A', 'B'] };
+  eq(E.mergeProfiles(a, { experience: [], skills: [] }).experience.length, 1);
+  eq(E.mergeProfiles(a, {}).skills, ['A', 'B']);
+  eq(E.mergeProfiles(null, a).experience.length, 1, 'nothing to merge onto is not a loss');
+  eq(E.mergeProfiles(a, null).experience.length, 1);
+});
+
+check('every profile section merges, not just the three headline lists', () => {
+  const a = { certifications: [], languages: [{ name: 'Bengali', detail: 'Native', dates: '' }] };
+  const b = {
+    certifications: [{ name: 'Google Analytics', detail: 'Google', dates: 'Apr 2023' }],
+    languages: [{ name: 'Bengali', detail: 'Native', dates: '' }, { name: 'English', detail: 'Full', dates: '' }]
+  };
+  const m = E.mergeProfiles(a, b);
+  eq(m.certifications.length, 1);
+  eq(m.languages.length, 2, 'deduped by identity, not appended blindly');
+});
+
+check('a role with no resolvable company is still a role', () => {
+  // Self-employed, freelance, or a company LinkedIn has since deleted: the
+  // predicate used to demand a company alongside the title and dropped these.
+  const pool = { included: [
+    { $type: 'com.linkedin.voyager.dash.identity.profile.Position', entityUrn: 'urn:li:p:1',
+      title: { text: 'Independent Consultant' }, dateRange: { start: { year: 2021, month: 3 } } }
+  ]};
+  const p = E.mapProfileEntity({ entityUrn: 'urn:li:fsd_profile:X', publicIdentifier: 'x', firstName: 'X' }, pool);
+  eq(p.experience.length, 1);
+  eq(p.experience[0].title, 'Independent Consultant');
+  eq(p.experience[0].current, true, 'no end date means still there');
+});
+
 /* ================================================================== */
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
 

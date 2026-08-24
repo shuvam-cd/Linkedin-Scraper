@@ -36,18 +36,45 @@
    * LinkedIn's own CDN and is declared in host_permissions; nothing is sent
    * to a third party either way.
    */
+  /*
+   * A media fetch had no deadline, and fetch() has none of its own. One CDN
+   * connection that opens and then stalls parked one of the four workers
+   * forever, so `Promise.all(workers)` never settled, ZIP_ADD never answered,
+   * and buildZip's finally — the only thing that clears `zip.building` — never
+   * ran. The popup sat on "Packaging…" with a frozen counter and every button
+   * disabled, and the keep-alive dutifully kept the worker alive for it.
+   */
+  const FETCH_TIMEOUT_MS = 60000;
+
+  /** Set by ZIP_CANCEL so a cancel is felt inside a batch, not after it. */
+  let cancelled = false;
+
   async function fetchBlob(url) {
-    let res;
+    if (cancelled) throw new Error('cancelled');
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
+    const timedOut = () => new Error(`no response within ${Math.round(FETCH_TIMEOUT_MS / 1000)}s`);
     try {
-      res = await fetch(url, { credentials: 'omit', cache: 'no-store' });
+      let res = null;
+      try {
+        res = await fetch(url, { credentials: 'omit', cache: 'no-store', signal: ctl.signal });
+      } catch (err) {
+        if (ctl.signal.aborted) throw timedOut();
+        res = null;
+      }
+      if (!res || res.status === 401 || res.status === 403) {
+        res = await fetch(url, { credentials: 'include', cache: 'no-store', signal: ctl.signal });
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // Awaited under the same deadline: a body that stalls after its headers
+      // arrive is the same hang, and returning the promise would escape it.
+      return await res.blob();
     } catch (err) {
-      res = null;
+      if (ctl.signal.aborted) throw timedOut();
+      throw err;
+    } finally {
+      clearTimeout(timer);
     }
-    if (!res || res.status === 401 || res.status === 403) {
-      res = await fetch(url, { credentials: 'include', cache: 'no-store' });
-    }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res.blob();
   }
 
   /* ---------------------------------------------------------------- *
@@ -219,6 +246,18 @@
     const queue = items.slice();
     const workers = Array.from({ length: Math.min(FETCH_CONCURRENCY, queue.length) }, async () => {
       for (;;) {
+        if (cancelled) {
+          /*
+           * Record what is being abandoned rather than returning a short batch
+           * that looks complete. The worker reads `failed` to decide whether an
+           * archive is whole, so an unreported drop is a silent truncation.
+           */
+          for (let item = queue.shift(); item; item = queue.shift()) {
+            itemFailures++;
+            failed.push({ path: item.path, url: item.url || null, error: 'cancelled' });
+          }
+          return;
+        }
         const item = queue.shift();
         if (!item) return;
         try {
@@ -278,6 +317,11 @@
       switch (msg.type) {
         case 'ZIP_INIT':
           zip = newZipWriter();
+          cancelled = false;
+          return { ok: true };
+
+        case 'ZIP_CANCEL':
+          cancelled = true;
           return { ok: true };
 
         case 'ZIP_ADD': {
@@ -333,6 +377,7 @@
         }
 
         case 'ZIP_ABORT':
+          cancelled = true;
           zip = null;
           return { ok: true };
 

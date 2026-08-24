@@ -149,15 +149,24 @@
 
     const busy = BUSY.includes(state.status);
     const paused = state.status === 'paused';
+    // Packaging is not a scrape status, so a build in flight leaves the run
+    // reading "done" — and Start was enabled straight over the top of it.
+    const packaging = !!(state.zip && state.zip.building);
     const live = busy || paused;
 
     el.statusPill.className = 'pill ' + state.status;
     const stageWord = busy && STAGE[state.stage] ? STAGE_SHORT[state.stage] : null;
     el.statusText.textContent = stageWord || STATUS_LABEL[state.status] || state.status;
 
-    el.btnStart.disabled = live;
+    el.btnStart.disabled = live || packaging;
     el.btnStart.classList.toggle('busy', busy);
-    el.startLabel.textContent = busy ? 'Scraping…' : paused ? 'Paused' : 'Start scrape';
+    el.startLabel.textContent = busy
+      ? 'Scraping…'
+      : paused
+        ? 'Paused'
+        : packaging
+          ? 'Packaging…'
+          : 'Start scrape';
     el.btnStop.disabled = !live;
     inputs.forEach((c) => (c.disabled = live));
 

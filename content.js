@@ -182,7 +182,10 @@
     S.port.onDisconnect.addListener(() => {
       S.port = null;
       // Service worker went away mid-run; stop rather than scrape into the void.
-      if (S.active) S.stop = true;
+      if (S.active) {
+        S.stop = true;
+        abortInFlight();
+      }
       else stopHeartbeat(); // nothing left to report — don't reconnect forever
     });
     startHeartbeat();
@@ -270,6 +273,68 @@
   async function waitWhilePaused() {
     while (S.paused && !S.stop) await U.sleep(500);
     if (S.stop) throw new Abort('stopped', 'Stopped by user');
+  }
+
+  /**
+   * Stop, as an unwind rather than a flag the next step might notice.
+   *
+   * Every long pass breaks out of its own loop when S.stop is set and then
+   * returns normally — which, to its caller, is indistinguishable from "this
+   * pass finished". run() therefore moved on to the next step, and one of
+   * those steps navigates the tab to the activity feed and has the worker
+   * start the run again, where S.stop begins life false. A Stop pressed during
+   * the profile read was erased that way: the popup settled to "Stopped" while
+   * the tab carried on scraping. Stop has to leave the run, not just a loop.
+   */
+  function throwIfStopped() {
+    if (S.stop) throw new Abort('stopped', 'Stopped by user');
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Request deadlines
+   *
+   * fetch() has no timeout of its own. A connection that is accepted and then
+   * held — a throttled response, a proxy stall, the machine sleeping mid-fetch
+   * — parks the run at an await that no flag check can reach: progress freezes,
+   * `finally { S.active = false }` never runs, and the tab then refuses every
+   * later run with "A scrape is already running in this tab." until the page is
+   * reloaded. Every request gets a deadline, and Stop tears down whatever is in
+   * flight instead of waiting it out.
+   * ------------------------------------------------------------------ */
+  const REQUEST_TIMEOUT_MS = 45000;
+  const inFlight = new Set();
+
+  function startDeadline(dl) {
+    clearDeadline(dl);
+    dl.ctl = new AbortController();
+    dl.timer = setTimeout(() => {
+      try {
+        dl.ctl.abort();
+      } catch (_) {
+        /* already settled */
+      }
+    }, REQUEST_TIMEOUT_MS);
+    inFlight.add(dl.ctl);
+    return dl.ctl.signal;
+  }
+
+  function clearDeadline(dl) {
+    if (dl.timer) clearTimeout(dl.timer);
+    if (dl.ctl) inFlight.delete(dl.ctl);
+    dl.timer = null;
+    dl.ctl = null;
+  }
+
+  /** Tear down every in-flight request. Called the moment Stop arrives. */
+  function abortInFlight() {
+    for (const ctl of inFlight) {
+      try {
+        ctl.abort();
+      } catch (_) {
+        /* already settled */
+      }
+    }
+    inFlight.clear();
   }
 
   /* ------------------------------------------------------------------ *
@@ -408,6 +473,17 @@
    *   redirect to /checkpoint   -> pause and hand back
    */
   async function apiGet(url, opts) {
+    // The deadline lives out here so it is torn down on every exit path —
+    // a return, a throw, or an Abort unwinding the whole run.
+    const dl = { ctl: null, timer: null };
+    try {
+      return await apiRequest(url, opts, dl);
+    } finally {
+      clearDeadline(dl);
+    }
+  }
+
+  async function apiRequest(url, opts, dl) {
     const { retries = L.MAX_RETRIES, expectJson = true, voyager = false } = opts || {};
     let attempt = 0;
     let pauses = 0;
@@ -433,12 +509,20 @@
           method: 'GET',
           credentials: 'include',
           headers: voyager ? VY.headers(document.cookie) : { accept: 'text/html,application/xhtml+xml' },
-          redirect: 'follow'
+          redirect: 'follow',
+          signal: startDeadline(dl)
         });
       } catch (err) {
-        if (attempt >= retries) throw new Error(`Network error: ${err.message}`);
+        // Stop aborts in-flight requests, so distinguish that from a timeout
+        // and both from a genuine network error before deciding to retry.
+        throwIfStopped();
+        const why =
+          dl.ctl && dl.ctl.signal.aborted
+            ? `no response within ${Math.round(REQUEST_TIMEOUT_MS / 1000)}s`
+            : err.message;
+        if (attempt >= retries) throw new Error(`Network error: ${why}`);
         attempt++;
-        await coolOff(L.BACKOFF_MS * attempt, `Network error (${err.message})`);
+        await coolOff(L.BACKOFF_MS * attempt, `Network error (${why})`);
         continue;
       }
 
@@ -484,6 +568,8 @@
 
       if (res.status === 401 || res.status === 403) {
         const body = await res.text().catch(() => '');
+        // An empty body here is indistinguishable from an aborted read.
+        throwIfStopped();
         if (looksLikeChallenge(body)) {
           if (++pauses > 6) throw new Error('challenge response did not clear');
           requireAttention('challenge', CHALLENGE_MSG);
@@ -520,7 +606,29 @@
         continue;
       }
 
-      const text = await res.text();
+      /*
+       * The deadline covers the body read too — headers arriving and the body
+       * then stalling is the same hang — so it is only released once the whole
+       * response is in hand, and an abort here is classified exactly as one on
+       * the fetch is. Left bare, it rejected with a raw AbortError that no
+       * caller recognised: Stop marked the post being fetched as failed, and a
+       * timeout was reported as "The operation was aborted." and never retried.
+       */
+      let text;
+      try {
+        text = await res.text();
+      } catch (err) {
+        throwIfStopped();
+        const why =
+          dl.ctl && dl.ctl.signal.aborted
+            ? `no response within ${Math.round(REQUEST_TIMEOUT_MS / 1000)}s`
+            : err.message;
+        if (attempt >= retries) throw new Error(`Network error: ${why}`);
+        attempt++;
+        await coolOff(L.BACKOFF_MS * attempt, `Network error (${why})`);
+        continue;
+      }
+      clearDeadline(dl);
       if (looksLikeChallenge(text)) {
         if (++pauses > 6) throw new Error('challenge response did not clear');
         requireAttention('challenge', CHALLENGE_MSG);
@@ -1405,9 +1513,20 @@
   function readExperience(pool, index) {
     const rows = [];
     const seen = new Set();
+    /*
+     * Widened deliberately. A role LinkedIn ships without a resolvable company
+     * — self-employed, a company that has since been deleted, a freelance
+     * entry — used to be dropped entirely, because the predicate demanded a
+     * company alongside the title. A title plus a date range is a job.
+     */
     const isPosition = (x) =>
       x.title != null &&
-      (x.companyName != null || x.company != null || x['*company'] != null || x.companyUrn != null);
+      (x.companyName != null ||
+        x.company != null ||
+        x['*company'] != null ||
+        x.companyUrn != null ||
+        x.dateRange != null ||
+        x.timePeriod != null);
 
     for (const raw of VY.collect(pool, isPosition)) {
       const n = resolveAgainst(pool, raw, index);
@@ -1442,8 +1561,18 @@
   function readEducation(pool, index) {
     const rows = [];
     const seen = new Set();
+    /*
+     * Widened to match the mapper below, which already resolves a linked
+     * school. A school picked from the typeahead with no degree recorded ships
+     * as `{entityUrn, '*school': …, dateRange}` and matched neither clause, so
+     * it was dropped before the mapper ever saw it — the same failure
+     * isPosition was widened for, left in place here.
+     */
     const isEducation = (x) =>
-      x.schoolName != null || (x.degreeName != null && (x.school != null || x['*school'] != null));
+      x.schoolName != null ||
+      x.school != null ||
+      x['*school'] != null ||
+      (x.degreeName != null && (x.dateRange != null || x.timePeriod != null));
 
     for (const raw of VY.collect(pool, isEducation)) {
       const n = resolveAgainst(pool, raw, index);
@@ -1549,9 +1678,9 @@
   }
 
   /** The same seven sections, read off the rendered page. */
-  function profileSectionsFromDom() {
+  function profileSectionsFromDom(doc) {
     const out = {};
-    for (const s of PROFILE_SECTIONS) out[s.key] = entriesFromRows(sectionRows(s.anchor, 60));
+    for (const s of PROFILE_SECTIONS) out[s.key] = entriesFromRows(sectionRows(s.anchor, 60, doc));
     return out;
   }
 
@@ -1665,34 +1794,117 @@
   async function getProfile(publicId) {
     const profile = await readProfile(publicId);
     if (!profile) return profile;
-    if (S.cfg && S.cfg.fullProfile === false) return profile;
+    if (S.cfg && S.cfg.fullProfile === false) return withCurrentPosition(profile);
 
     // Collected while the profile was being read, off whichever document that
     // read used — fetching the page a second time just to look at its links
     // would spend a request for something already in hand.
-    return enrichFromDetailPages(publicId, profile, S.detailLinks || new Set());
+    const full = await enrichFromDetailPages(publicId, profile, S.detailLinks || new Set());
+
+    /*
+     * Recomputed here, after enrichment, and not only at the end of the read.
+     *
+     * The "Show all" pass exists precisely for the profile whose card yields
+     * no roles — that is the condition it forces the experience page on. So
+     * the case it was built for was also the case that left currentPosition
+     * null forever: it was frozen off the card, before the roles arrived. The
+     * export then printed a full experience list beside "currentPosition":
+     * null, which is the one field that answers "where does he work".
+     */
+    return withCurrentPosition(full);
   }
 
+  /** The profile page as a document, fetched and parsed. Null if either fails. */
+  async function fetchProfileDocument(publicId) {
+    try {
+      const html = await apiGet(U.profileUrl(publicId), { expectJson: false });
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      rememberDetailLinks(doc);
+      return doc;
+    } catch (err) {
+      if (err instanceof Abort) throw err;
+      log('warn', `Could not fetch the profile page to read (${err.message}).`);
+      return null;
+    }
+  }
+
+  /**
+   * Merges one profile read over another.
+   *
+   * Scalars: the first non-empty value wins, so an earlier, richer source is
+   * never overwritten by a later, thinner one. Lists: unioned by identity, so
+   * every source can only ever add rows.
+   */
+  function mergeProfiles(base, extra) {
+    if (!base) return extra;
+    if (!extra) return base;
+
+    const LISTS = {
+      experience: (r) => `${r.title}|${r.company}|${r.dates}`,
+      education: (r) => `${r.school}|${r.degree}|${r.dates}`,
+      skills: (r) => String(r)
+    };
+    for (const s of PROFILE_SECTIONS) LISTS[s.key] = entryKey;
+
+    const out = Object.assign({}, base);
+    for (const k of Object.keys(extra)) {
+      const v = extra[k];
+      if (LISTS[k]) {
+        out[k] = mergeById(base[k], v, LISTS[k]);
+        continue;
+      }
+      const cur = out[k];
+      const empty = cur == null || cur === '' || (Array.isArray(cur) && !cur.length);
+      if (empty && v != null && v !== '') out[k] = v;
+    }
+    return out;
+  }
+
+  /**
+   * Every source of profile data, merged — not the first one that answers.
+   *
+   * This used to `return` on the first strategy that produced a Profile
+   * entity, and that is why a real profile came back with a name, a headline
+   * and a photo but no job history. LinkedIn still ships the Profile entity in
+   * the page payload, so strategy B always "succeeded" — but it no longer
+   * ships typed Position/Education entities beside it, so the lists that entity
+   * produced were empty, and the DOM reader that *can* see the rendered rows
+   * was never reached because it only ran when B had failed outright.
+   *
+   * A partial answer is not a failure to be fallen back from, it is a
+   * contribution. So every strategy runs and the results are unioned.
+   */
   async function readProfile(publicId) {
-    // A — Voyager
+    let profile = null;
+    const sources = [];
+
+    const contribute = (candidate, name) => {
+      if (!candidate) return;
+      const before = profile ? (profile.experience || []).length : 0;
+      profile = mergeProfiles(profile, candidate);
+      const added = (profile.experience || []).length - before;
+      // The count goes in the log, where it is diagnostic; `source` stays a
+      // clean list of names because it is also a badge in the popup and a
+      // line in profile.txt.
+      sources.push(name);
+      if (added) log('info', `${name} contributed ${added} role(s).`);
+    };
+
+    // A — Voyager, when its endpoints have been filled in.
     if (CFG.profile.enabled) {
       try {
         const { raw } = await voyagerGet(CFG.profile, { publicId });
         const p = pickProfileEntity(raw, publicId);
-        if (p) {
-          log('success', 'Profile read from the Voyager API.');
-          return withCurrentPosition(Object.assign(mapProfileEntity(p, raw), { source: 'voyager' }));
-        }
-        log('warn', 'Voyager profile response held no profile entity — falling back.');
+        if (p) contribute(mapProfileEntity(p, raw), 'voyager');
       } catch (err) {
         if (err instanceof Abort) throw err;
-        log('warn', `Voyager profile failed (${err.message}) — falling back to the rendered page.`);
+        log('warn', `Voyager profile failed (${err.message}) — the other readers still run.`);
       }
-    } else {
-      log('info', 'Voyager profile endpoint is not configured — using the page payload (see ENDPOINTS.md).');
     }
 
-    // B — the payload the server rendered into the page
+    // B — the payload the server rendered into the page, plus that same page's
+    //     markup. One fetch, read both ways.
+    let fetched = null;
     if (CFG.embeddedJson.enabled) {
       try {
         let pool;
@@ -1700,32 +1912,88 @@
           pool = mergePayloads(payloadsFromRoot(document));
           rememberDetailLinks(document);
         } else {
-          // One fetch, read twice: the embedded payload for the entities and
-          // the markup for the "Show all" links.
           const html = await apiGet(U.profileUrl(publicId), { expectJson: false });
           pool = mergePayloads(payloadsFromHtml(html));
           try {
-            rememberDetailLinks(new DOMParser().parseFromString(html, 'text/html'));
+            fetched = new DOMParser().parseFromString(html, 'text/html');
+            rememberDetailLinks(fetched);
           } catch (_) {
             /* the payload read still stands */
           }
         }
         const p = pickProfileEntity(pool, publicId);
-        if (p) {
-          log('success', 'Profile read from the embedded page payload.');
-          return withCurrentPosition(Object.assign(mapProfileEntity(p, pool), { source: 'embedded-json' }));
-        }
-        log('warn', 'No profile entity in the page payload — falling back to the DOM.');
+        if (p) contribute(mapProfileEntity(p, pool), 'embedded-json');
       } catch (err) {
         if (err instanceof Abort) throw err;
-        log('warn', `Embedded payload read failed (${err.message}) — falling back to the DOM.`);
+        log('warn', `Embedded payload read failed (${err.message}) — the DOM reader still runs.`);
       }
     }
 
-    // C — read the rendered page
-    log('warn', 'Reading the profile off the rendered page. Expect fewer fields.');
-    rememberDetailLinks(document);
-    return withCurrentPosition(profileFromDom(publicId));
+    // C — the rendered markup. Not a fallback: on a modern profile this is the
+    //     only reader that sees the job history at all, because the rows are
+    //     rendered from components the typed readers do not recognise.
+    if (CFG.dom.enabled) {
+      try {
+        if (onProfilePageFor(publicId)) {
+          rememberDetailLinks(document);
+          contribute(profileFromDom(publicId, document), 'dom');
+        } else {
+          /*
+           * `fetched` is strategy B's parse of its own fetch, so when that
+           * fetch failed there was no document here and this reader — the only
+           * one that sees a component-rendered job history — quietly did
+           * nothing, directly under a log line promising it still ran. Fetch
+           * the page for it rather than skip it.
+           */
+          if (!fetched) fetched = await fetchProfileDocument(publicId);
+          if (fetched) contribute(profileFromDom(publicId, fetched), 'dom-fetched');
+        }
+      } catch (err) {
+        if (err instanceof Abort) throw err;
+        log('warn', `Reading the rendered profile failed (${err.message}).`);
+      }
+    }
+
+    if (!profile) {
+      log('warn', 'No reader produced a profile — falling back to the identifier alone.');
+      try {
+        /*
+         * Only when the tab is actually showing this profile. Reading the live
+         * document otherwise harvests whatever page the tab happens to be on
+         * and files a stranger's name and photo under the target's id, which
+         * is worse than the thin fallback below.
+         */
+        profile = onProfilePageFor(publicId) ? profileFromDom(publicId, document) : null;
+        if (profile) sources.push('dom');
+      } catch (_) {
+        /*
+         * Never throw out of here. A run with a thin profile is still a run —
+         * the posts are the point — and a profile read that fails must not be
+         * the thing that ends it.
+         */
+        profile = null;
+      }
+      if (!profile) {
+        profile = {
+          publicId,
+          fullName: publicId,
+          experience: [], education: [], skills: [],
+          profileUrl: U.profileUrl(publicId),
+          scrapedAt: new Date().toISOString()
+        };
+        for (const sec of PROFILE_SECTIONS) profile[sec.key] = [];
+        sources.push('identifier-only');
+      }
+    }
+
+    profile.source = sources.join(' + ') || 'unknown';
+    log(
+      (profile.experience || []).length ? 'success' : 'warn',
+      `Profile read via ${profile.source} — ` +
+        `${(profile.experience || []).length} role(s), ${(profile.education || []).length} school(s), ` +
+        `${(profile.skills || []).length} skill(s).`
+    );
+    return withCurrentPosition(profile);
   }
 
   const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -1767,15 +2035,28 @@
    * years. Class names are not, so every DOM lookup below is a list of
    * candidates and the structural fallbacks come last.
    */
-  function profileFromDom(publicId) {
+  /**
+   * Reads a profile out of rendered markup.
+   *
+   * `doc` is the live document when the tab is showing the profile, and a
+   * DOMParser document over fetched HTML when it is not — the readers are the
+   * same either way, so the rendered rows are available whether or not the
+   * user happens to be sitting on the page.
+   */
+  function profileFromDom(publicId, doc) {
+    const d = doc || document;
     const meta = (sel, attr) => {
-      const el = document.querySelector(sel);
-      return el ? el.getAttribute(attr || 'content') || '' : '';
+      try {
+        const el = d.querySelector(sel);
+        return el ? el.getAttribute(attr || 'content') || '' : '';
+      } catch (_) {
+        return '';
+      }
     };
     const pick = (sels) => {
       for (const s of sels) {
         try {
-          const el = document.querySelector(s);
+          const el = d.querySelector(s);
           const t = el && (el.textContent || '').trim();
           if (t) return t;
         } catch (_) {
@@ -1818,12 +2099,12 @@
      */
     let root = null;
     try {
-      root = document.querySelector('main');
+      root = d.querySelector('main');
     } catch (_) {
       /* ignore */
     }
     const scoped = root ? imageUrlsIn(root) : [];
-    const everywhere = imageUrlsIn(document);
+    const everywhere = imageUrlsIn(d);
 
     const photo =
       pickImageByPath(scoped, PROFILE_PHOTO_PATH) ||
@@ -1837,9 +2118,9 @@
 
     // The top card carries both counts as plain text. Bounded, because further
     // down the page other people's follower counts appear too.
-    const topText = textOfNode(root || (document && document.body)).slice(0, 3000);
+    const topText = textOfNode(root || (d && d.body)).slice(0, 3000);
 
-    return Object.assign(profileSectionsFromDom(), {
+    return Object.assign(profileSectionsFromDom(d), {
       publicId,
       profileUrn: null,
       fullName: name,
@@ -1848,14 +2129,14 @@
       headline,
       location,
       industry: '',
-      about: about || sectionText('about') || ogDesc,
+      about: about || sectionText('about', d) || ogDesc,
       followers: countFromText(topText, 'followers?'),
       connections: countFromText(topText, 'connections?'),
       photoUrl: photo || null,
       bannerUrl: banner || null,
-      experience: experienceFromDom(),
-      education: educationFromDom(),
-      skills: skillsFromDom(),
+      experience: experienceFromDom(d),
+      education: educationFromDom(d),
+      skills: skillsFromDom(d),
       currentPosition: null,
       profileUrl: U.profileUrl(publicId),
       scrapedAt: new Date().toISOString(),
@@ -1922,12 +2203,23 @@
     for (const n of VY.collect(pool, (x) => !!x.entityComponent || (x.components && x.components.entityComponent))) {
       const c = n.entityComponent || (n.components && n.components.entityComponent);
       if (!c || typeof c !== 'object') continue;
+      /*
+       * Positions preserved, not compacted.
+       *
+       * These four slots are known by name, and every consumer reads them by
+       * position — company is spans[1], dates spans[2], location spans[3].
+       * Dropping an empty one slid every later field a column left, so a
+       * self-employed role with no company line came out with its date range
+       * filed as the company and `current` computed from the location.
+       * Only trailing blanks go, so `spans.slice(3)` stays clean.
+       */
       const spans = [
         textOf(c.titleV2) || textOf(c.title),
         textOf(c.subtitle),
         textOf(c.caption),
         textOf(c.metadata)
-      ].filter(Boolean);
+      ].map((v) => v || '');
+      while (spans.length && !spans[spans.length - 1]) spans.pop();
       if (spans.length) out.push(spans);
     }
     return out;
@@ -1991,10 +2283,18 @@
           /* fall through to the payload read */
         }
 
-        // The rendered list first — it is what the page is for. The embedded
-        // components are the backstop for when LinkedIn ships no markup.
-        let rows = doc ? rowsFrom(doc.querySelector('main') || doc.body, 200) : [];
-        if (!rows.length) rows = componentRows(mergePayloads(payloadsFromHtml(html)));
+        /*
+         * Both readings, merged — not the first that answers.
+         *
+         * A fetched page is server-rendered, so which of the two carries the
+         * rows depends on how much LinkedIn chose to render for this section:
+         * sometimes the markup, sometimes only the component payload, and
+         * sometimes each holds rows the other does not. Taking whichever
+         * answered first threw away the difference.
+         */
+        const marked = doc ? rowsFrom(doc.querySelector('main') || doc.body, 200) : [];
+        const components = componentRows(mergePayloads(payloadsFromHtml(html)));
+        const rows = mergeById(marked, components, (r) => r.join('|'));
         if (!rows.length) continue;
 
         const before = (profile[d.key] || []).length;
@@ -2061,6 +2361,11 @@
    * profile with no education. So the walk up settles for whatever ancestor
    * actually contains a list.
    */
+  /** Every anchor LinkedIn drops in for its own in-page navigation. */
+  const SECTION_ANCHORS = ['experience', 'education', 'skills'].concat(
+    PROFILE_SECTIONS.map((sec) => sec.anchor).filter(Boolean)
+  );
+
   function sectionContainer(anchorId, root) {
     const doc = root || document;
     let anchor = null;
@@ -2077,18 +2382,42 @@
     } catch (_) {
       /* ignore */
     }
-    if (best && best.querySelector('li')) return best;
+    /*
+     * The walk must not escape this section.
+     *
+     * Looking for "any ancestor that contains an <li>" reaches `<main>` when
+     * the section itself is empty — and `<main>` contains every other
+     * section's rows. A profile with no experience listed therefore read the
+     * education card as its job history, and the first school became the
+     * answer to "where does he work". An ancestor that also holds another
+     * section's anchor is not this section's container.
+     */
+    const foreign = SECTION_ANCHORS.filter((id) => id !== anchorId)
+      .map((id) => '#' + id)
+      .join(', ');
+    const reachesAnotherSection = (el) => {
+      if (!foreign || !el || !el.querySelector) return false;
+      try {
+        return !!el.querySelector(foreign);
+      } catch (_) {
+        return false;
+      }
+    };
+
+    if (best && best.querySelector('li') && !reachesAnotherSection(best)) return best;
 
     let el = anchor.parentElement;
     for (let i = 0; el && i < 4; i++) {
       try {
-        if (el.querySelector && el.querySelector('li')) return el;
+        if (el.querySelector && el.querySelector('li') && !reachesAnotherSection(el)) return el;
       } catch (_) {
         /* ignore */
       }
       el = el.parentElement;
     }
-    return best;
+    // A container that spans other sections is worse than none: it yields
+    // their rows under this section's name.
+    return reachesAnotherSection(best) ? null : best;
   }
 
   /**
@@ -2119,12 +2448,12 @@
     return rows;
   }
 
-  const sectionRows = (anchorId, limit) => rowsFrom(sectionContainer(anchorId), limit);
+  const sectionRows = (anchorId, limit, doc) => rowsFrom(sectionContainer(anchorId, doc), limit);
 
   /** The longest string in a section — its body copy rather than its chrome. */
-  function sectionText(anchorId) {
+  function sectionText(anchorId, doc) {
     let best = '';
-    for (const spans of sectionRows(anchorId, 8)) {
+    for (const spans of sectionRows(anchorId, 8, doc)) {
       for (const s of spans) if (s.length > best.length) best = s;
     }
     return best;
@@ -2141,21 +2470,55 @@
    * its temporal dead zone when that table is evaluated — which throws before
    * the content script has registered a single listener.
    */
+  // The same month names the date formatter already keeps, as an alternation.
+  const MONTH_ALT = MONTHS.slice(1).join('|');
+  const DATE_RANGE_RE = new RegExp(
+    `^(?:(?:${MONTH_ALT})[a-z]*\\.?\\s*)?\\d{4}\\s*[\u2013\u2014-]\\s*(?:present|(?:(?:${MONTH_ALT})[a-z]*\\.?\\s*)?\\d{4})` +
+      `|^present\\b|^\\d+\\s*(?:yrs?|mos?|years?|months?)\\b`,
+    'i'
+  );
+
+  /** "Jan 2020 - Present", "2019 - 2023", "2 yrs 3 mos" — a date, not a name. */
+  function looksLikeDateRange(s) {
+    return DATE_RANGE_RE.test(String(s == null ? '' : s).trim());
+  }
+
+  /**
+   * Restores a column the markup never rendered.
+   *
+   * Unlike the component payload, rendered rows are unlabelled spans — an
+   * absent field is simply not there, so a role with no company line arrives
+   * as [title, dates] and every positional read is one column out. A date
+   * range sitting where a company belongs is unambiguous enough to correct:
+   * put the blank back and the rest of the row lines up again.
+   */
+  function realignDates(spans, at) {
+    const cols = spans.slice();
+    if (cols[at] && looksLikeDateRange(cols[at]) && !looksLikeDateRange(cols[at + 1] || '')) {
+      cols.splice(at, 0, '');
+    }
+    return cols;
+  }
+
   function experienceFromRows(rows) {
-    return rows.map((spans) => ({
-      title: spans[0] || '',
-      company: (spans[1] || '').split('·')[0].trim(),
-      location: spans[3] || '',
-      dates: spans[2] || '',
-      current: /present/i.test(spans[2] || ''),
-      description: spans.slice(4).join(' ')
-    }));
+    return rows.map((row) => {
+      const spans = realignDates(row, 1);
+      return {
+        title: spans[0] || '',
+        company: (spans[1] || '').split('·')[0].trim(),
+        location: spans[3] || '',
+        dates: spans[2] || '',
+        current: /present/i.test(spans[2] || ''),
+        description: spans.slice(4).join(' ')
+      };
+    });
   }
 
   function educationFromRows(rows) {
     return rows
-      .filter((spans) => spans[0])
-      .map((spans) => {
+      .filter((row) => row[0])
+      .map((row) => {
+        const spans = realignDates(row, 1);
         // "Bachelor of Commerce, Accounting and Finance" is one span.
         const parts = (spans[1] || '').split(',').map((s) => s.trim()).filter(Boolean);
         return {
@@ -2180,8 +2543,8 @@
       }));
   }
 
-  function experienceFromDom() {
-    return experienceFromRows(sectionRows('experience'));
+  function experienceFromDom(doc) {
+    return experienceFromRows(sectionRows('experience', 40, doc));
   }
 
   /*
@@ -2190,15 +2553,15 @@
    * captured)" and a profile.json with no skills — for a profile that showed
    * both on screen.
    */
-  function educationFromDom() {
-    return educationFromRows(sectionRows('education'));
+  function educationFromDom(doc) {
+    return educationFromRows(sectionRows('education', 40, doc));
   }
 
-  function skillsFromDom() {
+  function skillsFromDom(doc) {
     const out = [];
     const seen = new Set();
     // Nested <li>s (a skill's endorsement list) repeat the name; dedupe.
-    for (const spans of sectionRows('skills', 80)) {
+    for (const spans of sectionRows('skills', 80, doc)) {
       const name = spans[0];
       if (!name || seen.has(name)) continue;
       seen.add(name);
@@ -2354,6 +2717,10 @@
    * reported as such rather than dressed up as the whole history.
    * ------------------------------------------------------------------ */
   async function harvestViaEmbedded(profile, add) {
+    // On the activity page the payload comes straight out of the document, so
+    // this strategy can run start to finish without a single request — and
+    // apiGet is where the stop check used to live.
+    throwIfStopped();
     const tracker = new PageTracker('Embedded payload');
     S.pagination = tracker;
     const url = U.activityUrl(profile.publicId);
@@ -3083,7 +3450,36 @@
     }
   }
 
+  /**
+   * The run, with nothing outside a `finally`.
+   *
+   * `S.active` is set in runToCompletion's prologue — before the `try` that
+   * owns the cleanup — so a throw up there (a malformed cfg, or
+   * chrome.runtime.connect against an invalidated extension context) left
+   * S.active true with nothing to clear it. The listener starts the run
+   * without awaiting it, so the rejection was unhandled: no DONE, no error
+   * line, the worker waiting in `running` forever, and every later Start in
+   * that tab refused with "A scrape is already running in this tab." until the
+   * page was reloaded. This wrapper is the outermost guarantee.
+   */
   async function run(cfg) {
+    try {
+      await runToCompletion(cfg);
+    } catch (err) {
+      const message = (err && err.message) || String(err);
+      log('error', message);
+      try {
+        finish('error', message);
+      } catch (_) {
+        /* the port is gone too; nothing more to report through */
+      }
+    } finally {
+      S.active = false;
+      stopHeartbeat();
+    }
+  }
+
+  async function runToCompletion(cfg) {
     S.active = true;
     S.stop = false;
     S.paused = false;
@@ -3173,6 +3569,13 @@
         S.profile = profile;
       }
 
+      /*
+       * The profile is published above, so unwinding here still exports it.
+       * Without this the run walked into the posts phase carrying a Stop that
+       * the profile passes had only used to break their own loops.
+       */
+      throwIfStopped();
+
       /* ---- posts ---- */
       if (cfg.includePosts) {
         let via = null;
@@ -3195,6 +3598,14 @@
            * LinkedIn's answer and re-scrolling would only spend the request
            * budget to rediscover the same posts.
            */
+          /*
+           * Checked again right here, and not only at the top of the phase:
+           * everything between the two can set it, and this is the branch that
+           * hands the run to a fresh page. Escalating with a Stop pending is
+           * what made Stop look like it did nothing.
+           */
+          throwIfStopped();
+
           const onActivityPage = /\/recent-activity\//.test(location.pathname);
           if (CFG.dom.enabled && via !== 'voyager' && S.collected < cfg.maxPosts) {
             if (onActivityPage) {
@@ -3231,6 +3642,7 @@
         }
 
         if (phase === 'posts-dom' && CFG.dom.enabled) {
+          throwIfStopped();
           await tryStrategy('Feed scroll', () => harvestViaDom(add));
         }
 
@@ -3319,13 +3731,19 @@
           }
         }
         sendResponse({ ok: true });
-        run(msg.cfg); // deliberately not awaited — streams back over the port
+        // Deliberately not awaited — it streams back over the port. run()
+        // cannot reject, but a floating promise with no handler is how the
+        // last one of these went unnoticed.
+        run(msg.cfg).catch(() => {});
         return true;
       }
 
       case MSG.STOP:
         S.stop = true;
         S.paused = false;
+        // Don't wait out a request that may never answer — cut it now, and let
+        // the retry path see the stop flag rather than a network error.
+        abortInFlight();
         sendResponse({ ok: true });
         return true;
 
@@ -3397,6 +3815,17 @@
        */
       profileFromDom,
       getProfile,
+      mergeProfiles,
+      /*
+       * The run itself, and the state it turns on. Exported so a harness can
+       * start a run in a real page and press Stop part-way through it — the
+       * one behaviour that source-level checks cannot prove, and the one that
+       * shipped broken: Stop set a flag that the next phase walked straight
+       * past into a tab navigation that started the run over.
+       */
+      run,
+      S,
+      CFG,
       linkedDetailPages,
       rowsFrom,
       componentRows,

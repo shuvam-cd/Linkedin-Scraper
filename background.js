@@ -118,6 +118,17 @@ async function loadFromStorage() {
     state.status = 'interrupted';
     addLog('warn', 'Extension restarted mid-scrape — partial results kept.');
   }
+  /*
+   * The other flag that only a `finally` clears, and a dead worker never ran
+   * one. A build cannot span a restart, so a loaded `building: true` is always
+   * stale — and left standing it disabled the export permanently: every
+   * BUILD_ZIP answered "Already packaging.", and Clear, the only other way
+   * out, was disabled by the same flag.
+   */
+  if (state.zip && state.zip.building) {
+    state.zip = Object.assign({}, state.zip, { building: false });
+    addLog('warn', 'The export was interrupted by a restart — nothing was saved.');
+  }
   loaded = true;
 }
 
@@ -147,6 +158,9 @@ function schedulePersist(immediate) {
   persistTimer = setTimeout(persist, due);
 }
 
+const MAX_PERSIST_RETRIES = 5;
+let persistFailures = 0;
+
 async function persist() {
   persistTimer = null;
   lastPersist = Date.now();
@@ -161,11 +175,30 @@ async function persist() {
 
   try {
     await chrome.storage.local.set(payload);
+    persistFailures = 0;
   } catch (err) {
     // Most likely the quota; "unlimitedStorage" is requested to avoid this.
-    writing.forEach((c) => dirtyChunks.add(c)); // retry on the next tick
+    /*
+     * Marking the chunks dirty is not a retry — `dirtyChunks` is inert, and
+     * only schedulePersist ever arms a write. The write most likely to fail is
+     * the largest, and the one with no event behind it is the last one of the
+     * run, so the failure mode was: the popup shows the full count, the data
+     * only exists in memory, and the next eviction takes it.
+     */
+    writing.forEach((c) => dirtyChunks.add(c));
     console.warn('[LinkedIn Scraper] persist failed', err);
-    addLog('warn', `Could not save to local storage: ${err.message}`);
+    persistFailures++;
+    if (persistFailures <= MAX_PERSIST_RETRIES) {
+      addLog('warn', `Could not save to local storage: ${err.message} — retrying.`);
+      if (!persistTimer) persistTimer = setTimeout(persist, L.PERSIST_DEBOUNCE_MS * 4 * persistFailures);
+    } else {
+      addLog(
+        'error',
+        `Could not save to local storage after ${MAX_PERSIST_RETRIES} attempts (${err.message}). ` +
+          'Results are held in memory only — export now.'
+      );
+    }
+    return;
   }
 }
 
@@ -454,6 +487,18 @@ async function startScrape(payload, keepResults) {
     return { ok: false, error: 'Enter a LinkedIn profile URL or public identifier.' };
   }
 
+  /*
+   * buildZip guards re-entry through `state.zip.building` — but `state` is
+   * rebound to a fresh blankState() below, whose zip block is blank, so every
+   * later write from the running build landed on an object nobody reads and
+   * the guard went back to answering false. A second build could then start
+   * over the first, reset the shared ZipWriter, and lose everything the first
+   * had accumulated. Packaging finishes before a new run begins.
+   */
+  if (state.zip && state.zip.building) {
+    return { ok: false, error: 'Still packaging the archive — wait for the export to finish.' };
+  }
+
   const maxPosts = Math.max(1, Math.min(L.MAX_POSTS, parseInt(payload.maxPosts, 10) || 100));
   const options = Object.assign({}, U.DEFAULT_OPTIONS, payload.options || {});
 
@@ -552,9 +597,29 @@ async function continueAt(url, phase, profile) {
     state.phase = phase;
     schedulePersist();
 
+    /*
+     * Moving the tab, waiting for it to load and injecting take seconds, and
+     * waitForTabLoad alone allows up to a minute. A Stop landing anywhere in
+     * that window reached a content script that was already being torn down,
+     * so nothing carried the flag into the new page — and this function then
+     * sent START regardless and began a brand-new run, while the popup's
+     * settle timer flipped to "Stopped" over the top of it. Re-read the status
+     * after every await instead of trusting the one read at entry.
+     */
+    const abandoned = () => {
+      if (['starting', 'running', 'paused'].includes(state.status)) return false;
+      addLog('info', 'Stop landed while the tab was moving — the run ends here.');
+      if (state.status !== 'stopped') setStatus('stopped', { finishedAt: Date.now() });
+      return true;
+    };
+
+    if (abandoned()) return;
     await chrome.tabs.update(state.tabId, { url, active: true });
+    if (abandoned()) return;
     await waitForTabLoad(state.tabId, url);
+    if (abandoned()) return;
     await injectContent(state.tabId);
+    if (abandoned()) return;
 
     const res = await sendToTab(state.tabId, {
       type: MSG.START,
@@ -1573,6 +1638,18 @@ async function buildZip() {
     }
 
     /*
+     * Checked once more after the loop, not only at the top of it. With
+     * twenty entries to a batch, a small export is a single group — so every
+     * cancel fell straight through to ZIP_FINISH and saved a truncated
+     * archive, reported as a success, with no record of what was left out.
+     */
+    if (zipCancelled) {
+      await offscreenSend({ type: 'ZIP_ABORT' }).catch(() => {});
+      addLog('warn', 'Packaging cancelled — nothing was saved.');
+      return { ok: false, error: 'cancelled' };
+    }
+
+    /*
      * A manifest of what did not make it. An expired signed CDN link is the
      * usual cause and it is invisible otherwise — the archive completes, just
      * lighter than expected. Writing the list means a short export can be
@@ -1743,6 +1820,11 @@ async function allChunkKeys() {
 
 async function clearAll() {
   await ensureLoaded();
+  // Same reason as startScrape: the build writes into `state.zip`, and
+  // replacing `state` underneath it strands the build and unlocks its guard.
+  if (state.zip && state.zip.building) {
+    return { ok: false, error: 'Still packaging the archive — wait for the export to finish.' };
+  }
   const tabId = state.tabId;
   const keys = await allChunkKeys();
   state = blankState();
@@ -1778,6 +1860,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return buildZip();
       case MSG.CANCEL_ZIP:
         zipCancelled = true;
+        // The group loop only reads the flag between batches, and a batch is 20
+        // media fetches — tell the packer directly so an in-flight batch stops
+        // pulling from its queue instead of running to the end first.
+        offscreenSend({ type: 'ZIP_CANCEL' }).catch(() => {});
         return { ok: true };
       case MSG.CLEAR:
         return clearAll();

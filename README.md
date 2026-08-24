@@ -98,14 +98,14 @@ their API" from the outside. So it lives in its own file, has no DOM or
 `chrome.*` dependency, and is tested in isolation:
 
 ```
-node tools/test.mjs               372 assertions, no dependencies
+node tools/test.mjs               382 assertions, no dependencies
 
   resolver-test.mjs   58   URN resolution, session cookies, Rest.li encoding
   utils-test.mjs      33   public-id normalisation, CSV escaping
-  engine-test.mjs     76   session detection, entity mapping, post kinds, profile
+  engine-test.mjs     81   session detection, entity mapping, post kinds, profile
   export-test.mjs     62   archive tree, CSV, JSON, README, path collisions
   wiring-check.mjs    34   manifest / popup / message wiring, safety limits
-  regression-test.mjs 109  tab navigation, timers, media scope, termination
+  regression-test.mjs 114  tab navigation, timers, media scope, termination
 ```
 
 None of it can talk to LinkedIn, which is the point — it covers exactly the
@@ -655,6 +655,50 @@ rendered text for the counts; and the `#experience` / `#education` / `#skills`
 anchor ids, which are what the profile's own in-page navigation targets. The
 embedded-JSON reader got the same CDN-path fallback, so a shape change that
 moves `profilePicture` no longer blanks the photo there either.
+
+## Name and photo, but no job history
+
+The reported symptom: run it against a real profile and you get the name, the
+headline and the picture — and nothing under experience, nothing under
+education. No "where he works".
+
+`readProfile()` was a first-wins chain. Strategy B, the embedded page payload,
+`return`ed the moment it found a `.Profile` entity. LinkedIn **still ships that
+entity** — it carries the name, headline, public identifier and picture — so B
+always succeeded. What it no longer ships beside it are typed
+`.Position` / `.Education` entities: a modern profile renders those sections
+from generic components. So the lists B produced were empty, it returned
+anyway, and strategy C — the DOM reader, the only one that can see the rendered
+job history — was never reached, because it only ran when B had failed
+outright.
+
+Same fixture through both versions. The fixture is what a modern profile page
+actually ships: a `.Profile` entity in the payload, no typed positions, and the
+roles rendered as markup.
+
+```
+before   source: embedded-json      experience 0   education 0   skills 0   currentPosition null
+after    source: embedded-json + dom experience 3   education 2   skills 3   currentPosition Founder @ Content Daddy
+```
+
+A partial answer is not a failure to be fallen back from — it is a
+contribution. Every reader now runs and the results are merged: scalars take
+the first non-empty value so a richer source is never overwritten by a thinner
+one, and lists are unioned by identity so a reader can only ever add rows.
+
+Three things followed from it:
+
+- **The DOM readers take a document.** They read the global `document` and so
+  only worked on the live tab. They now accept any document, which means the
+  HTML already fetched for the payload is read as markup too — same fetch, two
+  readings, no extra request.
+- **A details page uses both its markup and its payload.** It took whichever
+  answered first; how much LinkedIn server-renders varies by section, and
+  sometimes each holds rows the other does not.
+- **A role with no company is still a role.** The Position predicate demanded a
+  company alongside the title, so self-employed, freelance, and roles at a
+  company LinkedIn has since deleted were dropped. A title plus a date range is
+  a job.
 
 ## The run that would not stop
 

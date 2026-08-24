@@ -197,9 +197,23 @@
    */
   function buildIndex(payload) {
     const byUrn = new Map();
+    /*
+     * The richer projection wins, not the last one seen.
+     *
+     * A page's payloads are concatenated before indexing, and the same
+     * entityUrn routinely appears in several of them under different
+     * projections — one full, one a `{entityUrn, $type}` stub. Overwriting
+     * unconditionally meant a reader could find the full Position entity, hand
+     * it to the resolver, and get the stub back: no title, no company, and the
+     * row discarded as empty. The `$id` line beside this one already had the
+     * rule right.
+     */
     const add = (e) => {
       if (!e || typeof e !== 'object' || Array.isArray(e)) return;
-      if (typeof e.entityUrn === 'string') byUrn.set(e.entityUrn, e);
+      if (typeof e.entityUrn === 'string') {
+        const prev = byUrn.get(e.entityUrn);
+        if (!prev || Object.keys(e).length > Object.keys(prev).length) byUrn.set(e.entityUrn, e);
+      }
       if (typeof e.$id === 'string' && !byUrn.has(e.$id)) byUrn.set(e.$id, e);
     };
     if (payload && typeof payload === 'object') {

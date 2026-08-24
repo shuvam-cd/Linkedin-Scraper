@@ -63,6 +63,9 @@ const group = (t) => process.stdout.write(`\n${t}\n`);
 
 const BG_SRC = read('background.js');
 const CS_SRC = read('content.js');
+const OS_SRC = read('offscreen.js');
+const VY_SRC = read('voyager.js');
+const PU_SRC = read('popup.js');
 
 /**
  * Comments in this project describe the bug that was fixed, so they quote the
@@ -70,6 +73,18 @@ const CS_SRC = read('content.js');
  * code alone or a good comment fails the test.
  */
 const stripComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+
+/**
+ * One function's source, ending at its own closing brace rather than at
+ * whatever happens to be declared next — so inserting a helper below it does
+ * not silently widen every assertion made about it.
+ */
+const fnBody = (decl, src) => {
+  const from = (src || CS_SRC).indexOf(decl);
+  if (from < 0) throw new Error(`not found: ${decl}`);
+  const end = (src || CS_SRC).indexOf('\n  }\n', from);
+  return (src || CS_SRC).slice(from, end < 0 ? undefined : end + 4);
+};
 
 /* ---------------- load background.js ---------------- */
 const ev = () => ({ addListener: () => {}, removeListener: () => {} });
@@ -1083,7 +1098,9 @@ check('getProfile reads the card and then follows the Show all pages', () => {
 });
 
 check('the links come from the document already fetched, not a second fetch', () => {
-  const body = CS_SRC.slice(CS_SRC.indexOf('async function getProfile'), CS_SRC.indexOf('async function readProfile'));
+  // getProfile's own body, not everything declared before readProfile — the
+  // helpers that live between them do make requests, and legitimately.
+  const body = fnBody('async function getProfile');
   ok(/S\.detailLinks/.test(body), 'collected during the read');
   ok(!/apiGet\(/.test(body), 'looking at the links must not cost a request of its own');
 });
@@ -1148,6 +1165,301 @@ check('the worker keeps the stage apart from the navigation phase', () => {
   ok(/stage: 'harvest'/.test(BG_SRC), 'blankState carries a stage');
   ok(/phase: 'main'/.test(BG_SRC), 'and still carries the phase');
   ok(/state\.stage = msg\.stage/.test(BG_SRC), 'the stage comes off the progress message');
+});
+
+/* ================================================================== *
+ * "Where does he work"
+ *
+ * The field the user actually asks for, and the four separate ways it came
+ * back empty or wrong.
+ * ================================================================== */
+group('where does he work');
+
+check('currentPosition is computed after the history is complete', () => {
+  const body = fnBody('async function getProfile');
+  // The "Show all" pass is forced precisely when the card yielded no roles,
+  // so the case it exists for is the case that left currentPosition null.
+  ok(/withCurrentPosition\(full\)/.test(body), 'the enriched profile is what gets the current role');
+  ok(/withCurrentPosition\(profile\)/.test(body), 'and so does the un-enriched early return');
+});
+
+check('the DOM reader is never skipped for want of a document', () => {
+  const body = stripComments(CS_SRC.slice(CS_SRC.indexOf('async function readProfile')));
+  // It is the only reader that sees a component-rendered job history, and it
+  // used to do nothing at all when strategy B's fetch had failed.
+  ok(/if \(!fetched\) fetched = await fetchProfileDocument\(publicId\)/.test(body), 'it fetches its own page');
+  ok(/async function fetchProfileDocument/.test(CS_SRC), 'and the helper exists');
+  ok(!/\} else if \(fetched\) \{/.test(body), 'no branch that silently does nothing');
+});
+
+check('the last-resort read does not harvest a stranger', () => {
+  const body = stripComments(CS_SRC.slice(CS_SRC.indexOf('async function readProfile')));
+  ok(
+    /onProfilePageFor\(publicId\) \? profileFromDom\(publicId, document\) : null/.test(body),
+    'the live document is only read when it is showing this profile'
+  );
+});
+
+check('a school with only a linked reference still counts', () => {
+  const src = fnBody('function readEducation');
+  // The mapper below already resolves `*school`; the predicate above it did
+  // not, so those entities were dropped before it ever saw them.
+  ok(/x\['\*school'\] != null/.test(src), 'the predicate accepts a school reference');
+  ok(/x\.school != null/.test(src), 'and a resolved one');
+  ok(/textOf\(linked\(n, 'school'\)\)/.test(src), 'which is exactly what the mapper resolves');
+});
+
+check('the component payload keeps its columns', () => {
+  const body = fnBody('function componentRows');
+  // titleV2 / subtitle / caption / metadata are read by position downstream —
+  // company is spans[1], dates spans[2] — so a compacted gap shifts them all.
+  ok(!/\]\.filter\(Boolean\)/.test(body), 'no compaction of the four named slots');
+  ok(/\.map\(\(v\) => v \|\| ''\)/.test(body), 'absent fields become blanks, not gaps');
+  ok(/while \(spans\.length && !spans\[spans\.length - 1\]\) spans\.pop\(\)/.test(body), 'only trailing blanks go');
+});
+
+check('a date range is never filed as a company', () => {
+  ok(/function looksLikeDateRange/.test(CS_SRC) && /function realignDates/.test(CS_SRC), 'the guard exists');
+  const exp = fnBody('function experienceFromRows');
+  const edu = fnBody('function educationFromRows');
+  ok(/realignDates\(row, 1\)/.test(exp), 'experience rows are realigned');
+  ok(/realignDates\(row, 1\)/.test(edu), 'and so are education rows');
+});
+
+check('a section reader cannot read the section next door', () => {
+  const body = fnBody('function sectionContainer');
+  // "Any ancestor holding an <li>" reaches <main>, which holds every other
+  // section's rows — so an empty experience card read the education list and
+  // the first school became the answer to "where does he work".
+  ok(/reachesAnotherSection/.test(body), 'the walk rejects a container that spans other sections');
+  ok(/SECTION_ANCHORS/.test(CS_SRC), 'the other anchors are known');
+  const anchors = CS_SRC.slice(CS_SRC.indexOf('const SECTION_ANCHORS'), CS_SRC.indexOf('function sectionContainer'));
+  ok(/PROFILE_SECTIONS\.map/.test(anchors), 'including every optional section, not a hand-kept list');
+});
+
+check('the richer projection of an entity wins the index', () => {
+  const body = VY_SRC.slice(VY_SRC.indexOf('function buildIndex'));
+  // The same URN appears in several of a page's payloads, one full and one a
+  // stub; last-wins meant a reader could find the full entity and resolve it
+  // back into the stub, then discard the row as empty.
+  ok(/const prev = byUrn\.get\(e\.entityUrn\)/.test(body), 'the existing entry is consulted');
+  ok(/Object\.keys\(e\)\.length > Object\.keys\(prev\)\.length/.test(body), 'and only beaten by a richer one');
+});
+
+/* ================================================================== *
+ * The archive is whole or it is not saved
+ * ================================================================== */
+group('the archive is whole or it is not saved');
+
+check('a run cannot start on top of a package in flight', () => {
+  // `state` is rebound to a blank object by both, which strands the running
+  // build's writes and resets the very flag that guards re-entry.
+  for (const fn of ['async function startScrape', 'async function clearAll']) {
+    const body = BG_SRC.slice(BG_SRC.indexOf(fn), BG_SRC.indexOf(fn) + 1400);
+    ok(/state\.zip && state\.zip\.building/.test(body), `${fn} checks for a build in flight`);
+  }
+  ok(/state\.zip && state\.zip\.building/.test(PU_SRC), 'and the popup disables Start for it');
+});
+
+check('a cancelled package is not saved', () => {
+  const body = BG_SRC.slice(BG_SRC.indexOf('for (const group of groups)'));
+  const finish = body.indexOf("type: 'ZIP_FINISH'");
+  const guard = body.indexOf('if (zipCancelled) {', body.indexOf('broadcast(true);'));
+  // Twenty entries to a batch means a small export is one group, so a cancel
+  // reached no further check and the truncated archive was saved as a success.
+  ok(guard > 0 && finish > guard, 'the flag is read again after the last batch');
+});
+
+check('a stale building flag cannot outlive the worker', () => {
+  const body = BG_SRC.slice(BG_SRC.indexOf('async function loadFromStorage'));
+  ok(/state\.zip = Object\.assign\(\{\}, state\.zip, \{ building: false \}\)/.test(body), 'it is repaired on load');
+  // Object.assign is shallow, so a persisted zip block replaces the blank one
+  // wholesale — and only a finally the dead worker never ran would clear it.
+  ok(body.indexOf('building: false') < body.indexOf('loaded = true'), 'before anything can read it');
+});
+
+check('a failed save actually retries', () => {
+  const body = BG_SRC.slice(BG_SRC.indexOf('async function persist()'));
+  // dirtyChunks is inert; only schedulePersist arms a write, and the catch
+  // never called it — so the last write of a run had no retry behind it.
+  ok(/persistTimer = setTimeout\(persist,/.test(body), 'the retry is armed from the failure path');
+  ok(/persistFailures/.test(body) && /MAX_PERSIST_RETRIES/.test(BG_SRC), 'and bounded');
+  ok(/persistFailures = 0;/.test(body), 'and reset once a write lands');
+});
+
+/* ================================================================== *
+ * Nothing waits forever
+ *
+ * fetch() has no timeout of its own, and neither half of this extension used
+ * to give it one. A connection that opens and then never answers parked the
+ * run at an await that no flag could reach: the popup froze mid-count, Stop
+ * did nothing at all, and the tab then refused every later run with "A scrape
+ * is already running in this tab." until the page was reloaded. The packer had
+ * the same hole one layer down, where it also disabled every button.
+ *
+ * Proved in a browser before it was fixed: with one held request, the shipped
+ * build never returned from run(), emitted no DONE, and left S.active true —
+ * with or without Stop. The current build settles the moment Stop arrives.
+ * ================================================================== */
+group('nothing waits forever');
+
+check('every LinkedIn request carries a deadline', () => {
+  ok(/const REQUEST_TIMEOUT_MS = /.test(CS_SRC), 'a deadline is defined');
+  const body = CS_SRC.slice(CS_SRC.indexOf('async function apiRequest'));
+  ok(/signal: startDeadline\(dl\)/.test(body), 'and the request is issued under it');
+  // The wrapper is what guarantees teardown on a return, a throw, or an Abort
+  // unwinding the whole run — not just on the happy path.
+  const wrapper = CS_SRC.slice(CS_SRC.indexOf('async function apiGet'), CS_SRC.indexOf('async function apiRequest'));
+  ok(/finally \{\s*clearDeadline\(dl\);/.test(wrapper), 'and torn down on every exit path');
+});
+
+check('the deadline covers the body, not just the headers', () => {
+  const body = CS_SRC.slice(CS_SRC.indexOf('async function apiRequest'));
+  const read = body.indexOf('text = await res.text();');
+  const clear = body.indexOf('clearDeadline(dl);', read);
+  ok(read > 0 && clear > read, 'the deadline is released after the body is read, not before');
+  // A bare `await res.text()` under an AbortSignal rejects with a raw
+  // AbortError that no caller recognises — Stop then marked the post being
+  // fetched as failed, and a timeout was never retried.
+  const after = body.slice(read, clear);
+  ok(/throwIfStopped\(\);/.test(after), 'an abort during the body read is classified, not raw');
+  ok(/await coolOff\(/.test(after), 'and a timeout there still gets its retry');
+});
+
+check('Stop tears down what is in flight instead of waiting it out', () => {
+  ok(/function abortInFlight\(\)/.test(CS_SRC), 'an abort helper exists');
+  const stop = CS_SRC.slice(CS_SRC.indexOf('case MSG.STOP:'), CS_SRC.indexOf('case MSG.RESUME:'));
+  ok(/abortInFlight\(\)/.test(stop), 'Stop calls it');
+  // The worker dying mid-run is the same situation wearing a different hat.
+  ok(/if \(S\.active\) \{\s*S\.stop = true;\s*abortInFlight\(\);/.test(stripComments(CS_SRC)), 'so does losing the worker');
+});
+
+check('an aborted request is told apart from a network error', () => {
+  const body = stripComments(CS_SRC.slice(CS_SRC.indexOf('async function apiRequest')));
+  // Retrying a request the user just cancelled is how a Stop turns into
+  // another three minutes of backoff.
+  const idx = body.indexOf('throwIfStopped();');
+  ok(idx > 0 && idx < body.indexOf('await coolOff'), 'Stop is checked before any retry decision');
+  ok(/signal\.aborted/.test(body), 'and a timeout is reported as one');
+});
+
+check('the packer gives its media fetches a deadline too', () => {
+  ok(/const FETCH_TIMEOUT_MS = /.test(OS_SRC), 'a deadline is defined');
+  const body = OS_SRC.slice(OS_SRC.indexOf('async function fetchBlob'));
+  ok((body.match(/signal: ctl\.signal/g) || []).length >= 2, 'both attempts run under it');
+  // `return res.blob()` would hand the promise back outside the try, and with
+  // it every guarantee the deadline was meant to provide.
+  ok(/return await res\.blob\(\);/.test(body), 'and the body read is awaited inside it');
+});
+
+check('Cancel is felt inside a batch, not only between batches', () => {
+  ok(/case 'ZIP_CANCEL':/.test(OS_SRC), 'the packer accepts a cancel');
+  const worker = OS_SRC.slice(OS_SRC.indexOf('const workers = Array.from'));
+  ok(/if \(cancelled\) \{/.test(worker.slice(0, 300)), 'and its workers stop pulling work');
+  // A short batch that reports no failures reads as a complete one.
+  ok(/error: 'cancelled'/.test(worker), 'recording what it abandons rather than reporting a clean batch');
+  ok(/offscreenSend\(\{ type: 'ZIP_CANCEL' \}\)/.test(BG_SRC), 'and the worker sends it on Cancel');
+  // A batch is twenty media fetches; waiting one out is what made Cancel look dead.
+  ok(/cancelled = false;/.test(OS_SRC), 'and a new archive starts uncancelled');
+});
+
+/* ================================================================== *
+ * Stop leaves the run, not just a loop
+ * ================================================================== */
+group('stop leaves the run');
+
+check('Stop does not survive the profile phase', () => {
+  const body = stripComments(CS_SRC.slice(CS_SRC.indexOf('async function runToCompletion(cfg)')));
+  // stripComments has eaten the `/* ---- posts ---- */` banner, so anchor on
+  // the code rather than on the comment that labels it.
+  const postsPhase = body.indexOf('if (cfg.includePosts)');
+  ok(postsPhase > 0, 'the posts phase is found');
+  ok(/throwIfStopped\(\);/.test(body.slice(0, postsPhase)), 'and a Stop unwinds before it starts');
+});
+
+check('a pending Stop never escalates the run into a new page', () => {
+  const body = stripComments(CS_SRC.slice(CS_SRC.indexOf('async function runToCompletion(cfg)')));
+  const escalate = body.indexOf('const onActivityPage =');
+  const guard = body.lastIndexOf('throwIfStopped();', escalate);
+  ok(escalate > 0, 'the escalation is found');
+  ok(guard > body.indexOf('if (cfg.includePosts)'), 'the guard sits inside the posts phase');
+  // The escalation navigates the tab and has the worker start the run again,
+  // where S.stop begins life false — so a Stop reaching it is a Stop erased.
+  ok(guard > 0 && escalate > guard, 'the escalation is guarded on the stop flag');
+  ok(/throwIfStopped\(\);\s*await tryStrategy\('Feed scroll'/.test(body), 'so is the feed-scroll leg');
+});
+
+check('a strategy that never makes a request still notices Stop', () => {
+  // On the activity page the payload comes out of the document, so this
+  // strategy can run start to finish without touching apiGet — which is where
+  // the stop check used to live.
+  const body = CS_SRC.slice(CS_SRC.indexOf('async function harvestViaEmbedded'));
+  ok(/throwIfStopped\(\)/.test(body.slice(0, 500)), 'it checks Stop itself');
+});
+
+check('nothing that sets S.active sits outside a finally', () => {
+  const wrapper = fnBody('async function run(cfg)');
+  // The listener starts the run without awaiting it, so a throw in the
+  // prologue was an unhandled rejection: no DONE, and the tab refused every
+  // later Start with "A scrape is already running in this tab."
+  ok(/await runToCompletion\(cfg\)/.test(wrapper), 'the run is wrapped');
+  ok(/finally \{\s*S\.active = false;/.test(wrapper), 'and S.active is cleared from the outermost finally');
+  ok(/finish\('error', message\)/.test(wrapper), 'and the worker is told rather than left waiting');
+  ok(/run\(msg\.cfg\)\.catch\(\(\) => \{\}\)/.test(CS_SRC), 'the floating call carries a handler');
+});
+
+check('the worker does not start a run it was told to stop', () => {
+  const body = stripComments(BG_SRC.slice(BG_SRC.indexOf('async function continueAt'), BG_SRC.indexOf('async function stopScrape')));
+  ok(/const abandoned = \(\) =>/.test(body), 'the status is re-read, not trusted from entry');
+  // tabs.update, waitForTabLoad and injectContent each take seconds, and
+  // waitForTabLoad alone allows a minute — a Stop can land in any of them.
+  const checks = (body.match(/if \(abandoned\(\)\) return;/g) || []).length;
+  ok(checks >= 4, `every await is followed by a re-check, found ${checks}`);
+  ok(body.indexOf('if (abandoned()) return;') < body.indexOf('type: MSG.START'), 'and the last one precedes START');
+});
+
+/* ================================================================== *
+ * A partial answer is a contribution, not a reason to stop asking
+ * ================================================================== */
+group('profile readers do not race each other');
+
+check('readProfile has no early return that ends the chain', () => {
+  const body = stripComments(CS_SRC.slice(CS_SRC.indexOf('async function readProfile'), CS_SRC.indexOf('const escapeRe')));
+  // The shipped version returned on the first strategy that found a Profile
+  // entity. LinkedIn still ships that entity, so the embedded strategy always
+  // "succeeded" — with empty lists — and the DOM reader that can see the
+  // rendered job history was never reached.
+  const returns = (body.match(/\n\s+return\s/g) || []).length;
+  ok(returns <= 1, `readProfile should end at one return, found ${returns}`);
+  ok(/contribute\(/.test(body), 'each strategy contributes');
+  ok(/mergeProfiles/.test(CS_SRC), 'and the contributions are merged');
+});
+
+check('the rendered page is read even when the payload answered', () => {
+  const body = stripComments(CS_SRC.slice(CS_SRC.indexOf('async function readProfile'), CS_SRC.indexOf('const escapeRe')));
+  const dom = body.indexOf('profileFromDom(publicId, document)');
+  const emb = body.indexOf('embedded-json');
+  ok(dom > 0, 'the DOM reader is called');
+  ok(emb > 0 && dom > emb, 'and it runs after the payload read rather than instead of it');
+});
+
+check('a fetched profile page is read as markup too, from the same fetch', () => {
+  const body = stripComments(CS_SRC.slice(CS_SRC.indexOf('async function readProfile'), CS_SRC.indexOf('const escapeRe')));
+  ok(/profileFromDom\(publicId, fetched\)/.test(body), 'the fetched HTML feeds the DOM reader');
+  ok((body.match(/apiGet\(/g) || []).length === 1, 'and it costs exactly one request');
+});
+
+check('the DOM readers can run against a document that is not the live page', () => {
+  for (const fn of ['experienceFromDom', 'educationFromDom', 'skillsFromDom', 'profileSectionsFromDom']) {
+    ok(new RegExp(`function ${fn}\\(doc\\)`).test(CS_SRC), `${fn} must take a document`);
+  }
+  ok(/function profileFromDom\(publicId, doc\)/.test(CS_SRC));
+});
+
+check('a details page uses both its markup and its payload', () => {
+  const body = stripComments(CS_SRC.slice(CS_SRC.indexOf('async function enrichFromDetailPages')));
+  ok(/const marked =/.test(body) && /const components =/.test(body), 'both are read');
+  ok(/mergeById\(marked, components/.test(body), 'and merged rather than raced');
 });
 
 /* ---------------- summary ---------------- */

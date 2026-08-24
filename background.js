@@ -648,6 +648,10 @@ async function stopScrape() {
   // The run may have finished between the popup rendering and the click.
   if (!['starting', 'running', 'paused'].includes(state.status)) return { ok: true, alreadyFinished: true };
   if (state.tabId != null) await sendToTab(state.tabId, { type: MSG.STOP });
+  // Whatever the run was waiting on, it is not waiting any more — and a
+  // checkpoint tears the content script down, so C_DONE may never arrive to
+  // clear this.
+  state.attention = null;
   addLog('info', 'Stop requested — finishing the current request.');
   setStatus('stopping');
   // If the content script is gone the DONE message never arrives; settle anyway.

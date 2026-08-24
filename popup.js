@@ -155,7 +155,14 @@
     const live = busy || paused;
 
     el.statusPill.className = 'pill ' + state.status;
-    const stageWord = busy && STAGE[state.stage] ? STAGE_SHORT[state.stage] : null;
+    /*
+     * Only while the run is actually running. `busy` includes 'stopping', and
+     * the content script keeps emitting its stage after the flag is set, so
+     * the stale stage word kept overwriting "Stopping" — pressing Stop during
+     * the detail or comments pass changed nothing on screen for twelve
+     * seconds, and STATUS_LABEL.stopping was dead code.
+     */
+    const stageWord = state.status === 'running' && STAGE[state.stage] ? STAGE_SHORT[state.stage] : null;
     el.statusText.textContent = stageWord || STATUS_LABEL[state.status] || state.status;
 
     el.btnStart.disabled = live || packaging;
@@ -167,7 +174,9 @@
         : packaging
           ? 'Packaging…'
           : 'Start scrape';
-    el.btnStop.disabled = !live;
+    // Not re-armed while the stop is being honoured: the next broadcast is
+    // ~200ms away and a second click sends a second STOP into the same run.
+    el.btnStop.disabled = !live || state.status === 'stopping';
     inputs.forEach((c) => (c.disabled = live));
 
     /* progress */
@@ -204,7 +213,14 @@
     const resumable = paused || state.status === 'interrupted' || state.status === 'session_limit_reached';
     const isError = state.status === 'error';
     let banner = '';
-    if (state.attention && state.attention.message) banner = state.attention.message;
+    /*
+     * Only while the run can still act on it. A checkpoint tears the content
+     * script down, so C_DONE never arrives and the worker's settle timer flips
+     * straight to 'stopped' with the attention message still set — leaving an
+     * amber notice telling the user to press a Resume button that is hidden
+     * one line below, and implying a run that is over is still recoverable.
+     */
+    if (state.attention && state.attention.message && (live || resumable)) banner = state.attention.message;
     // A paused run always carries an attention message, but a paused state
     // restored from storage may not — and an amber box with no text in it
     // says nothing about why the run stopped.
@@ -233,7 +249,10 @@
     const hasData = got > 0 || !!state.profile;
     const canExport = hasData && !busy && !zip.building;
     el.btnZip.disabled = !canExport;
-    el.btnClear.disabled = busy || zip.building || (!hasData && state.status === 'idle');
+    // `live`, not `busy`: every other control here treats a paused run as
+    // in-flight, and this one button wiped the cursor and every collected post
+    // — with no confirmation — while the Resume button sat above it.
+    el.btnClear.disabled = live || zip.building || (!hasData && state.status === 'idle');
 
     el.btnZip.classList.toggle('busy', !!zip.building);
     el.zipLabel.textContent = zip.building ? 'Packaging…' : 'Download everything as ZIP';

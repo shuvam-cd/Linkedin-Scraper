@@ -252,6 +252,11 @@
   box-shadow: inset 0 0 0 1px var(--border);
 }
 .progress > .bar {
+  /* Positioned so the sheen below sizes to the *fill*. Without it the
+     absolutely-positioned ::after resolves inset:0 against .progress, so
+     the shimmer swept the whole track and a run at 5% animated
+     edge-to-edge — the one cue that should say "this fill is working". */
+  position: relative;
   height: 100%;
   width: 0%;
   border-radius: var(--r-pill);

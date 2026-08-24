@@ -1288,6 +1288,38 @@ check('a failed save actually retries', () => {
 });
 
 /* ================================================================== *
+ * The window tells the truth
+ * ================================================================== */
+group('the window tells the truth');
+
+check('the progress sheen belongs to the fill, not the track', () => {
+  const css = read('ui/components.css');
+  const bar = css.slice(css.indexOf('.progress > .bar {'), css.indexOf('.progress > .bar.live::after'));
+  // inset:0 on the ::after resolves against the nearest positioned ancestor;
+  // without this the shimmer swept the whole track at any percentage.
+  ok(/position: relative;/.test(bar), '.bar establishes its own containing block');
+});
+
+check('Stop is visible the moment it is pressed', () => {
+  // BUSY includes 'stopping', and the content script keeps emitting its stage
+  // after the flag is set, so the stage word kept overwriting "Stopping".
+  ok(/state\.status === 'running' && STAGE\[state\.stage\]/.test(PU_SRC), 'the stage word yields to the status');
+  ok(/!live \|\| state\.status === 'stopping'/.test(PU_SRC), 'and the button does not re-arm itself');
+});
+
+check('a paused run cannot be cleared out from under itself', () => {
+  // Every other control treats paused as in-flight; this one wiped the cursor
+  // and every collected post, with no confirmation, next to a Resume button.
+  ok(/el\.btnClear\.disabled = live \|\|/.test(PU_SRC), 'Clear is gated on live, not busy');
+});
+
+check('an attention notice does not outlive what it asks for', () => {
+  ok(/state\.attention\.message && \(live \|\| resumable\)/.test(PU_SRC), 'the banner needs a run that can act');
+  const stop = BG_SRC.slice(BG_SRC.indexOf('async function stopScrape'), BG_SRC.indexOf("setStatus('stopping')"));
+  ok(/state\.attention = null;/.test(stop), 'and Stop clears it worker-side too');
+});
+
+/* ================================================================== *
  * Nothing waits forever
  *
  * fetch() has no timeout of its own, and neither half of this extension used

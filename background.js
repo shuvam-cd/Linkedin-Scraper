@@ -405,9 +405,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
  * handoff. They would sit in storage forever with no text and no counts.
  */
 function needsMoreWork(p) {
-  if (!p.detailFetched) return true;
-  if (state.options.includeComments && !Array.isArray(p.commentList)) return true;
-  return false;
+  // One definition, shared with the content script. These two predicates used
+  // to be written out separately in each context and had drifted apart, so the
+  // worker handed back fewer posts than the run would have worked on.
+  if (U.postNeedsDetail(p)) return true;
+  return state.options.includeComments && U.postNeedsComments(p);
 }
 
 // Bounded: this rides inside a single sendMessage, and a few hundred posts
@@ -439,7 +441,10 @@ function runCfg(extra) {
       alreadyCollected: posts.length,
       pendingPosts: needy.slice(0, HANDOFF_LIMIT),
       startCursor: state.cursor,
-      phase: 'main',
+      // Read from the state rather than hardcoded: continueAt still overrides
+      // it, but a resume now picks up where the run actually was.
+      phase: state.phase || 'main',
+      profile: state.phase === 'posts-dom' ? state.profile : null,
       // A fresh sitting starts the budget over; continueAt overrides this.
       requestsSoFar: 0
     },
@@ -508,6 +513,17 @@ async function startScrape(payload, keepResults) {
   const keepProfile = resuming ? state.profile : null;
   const keepLog = resuming ? state.log : [];
   const keepCursor = resuming ? state.cursor : null;
+  /*
+   * Where the run had got to. This was written on every handoff and persisted
+   * faithfully, and then nothing ever read it — so a run interrupted during
+   * the feed scroll resumed at 'main': back to the profile page, the whole
+   * profile re-read (with Full history that is the card plus up to seven
+   * "Show all" pages, each behind the request floor), the activity page
+   * re-fetched, and only then back to the feed to scroll from the top. Around
+   * ten requests of the budget spent getting back to where it already was, on
+   * a run that was resumed because the budget ran out.
+   */
+  const keepPhase = resuming && state.phase === 'posts-dom' && keepProfile ? 'posts-dom' : 'main';
 
   state = blankState();
   state.tabId = keepTab;
@@ -518,6 +534,7 @@ async function startScrape(payload, keepResults) {
   state.log = keepLog;
   state.profile = keepProfile;
   state.cursor = keepCursor;
+  state.phase = keepPhase;
 
   if (!resuming) {
     posts = [];
@@ -536,7 +553,8 @@ async function startScrape(payload, keepResults) {
   setStatus('starting');
 
   try {
-    const target = U.profileUrl(publicId);
+    // Resuming into the feed scroll means the feed is where the run belongs.
+    const target = state.phase === 'posts-dom' ? U.activityUrl(publicId) : U.profileUrl(publicId);
     const { tabId, navigated } = await ensureTab(target);
     state.tabId = tabId;
     // Only wait when something is actually loading — a tab already on the

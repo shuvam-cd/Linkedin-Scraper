@@ -438,8 +438,54 @@ check('carrying only part of the backlog is announced', () => {
 });
 
 check('needsMoreWork still drives the list', () => {
+  const done = { detailFetched: true, text: 'hi', reactions: 0, comments: 0, commentList: [] };
   eq(BG.needsMoreWork({ detailFetched: false }), true);
-  eq(BG.needsMoreWork({ detailFetched: true }), false);
+  eq(BG.needsMoreWork(done), false);
+});
+
+check('the worker and the content script agree on what is unfinished', () => {
+  // They each wrote the rule out separately and had drifted: the worker only
+  // checked detailFetched, so a post the run would have fetched — no text,
+  // null counts, declared-but-missing media — was never handed back to it.
+  // The embedded fallback makes URN-only stubs with detailFetched true.
+  const U = globalThis.LIS;
+  const base = { detailFetched: true, text: 'hi', reactions: 4, comments: 2 };
+  eq(U.postNeedsDetail(base), false, 'a finished post');
+  eq(U.postNeedsDetail(Object.assign({}, base, { text: '' })), true, 'no text');
+  eq(U.postNeedsDetail(Object.assign({}, base, { text: '', type: 'image' })), false, 'an image may be wordless');
+  eq(U.postNeedsDetail(Object.assign({}, base, { reactions: null })), true, 'null counts');
+  eq(U.postNeedsDetail(Object.assign({}, base, { mediaIncomplete: true })), true, 'declared media missing');
+  for (const p of [base, Object.assign({}, base, { text: '' })]) {
+    eq(BG.needsMoreWork(Object.assign({ commentList: [] }, p)), U.postNeedsDetail(p), 'the two agree');
+  }
+  ok(/U\.postNeedsDetail/.test(read('content.js')), 'and the content script uses the shared one');
+});
+
+check('a resume picks up where the run was, not at the beginning', () => {
+  const body = BG_SRC.slice(BG_SRC.indexOf('async function startScrape'), BG_SRC.indexOf('async function stopScrape'));
+  // state.phase was written on every handoff and persisted, and nothing ever
+  // read it — so an interrupted feed scroll resumed at 'main' and spent ten
+  // requests of the budget getting back to where it already was.
+  ok(/const keepPhase = /.test(body), 'the phase survives the state reset');
+  ok(/state\.phase === 'posts-dom' \? U\.activityUrl/.test(body), 'and decides which page to open');
+  const cfg = BG_SRC.slice(BG_SRC.indexOf('function runCfg'), BG_SRC.indexOf('function runCfg') + 1400);
+  ok(/phase: state\.phase \|\| 'main'/.test(cfg), 'and the cfg carries it');
+  // Resuming into the feed with no profile would export a run with no profile.
+  ok(/keepProfile \? 'posts-dom' : 'main'/.test(body), 'only when the profile came with it');
+});
+
+check('a post with no comments is recorded as finished', () => {
+  const U = globalThis.LIS;
+  // `comments === 0` is normal and such a post never gets a list, so testing
+  // only for the list read as "unfinished" forever — re-shipping finished
+  // posts every resume and crowding needy ones out of the bounded handoff.
+  eq(U.postNeedsComments({ comments: 0 }), false, 'zero comments is done');
+  eq(U.postNeedsComments({ comments: 3 }), true, 'three and no list is not');
+  eq(U.postNeedsComments({ comments: 3, commentList: [] }), false, 'a list settles it');
+  const pass = read('content.js');
+  const body = pass.slice(pass.indexOf('async function commentPass'));
+  ok(/p\.comments === 0 && !Array\.isArray\(p\.commentList\)/.test(body), 'the pass records the skip');
+  ok(/p\.commentList = \[\];/.test(body), 'as an empty list');
 });
 
 /* ================================================================== *

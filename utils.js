@@ -282,6 +282,40 @@ if (!globalThis.LIS) {
     const csvRow = (cells) => cells.map(csvCell).join(',') + '\r\n';
 
     /* ------------------------------------------------------------------ *
+     * What still needs fetching
+     *
+     * Shared because two contexts have to agree on it and did not. The
+     * content script decided what to fetch detail for; the worker decided
+     * what to hand back to a re-hosted run — and the worker's version only
+     * checked `detailFetched`. A post the content script would have fetched
+     * (empty text, null counts, declared-but-missing media) was therefore
+     * never handed over, and the run that could have fixed it never saw it.
+     * The embedded-payload fallback makes URN-only stubs whose entire content
+     * comes from the detail pass, and `detailFetched` is true on all of them.
+     * ------------------------------------------------------------------ */
+    function postNeedsDetail(p) {
+      if (!p) return false;
+      if (!p.detailFetched) return true;
+      // Declared media the list response did not carry.
+      if (p.mediaIncomplete) return true;
+      // An image post is allowed to have no words; nothing else is.
+      if (!p.text && p.type !== 'image') return true;
+      return p.reactions == null || p.comments == null;
+    }
+
+    /**
+     * Whether a post's comments are still outstanding.
+     *
+     * `comments === 0` is a normal, common value, and a post with none never
+     * gets a list — so testing only for the list read as "unfinished" forever,
+     * re-shipping finished posts on every resume and crowding genuinely needy
+     * ones out of the bounded handoff.
+     */
+    function postNeedsComments(p) {
+      return !!p && p.comments !== 0 && !Array.isArray(p.commentList);
+    }
+
+    /* ------------------------------------------------------------------ *
      * Post types and reactions
      * ------------------------------------------------------------------ */
     const POST_TYPES = ['text', 'image', 'document', 'video', 'article', 'repost', 'poll'];
@@ -332,6 +366,8 @@ if (!globalThis.LIS) {
       fmtTimestamp,
       csvCell,
       csvRow,
+      postNeedsDetail,
+      postNeedsComments,
       POST_TYPES,
       REACTION_LABELS,
       reactionLabel

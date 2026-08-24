@@ -3061,14 +3061,10 @@
     return true;
   }
 
+  // The rule itself lives in utils.js because the worker has to apply the same
+  // one when it decides which posts to hand back to a re-hosted run.
   function needsDetail(post) {
-    if (CFG.alwaysFetchDetail) return true;
-    if (!post.detailFetched) return true;
-    // The post said it had media and the list response did not carry it.
-    if (post.mediaIncomplete) return true;
-    if (!post.text && post.type !== 'image') return true;
-    if (post.reactions == null || post.comments == null) return true;
-    return false;
+    return CFG.alwaysFetchDetail || U.postNeedsDetail(post);
   }
 
   async function fetchPostDetail(post) {
@@ -3361,7 +3357,24 @@
   }
 
   async function commentPass() {
-    const pending = S.posts.filter((p) => p.comments !== 0 && !p.commentList);
+    const pending = S.posts.filter(U.postNeedsComments);
+
+    /*
+     * A post with no comments is finished, and has to be recorded as finished.
+     * Skipping it silently left `commentList` undefined, which the worker reads
+     * as "still outstanding" — so every resume re-shipped the same finished
+     * posts, and once more than the handoff limit were in that state the posts
+     * that genuinely needed work sat past the slice boundary and were never
+     * handed over at all.
+     */
+    for (const p of S.posts) {
+      if (p.comments === 0 && !Array.isArray(p.commentList)) {
+        p.commentList = [];
+        p.commentsTruncated = false;
+        emit(MSG.C_POST_UPDATE, { post: p });
+      }
+    }
+
     if (!pending.length) {
       log('info', 'No posts with comments to fetch.');
       return;

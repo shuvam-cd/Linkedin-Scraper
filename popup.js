@@ -132,8 +132,9 @@
     if (f.maxPosts != null) el.maxPosts.value = f.maxPosts;
     const o = f.options || {};
     el.optIncludePosts.checked = o.includePosts !== false;
-    // Comments stay opt-in: never restored as on unless explicitly saved on.
-    el.optIncludeComments.checked = o.includeComments === true;
+    // Same rule as every other option: on unless explicitly saved off. This
+    // used to be the one opt-in, which meant "everything" was never the default.
+    el.optIncludeComments.checked = o.includeComments !== false;
     el.optSkipVideos.checked = !!o.skipVideos;
     el.optIncludeProfileMedia.checked = o.includeProfileMedia !== false;
     el.optFullProfile.checked = o.fullProfile !== false;

@@ -887,8 +887,85 @@ const PROFILE_SECTION_LABELS = [
   ['projects', 'PROJECTS'],
   ['honors', 'HONORS & AWARDS'],
   ['courses', 'COURSES'],
-  ['publications', 'PUBLICATIONS']
+  ['publications', 'PUBLICATIONS'],
+  ['patents', 'PATENTS'],
+  ['testScores', 'TEST SCORES'],
+  ['organizations', 'ORGANIZATIONS'],
+  ['causes', 'VOLUNTEER CAUSES'],
+  ['recommendations', 'RECOMMENDATIONS'],
+  ['interests', 'INTERESTS'],
+  ['featured', 'FEATURED']
 ];
+
+/** The file name each section is written to, beside experience.txt. */
+const PROFILE_SECTION_FILES = {
+  certifications: 'certifications.txt',
+  languages: 'languages.txt',
+  volunteering: 'volunteering.txt',
+  projects: 'projects.txt',
+  honors: 'honors_and_awards.txt',
+  courses: 'courses.txt',
+  publications: 'publications.txt',
+  patents: 'patents.txt',
+  testScores: 'test_scores.txt',
+  organizations: 'organizations.txt',
+  causes: 'volunteer_causes.txt',
+  recommendations: 'recommendations.txt',
+  interests: 'interests.txt',
+  featured: 'featured.txt'
+};
+
+/** One section as its own file — the same rendering profile.txt uses. */
+function sectionFileText(p, key, label) {
+  const rows = Array.isArray(p[key]) ? p[key] : [];
+  const out = [`${label} — ${p.fullName || p.publicId}`, '='.repeat(70), ''];
+  if (!rows.length) {
+    out.push(`(no ${label.toLowerCase()} captured)`);
+    return crlf(out);
+  }
+  rows.forEach((r, i) => {
+    out.push(`${String(i + 1).padStart(3)}. ${r.name}`);
+    const line = [r.detail, r.dates].filter(Boolean).join('   ·   ');
+    if (line) out.push(`     ${line}`);
+    if (r.url) out.push(`     ${r.url}`);
+    if (r.description) {
+      for (const l of String(r.description).split(/\r?\n/)) out.push(`     ${l}`);
+    }
+    out.push('');
+  });
+  return crlf(out);
+}
+
+/** Contact info and the rest of the top card that has no section of its own. */
+function contactFileText(p) {
+  const out = [`CONTACT — ${p.fullName || p.publicId}`, '='.repeat(70), ''];
+  out.push(kv('Profile', p.profileUrl || U.profileUrl(p.publicId)));
+  if (p.pronouns) out.push(kv('Pronouns', p.pronouns));
+  if (p.verified) out.push(kv('Verified', 'yes'));
+  if (p.openTo) out.push(kv('Open to', p.openTo));
+  if (p.currentCompany) out.push(kv('Company', p.currentCompany));
+  if (p.currentSchool) out.push(kv('School', p.currentSchool));
+  const c = p.contact || {};
+  const ORDER = [
+    ['email', 'Email'], ['phone', 'Phone'], ['birthday', 'Birthday'], ['address', 'Address'],
+    ['twitter', 'Twitter / X'], ['im', 'IM'], ['connectedOn', 'Connected']
+  ];
+  for (const [key, label] of ORDER) {
+    if (c[key]) out.push(kv(label, Array.isArray(c[key]) ? c[key].join(', ') : String(c[key])));
+  }
+  const sites = new Set([].concat(Array.isArray(p.websites) ? p.websites : [], Array.isArray(c.websites) ? c.websites : []));
+  if (sites.size) {
+    out.push('');
+    out.push('WEBSITES');
+    out.push(RULE);
+    for (const u of sites) out.push(String(u));
+  }
+  if (out.length === 4 && !p.pronouns) {
+    out.push('');
+    out.push('(the profile publishes no contact details)');
+  }
+  return crlf(out);
+}
 
 function profileFileText(p) {
   const out = [];
@@ -898,8 +975,13 @@ function profileFileText(p) {
   out.push('');
   out.push(kv('Profile', p.profileUrl || U.profileUrl(p.publicId)));
   out.push(kv('Public ID', p.publicId || 'unknown'));
+  if (p.pronouns) out.push(kv('Pronouns', p.pronouns));
   if (p.location) out.push(kv('Location', p.location));
   if (p.industry) out.push(kv('Industry', p.industry));
+  if (p.currentCompany) out.push(kv('Company', p.currentCompany));
+  if (p.currentSchool) out.push(kv('School', p.currentSchool));
+  if (p.verified) out.push(kv('Verified', 'yes'));
+  if (p.openTo) out.push(kv('Open to', p.openTo));
   out.push(kv('Followers', nOf(p.followers)));
   out.push(kv('Connections', nOf(p.connections)));
   out.push('');
@@ -1485,6 +1567,19 @@ function zipEntries() {
     items.push({ path: `${root}/Profile/profile.json`, text: JSON.stringify(p, null, 2) });
     items.push({ path: `${root}/Profile/experience.txt`, text: experienceFileText(p) });
     items.push({ path: `${root}/Profile/education.txt`, text: educationFileText(p) });
+    items.push({ path: `${root}/Profile/contact.txt`, text: contactFileText(p) });
+    if (Array.isArray(p.skills) && p.skills.length) {
+      items.push({ path: `${root}/Profile/skills.txt`, text: crlf([`SKILLS (${p.skills.length})`, RULE, ''].concat(p.skills.map(String))) });
+    }
+    /*
+     * A file per section, but only for a section the profile has. profile.txt
+     * still carries all of them together; these exist so "show me their
+     * certifications" is one file and not a search through a long one.
+     */
+    for (const [key, label] of PROFILE_SECTION_LABELS) {
+      if (!Array.isArray(p[key]) || !p[key].length) continue;
+      items.push({ path: `${root}/Profile/${PROFILE_SECTION_FILES[key]}`, text: sectionFileText(p, key, label) });
+    }
 
     if (state.options.includeProfileMedia) {
       if (p.photoUrl && /^https?:/i.test(p.photoUrl)) {

@@ -70,7 +70,10 @@ if (!globalThis.LIS) {
      */
     const DEFAULT_OPTIONS = {
       includePosts: true,
-      includeComments: false, // third-party personal data — opt in explicitly
+      // On by default: the brief for this build is "everything the profile
+      // has". The export's DATA HANDLING notice says what that means for other
+      // people's data; the option is still there for anyone who wants less.
+      includeComments: true,
       skipVideos: false,
       includeProfileMedia: true,
       // Follow LinkedIn's "Show all" pages so experience and education are the

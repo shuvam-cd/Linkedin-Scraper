@@ -137,10 +137,15 @@ check('the four option chips the spec calls for are present', () => {
   }
 });
 
-check('comments default to off in the markup', () => {
+check('every option defaults to on, in the markup and in the code', () => {
+  // The brief for this build is "everything the profile has" — so no option
+  // is opt-in any more. The DATA HANDLING notice in the export says what that
+  // means for other people's data; the checkbox is still there to turn it off.
   const m = popupHtml.match(/id="optIncludeComments"[^>]*>/);
   if (!m) throw new Error('checkbox not found');
-  if (/\bchecked\b/.test(m[0])) throw new Error('comments must not be checked by default');
+  if (!/\bchecked\b/.test(m[0])) throw new Error('comments must be checked by default');
+  if (!/includeComments: true/.test(read('utils.js'))) throw new Error('DEFAULT_OPTIONS must have comments on');
+  if (!/o\.includeComments !== false/.test(popupJs)) throw new Error('the popup must restore comments as on unless saved off');
 });
 
 check('the target presets are 50 / 100 / 250 / All', () => {

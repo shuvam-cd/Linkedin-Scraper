@@ -1629,7 +1629,20 @@
     { key: 'projects',       type: /\.Project$/,             anchor: 'projects' },
     { key: 'honors',         type: /\.Honor$/,               anchor: 'honors_and_awards', point: true },
     { key: 'courses',        type: /\.Course$/,              anchor: 'courses', point: true },
-    { key: 'publications',   type: /\.Publication$/,         anchor: 'publications', point: true }
+    { key: 'publications',   type: /\.Publication$/,         anchor: 'publications', point: true },
+    /*
+     * The rest of what a profile can carry. These were simply never read —
+     * a profile with patents, recommendations or an Interests panel exported
+     * as though it had none, which is the failure this scraper is otherwise
+     * written to avoid: silence that looks like absence.
+     */
+    { key: 'patents',        type: /\.Patent$/,              anchor: 'patents', point: true },
+    { key: 'testScores',     type: /\.TestScore$/,           anchor: 'test_scores', point: true },
+    { key: 'organizations',  type: /\.Organization$/,        anchor: 'organizations' },
+    { key: 'causes',         type: /\.VolunteerCause$/,      anchor: 'volunteer_causes' },
+    { key: 'recommendations', type: /\.Recommendation$/,     anchor: 'recommendations' },
+    { key: 'interests',      type: /\.Interest(Company|Group|School|Newsletter)?$/, anchor: 'interests' },
+    { key: 'featured',       type: /\.Featured/,             anchor: 'featured' }
   ];
 
   /** The fields these sections share, whichever one an entity belongs to. */
@@ -2119,8 +2132,9 @@
     // The top card carries both counts as plain text. Bounded, because further
     // down the page other people's follower counts appear too.
     const topText = textOfNode(root || (d && d.body)).slice(0, 3000);
+    const extra = topCardExtras(d, root, topText);
 
-    return Object.assign(profileSectionsFromDom(d), {
+    return Object.assign(profileSectionsFromDom(d), extra, {
       publicId,
       profileUrn: null,
       fullName: name,
@@ -2132,6 +2146,15 @@
       about: about || sectionText('about', d) || ogDesc,
       followers: countFromText(topText, 'followers?'),
       connections: countFromText(topText, 'connections?'),
+      // Set by topCardExtras above when the page carries them; declared here so
+      // the shape of a profile never depends on which reader produced it.
+      pronouns: extra.pronouns || '',
+      verified: !!extra.verified,
+      openTo: extra.openTo || '',
+      currentCompany: extra.currentCompany || '',
+      currentSchool: extra.currentSchool || '',
+      websites: extra.websites || [],
+      contact: extra.contact || {},
       photoUrl: photo || null,
       bannerUrl: banner || null,
       experience: experienceFromDom(d),
@@ -2142,6 +2165,133 @@
       scrapedAt: new Date().toISOString(),
       source: 'dom'
     });
+  }
+
+  /**
+   * The parts of the top card nothing was reading.
+   *
+   * Pronouns, the verification badge, an Open-to-work banner, the company and
+   * school the card links to, and any personal site listed on it — all of it
+   * is on the page the reader was already holding, and none of it was being
+   * written down. Every lookup is guarded on its own: this runs against markup
+   * that changes without notice, and one bad selector must not cost the rest.
+   */
+  function topCardExtras(d, root, topText) {
+    const out = { websites: [], contact: {} };
+    const scope = root || (d && d.body) || null;
+    if (!scope) return out;
+
+    const q = (sel) => {
+      try {
+        return scope.querySelector(sel);
+      } catch (_) {
+        return null;
+      }
+    };
+    const qa = (sel) => {
+      try {
+        return [...scope.querySelectorAll(sel)];
+      } catch (_) {
+        return [];
+      }
+    };
+    const txt = (el) => ((el && (el.textContent || '')) || '').trim();
+
+    // "(she/her)" sits beside the name; the parentheses are LinkedIn's, not ours.
+    const pronounNode = q('main h1 ~ span, .pv-text-details__left-panel span.text-body-small');
+    const pronounRaw = txt(pronounNode);
+    if (/^\(?\s*(he|she|they|ze|xe)\b/i.test(pronounRaw) && pronounRaw.length <= 40) {
+      out.pronouns = pronounRaw.replace(/^\(|\)$/g, '').trim();
+    }
+    if (!out.pronouns) {
+      const m = topText.match(/\((he\/him|she\/her|they\/them)[^)]*\)/i);
+      if (m) out.pronouns = m[1];
+    }
+
+    out.verified =
+      !!q('[data-test-icon*="verified"], [class*="verified"], svg[data-test-icon="verified-small"]') ||
+      /\bVerified\b/.test(topText);
+
+    const openTo = topText.match(/Open to work[^\n]{0,120}/i) || topText.match(/Hiring[^\n]{0,120}/i);
+    if (openTo) out.openTo = openTo[0].trim();
+
+    // The card links to the current employer and the most recent school.
+    for (const a of qa('a[href*="/company/"]')) {
+      const t = txt(a);
+      if (t && !out.currentCompany) out.currentCompany = t;
+    }
+    for (const a of qa('a[href*="/school/"]')) {
+      const t = txt(a);
+      if (t && !out.currentSchool) out.currentSchool = t;
+    }
+
+    /*
+     * Anything the profile links out to. LinkedIn's own URLs are excluded, and
+     * so is anything that is not http(s) — a `mailto:` belongs in contact, not
+     * in a list of sites.
+     */
+    const sites = new Set();
+    for (const a of qa('a[href^="http"]')) {
+      let href = '';
+      try {
+        href = a.getAttribute('href') || '';
+      } catch (_) {
+        continue;
+      }
+      if (/^https?:\/\/([a-z0-9-]+\.)*(linkedin\.com|licdn\.com)/i.test(href)) continue;
+      sites.add(href.split('?')[0]);
+      if (sites.size >= 10) break;
+    }
+    out.websites = [...sites];
+
+    return out;
+  }
+
+  /**
+   * The contact-info overlay: websites, email, phone, birthday, address and
+   * whatever else the profile chose to publish. It is its own URL rather than
+   * part of the card, which is why nothing here had ever seen it.
+   */
+  function contactFromDoc(doc) {
+    const out = {};
+    if (!doc) return out;
+    const rows = [];
+    try {
+      rows.push(...doc.querySelectorAll('section, li, .pv-contact-info__contact-type'));
+    } catch (_) {
+      return out;
+    }
+    const LABELS = [
+      [/e-?mail/i, 'email'],
+      [/phone/i, 'phone'],
+      [/birthday/i, 'birthday'],
+      [/address/i, 'address'],
+      [/websites?/i, 'websites'],
+      [/twitter|^x$/i, 'twitter'],
+      [/im\b|instant message/i, 'im'],
+      [/connected/i, 'connectedOn'],
+      [/profile/i, 'profileUrl']
+    ];
+    for (const row of rows) {
+      const text = ((row.textContent || '') + '').replace(/\s+/g, ' ').trim();
+      if (!text || text.length > 400) continue;
+      for (const [re, key] of LABELS) {
+        if (!re.test(text)) continue;
+        const links = [];
+        try {
+          for (const a of row.querySelectorAll('a[href]')) {
+            const h = a.getAttribute('href') || '';
+            if (h) links.push(h.replace(/^mailto:/, ''));
+          }
+        } catch (_) {
+          /* text is enough */
+        }
+        const value = links.length ? (key === 'websites' ? links : links[0]) : text;
+        if (out[key] == null) out[key] = value;
+        break;
+      }
+    }
+    return out;
   }
 
   /** innerText where the page offers it, textContent otherwise. */
@@ -2179,15 +2329,29 @@
     { key: 'honors',        path: 'honors',                  map: entriesFromRows,    id: entryKey },
     { key: 'languages',     path: 'languages',               map: entriesFromRows,    id: entryKey },
     { key: 'courses',       path: 'courses',                 map: entriesFromRows,    id: entryKey },
-    { key: 'publications',  path: 'publications',            map: entriesFromRows,    id: entryKey }
+    { key: 'publications',  path: 'publications',            map: entriesFromRows,    id: entryKey },
+    { key: 'patents',       path: 'patents',                 map: entriesFromRows,    id: entryKey },
+    { key: 'testScores',    path: 'test-scores',             map: entriesFromRows,    id: entryKey },
+    { key: 'organizations', path: 'organizations',           map: entriesFromRows,    id: entryKey },
+    { key: 'causes',        path: 'volunteering-causes',     map: entriesFromRows,    id: entryKey },
+    // LinkedIn splits recommendations into received and given behind one link;
+    // both render as rows on the same page, so one fetch covers the section.
+    { key: 'recommendations', path: 'recommendations',       map: entriesFromRows,    id: entryKey },
+    { key: 'interests',     path: 'interests',               map: entriesFromRows,    id: entryKey },
+    { key: 'featured',      path: 'featured',                map: entriesFromRows,    id: entryKey }
   ];
 
   function entryKey(r) {
     return `${r.name}|${r.detail}|${r.dates}`;
   }
 
-  /** A hard ceiling on what this costs: one request per page, at most. */
-  const MAX_DETAILS_PAGES = 10;
+  /*
+   * A hard ceiling on what this costs: one request per page, at most, and only
+   * for a section the profile actually links to. The list below it is longer
+   * now, so the ceiling is the list's length rather than a number that would
+   * silently drop the sections at the end of it.
+   */
+  const MAX_DETAILS_PAGES = 17;
 
   /**
    * Rows out of a details page's *embedded* payload.
@@ -2308,6 +2472,31 @@
     }
 
     if (added) log('success', `Full profile history added ${added} row(s) the profile card did not show.`);
+
+    /*
+     * The contact-info overlay is not a details page — it is its own URL —
+     * but it is the only place the profile's email, phone, birthday, address
+     * and listed websites appear. One request, guarded like the rest.
+     */
+    if (!S.stop) {
+      await waitWhilePaused();
+      const url = `${ORIGIN}/in/${encodeURIComponent(publicId)}/overlay/contact-info/`;
+      try {
+        const html = await apiGet(url, { expectJson: false });
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const contact = contactFromDoc(doc);
+        if (Object.keys(contact).length) {
+          profile.contact = Object.assign({}, profile.contact || {}, contact);
+          if (Array.isArray(contact.websites)) {
+            profile.websites = mergeById(profile.websites, contact.websites, (u) => String(u));
+          }
+          log('info', `Contact info read: ${Object.keys(contact).join(', ')}.`);
+        }
+      } catch (err) {
+        if (err instanceof Abort) throw err;
+        log('warn', `Could not read the contact-info overlay (${err.message}).`);
+      }
+    }
     return profile;
   }
 

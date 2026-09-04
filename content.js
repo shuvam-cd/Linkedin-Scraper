@@ -2035,10 +2035,12 @@
     const exact = candidates.find(
       (p) => String(p.publicIdentifier || '').toLowerCase() === String(publicId).toLowerCase()
     );
-    // Several profiles ride along in a feed payload; the richest one that is
-    // not the target would be the wrong answer, so prefer the exact match and
-    // only fall back to "the one with a headline" when there is no id match.
-    return exact || candidates.find((p) => p.headline || p.firstName) || candidates[0];
+    // Several profiles ride along in a feed payload — "People also viewed",
+    // a commenter — and the richest of them is not the target. An exact id
+    // match, or the only candidate there is; anything else files a stranger
+    // under the target's id, and the DOM reader carries the read instead.
+    if (exact) return exact;
+    return candidates.length === 1 ? candidates[0] : null;
   }
 
   /**
@@ -2119,9 +2121,23 @@
     const scoped = root ? imageUrlsIn(root) : [];
     const everywhere = imageUrlsIn(d);
 
+    /*
+     * Never the whole document for the photo: the signed-in viewer's own
+     * avatar sits in the nav bar on the same CDN path, and falling back to it
+     * filed the operator's face as the target's. An <img> whose alt is the
+     * profile's name is the surest read; the top card's CDN-path image next;
+     * then og:image, which is at least this profile's.
+     */
+    let byAlt = '';
+    try {
+      const img = name && root ? root.querySelector(`img[alt="${name.replace(/"/g, '\\"')}"]`) : null;
+      byAlt = (img && (img.currentSrc || img.src || img.getAttribute('data-delayed-url'))) || '';
+    } catch (_) {
+      byAlt = '';
+    }
     const photo =
+      (byAlt && /licdn\.com/.test(byAlt) ? byAlt : '') ||
       pickImageByPath(scoped, PROFILE_PHOTO_PATH) ||
-      pickImageByPath(everywhere, PROFILE_PHOTO_PATH) ||
       meta('meta[property="og:image"]');
 
     const banner =
@@ -2178,8 +2194,27 @@
    */
   function topCardExtras(d, root, topText) {
     const out = { websites: [], contact: {} };
-    const scope = root || (d && d.body) || null;
+    /*
+     * The top card only — the section holding the <h1>. Scanning all of
+     * <main> made the first /company/ link anywhere on the page (a past
+     * employer, an interest) the current company, and every outbound link
+     * in every post a "website" of the profile's.
+     */
+    let scope = null;
+    try {
+      const h1 = (root || d).querySelector('h1');
+      scope = (h1 && (h1.closest('section, .artdeco-card, .pv-top-card, [class*="top-card"]') || h1.parentElement)) || null;
+      if (!scope || scope === root || scope === d.body) scope = (root || d).querySelector('section') || null;
+    } catch (_) {
+      scope = null;
+    }
     if (!scope) return out;
+    // The top card's own text, not the first 3000 characters of the page.
+    try {
+      topText = String(scope.innerText || scope.textContent || topText || '').slice(0, 1500);
+    } catch (_) {
+      topText = String(topText || '').slice(0, 1500);
+    }
 
     const q = (sel) => {
       try {
@@ -2208,12 +2243,24 @@
       if (m) out.pronouns = m[1];
     }
 
-    out.verified =
-      !!q('[data-test-icon*="verified"], [class*="verified"], svg[data-test-icon="verified-small"]') ||
-      /\bVerified\b/.test(topText);
+    // The badge is an element beside the name, not a word — "Verified" can
+    // appear in a headline ("Verified Meta Partner").
+    out.verified = !!q('[data-test-icon*="verified"], svg[data-test-icon="verified-small"], [aria-label="Verified"], [class*="verified-badge"]');
 
-    const openTo = topText.match(/Open to work[^\n]{0,120}/i) || topText.match(/Hiring[^\n]{0,120}/i);
-    if (openTo) out.openTo = openTo[0].trim();
+    /*
+     * The Open-to-work / Hiring banner is a frame around the photo. LinkedIn
+     * serves a framed avatar from a distinct CDN path, and the frame names
+     * itself in the image's alt or aria-label; the text of the card is only a
+     * last resort, because "hiring" is a common word in a headline.
+     */
+    const framed = q('img[src*="profile-framedphoto"], img[alt*="#OPEN_TO_WORK" i], img[alt*="#HIRING" i], [aria-label*="Open to work" i], [aria-label*="hiring" i]');
+    if (framed) {
+      const label = String(framed.getAttribute('alt') || framed.getAttribute('aria-label') || '');
+      out.openTo = /open.?to.?work/i.test(label) ? 'Open to work' : /hiring/i.test(label) ? 'Hiring' : 'Open to work';
+    } else {
+      const m = topText.match(/^\s*(Open to work|Hiring)\b[^\n]{0,80}/im);
+      if (m) out.openTo = m[0].trim();
+    }
 
     // The card links to the current employer and the most recent school.
     for (const a of qa('a[href*="/company/"]')) {
@@ -2255,12 +2302,21 @@
   function contactFromDoc(doc) {
     const out = {};
     if (!doc) return out;
-    const rows = [];
+    let rows = [];
     try {
-      rows.push(...doc.querySelectorAll('section, li, .pv-contact-info__contact-type'));
+      rows = [...doc.querySelectorAll('section, li, .pv-contact-info__contact-type')];
     } catch (_) {
       return out;
     }
+    // Leaf rows only: a section that contains sections is the overlay itself,
+    // and matching its whole text filed the profile URL as "email".
+    rows = rows.filter((r) => {
+      try {
+        return !r.querySelector('section, .pv-contact-info__contact-type');
+      } catch (_) {
+        return true;
+      }
+    });
     const LABELS = [
       [/e-?mail/i, 'email'],
       [/phone/i, 'phone'],
@@ -2268,15 +2324,24 @@
       [/address/i, 'address'],
       [/websites?/i, 'websites'],
       [/twitter|^x$/i, 'twitter'],
-      [/im\b|instant message/i, 'im'],
-      [/connected/i, 'connectedOn'],
-      [/profile/i, 'profileUrl']
+      [/^im$|instant message/i, 'im'],
+      [/^connected/i, 'connectedOn'],
+      [/profile url|^profile$|^your profile/i, 'profileUrl']
     ];
     for (const row of rows) {
       const text = ((row.textContent || '') + '').replace(/\s+/g, ' ').trim();
       if (!text || text.length > 400) continue;
+      // The label is the row's heading when it has one; the whole row's text
+      // matched "profile" and "im" far too readily.
+      let label = text;
+      try {
+        const h = row.querySelector('h3, h2, dt, .pv-contact-info__header, [class*="header"]');
+        if (h && (h.textContent || '').trim()) label = (h.textContent || '').trim();
+      } catch (_) {
+        /* the row's text stands */
+      }
       for (const [re, key] of LABELS) {
-        if (!re.test(text)) continue;
+        if (!re.test(label)) continue;
         const links = [];
         try {
           for (const a of row.querySelectorAll('a[href]')) {
@@ -2555,84 +2620,255 @@
     PROFILE_SECTIONS.map((sec) => sec.anchor).filter(Boolean)
   );
 
+  /*
+   * What each section is called on the page — the second way to find it.
+   * The anchor div is LinkedIn's own navigation aid and has survived every
+   * redesign so far, but a reader that has only one way to find a section
+   * returns nothing the day that changes. A heading is the other way.
+   */
+  const SECTION_TITLES = {
+    experience: /^experience$/i,
+    education: /^education$/i,
+    skills: /^skills$/i,
+    licenses_and_certifications: /^licen[cs]es\s*&?\s*(and\s*)?certifications$/i,
+    languages: /^languages$/i,
+    volunteering_experience: /^volunteering( experience)?$/i,
+    projects: /^projects$/i,
+    honors_and_awards: /^hono(u)?rs\s*&?\s*(and\s*)?awards$/i,
+    courses: /^courses$/i,
+    publications: /^publications$/i,
+    patents: /^patents$/i,
+    test_scores: /^test scores$/i,
+    organizations: /^organi[sz]ations$/i,
+    volunteer_causes: /^(volunteer )?causes$/i,
+    recommendations: /^recommendations$/i,
+    interests: /^interests$/i,
+    featured: /^featured$/i
+  };
+
+  /** Selectors that mean "one entry" on a profile, across LinkedIn's designs. */
+  const ROW_SEL = 'li, .pvs-entity, .pvs-list__item--line-separated, .artdeco-list__item, [data-view-name*="entity"]';
+
+  const safeQueryAll = (el, sel) => {
+    try {
+      return el && el.querySelectorAll ? [...el.querySelectorAll(sel)] : [];
+    } catch (_) {
+      return [];
+    }
+  };
+  const safeClosest = (el, sel) => {
+    try {
+      return el && el.closest ? el.closest(sel) : null;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  /** The visible text of a heading, without the screen-reader duplicate. */
+  function headingText(h) {
+    const aria = safeQueryAll(h, 'span[aria-hidden="true"]');
+    const t = aria.length ? aria[0].textContent : h.textContent;
+    return String(t || '').replace(/\s+/g, ' ').trim();
+  }
+
+  /**
+   * The element that holds a section's rows.
+   *
+   * Two ways in: the anchor div LinkedIn drops in for its in-page navigation,
+   * and failing that a heading that reads as the section's title. Either way
+   * the walk up settles for the nearest ancestor that actually contains rows —
+   * and never one that also contains another section, because that ancestor
+   * is `<main>`, and reading it under this section's name filed the education
+   * list as the job history.
+   */
   function sectionContainer(anchorId, root) {
     const doc = root || document;
     let anchor = null;
     try {
       anchor = doc.getElementById ? doc.getElementById(anchorId) : doc.querySelector('#' + anchorId);
     } catch (_) {
-      return null;
+      anchor = null;
     }
-    if (!anchor) return null;
 
-    let best = null;
-    try {
-      best = anchor.closest ? anchor.closest('section') : null;
-    } catch (_) {
-      /* ignore */
-    }
-    /*
-     * The walk must not escape this section.
-     *
-     * Looking for "any ancestor that contains an <li>" reaches `<main>` when
-     * the section itself is empty — and `<main>` contains every other
-     * section's rows. A profile with no experience listed therefore read the
-     * education card as its job history, and the first school became the
-     * answer to "where does he work". An ancestor that also holds another
-     * section's anchor is not this section's container.
-     */
     const foreign = SECTION_ANCHORS.filter((id) => id !== anchorId)
       .map((id) => '#' + id)
       .join(', ');
+    const otherTitles = Object.keys(SECTION_TITLES).filter((k) => k !== anchorId).map((k) => SECTION_TITLES[k]);
     const reachesAnotherSection = (el) => {
-      if (!foreign || !el || !el.querySelector) return false;
+      if (!el || !el.querySelector) return false;
       try {
-        return !!el.querySelector(foreign);
+        if (foreign && el.querySelector(foreign)) return true;
+      } catch (_) {
+        /* fall through to the heading check */
+      }
+      for (const h of safeQueryAll(el, 'h2, h3, [role="heading"], .pvs-header__title')) {
+        const t = headingText(h);
+        if (t && otherTitles.some((re) => re.test(t))) return true;
+      }
+      return false;
+    };
+    const hasRows = (el) => {
+      try {
+        return !!(el && el.querySelector && el.querySelector(ROW_SEL));
       } catch (_) {
         return false;
       }
     };
-
-    if (best && best.querySelector('li') && !reachesAnotherSection(best)) return best;
-
-    let el = anchor.parentElement;
-    for (let i = 0; el && i < 4; i++) {
-      try {
-        if (el.querySelector && el.querySelector('li') && !reachesAnotherSection(el)) return el;
-      } catch (_) {
-        /* ignore */
+    const settle = (from, section) => {
+      if (section && hasRows(section) && !reachesAnotherSection(section)) return section;
+      let el = from && from.parentElement;
+      for (let i = 0; el && i < 4; i++) {
+        if (hasRows(el) && !reachesAnotherSection(el)) return el;
+        el = el.parentElement;
       }
-      el = el.parentElement;
+      // A container that spans other sections is worse than none: it yields
+      // their rows under this section's name.
+      return section && !reachesAnotherSection(section) ? section : null;
+    };
+
+    if (anchor) return settle(anchor, safeClosest(anchor, 'section, .artdeco-card, .pv-profile-card'));
+
+    // No anchor — find the section by what it is called.
+    const want = SECTION_TITLES[anchorId];
+    if (!want) return null;
+    for (const h of safeQueryAll(doc, 'h2, h3, [role="heading"], .pvs-header__title')) {
+      if (!want.test(headingText(h))) continue;
+      const found = settle(h, safeClosest(h, 'section, .artdeco-card, .pv-profile-card'));
+      if (found) return found;
     }
-    // A container that spans other sections is worse than none: it yields
-    // their rows under this section's name.
-    return reachesAnotherSection(best) ? null : best;
+    return null;
   }
 
   /**
-   * Every row under a root, as span lists.
+   * The visible strings of one entry, in reading order.
    *
-   * LinkedIn prints each field twice — once visible with aria-hidden, once for
-   * a screen reader — so taking only the aria-hidden spans avoids doubling
-   * every string. The order is stable across the profile card and the
-   * "Show all" page, which is what lets both feed the same mappers.
+   * Three ways, tried in turn: the aria-hidden spans LinkedIn prints beside
+   * every screen-reader copy; the screen-reader copies themselves when the
+   * visible ones are missing; and finally the leaf text of the row, for markup
+   * that renders each string once. Strings that belong to a *nested* entry —
+   * a role under a grouped company, an endorsement under a skill — are not
+   * this entry's and are left for their own row.
+   */
+  function rowSpans(row) {
+    const own = (el) => safeClosest(el, ROW_SEL) === row;
+    const clean = (list) => {
+      const out = [];
+      for (const raw of list) {
+        const t = String(raw || '').replace(/\s+/g, ' ').trim();
+        if (!t) continue;
+        if (out.length && out[out.length - 1] === t) continue; // aria + hidden copy
+        out.push(t);
+      }
+      return out;
+    };
+
+    const aria = safeQueryAll(row, 'span[aria-hidden="true"]').filter(own).map((el) => el.textContent);
+    if (aria.length) return clean(aria);
+
+    const hidden = safeQueryAll(row, '.visually-hidden').filter(own).map((el) => el.textContent);
+    if (hidden.length) return clean(hidden);
+
+    // Leaf text: an element with text of its own and no element child that has text.
+    const leaves = [];
+    const walk = (el) => {
+      if (!el || el.nodeType !== 1) return;
+      if (el !== row && safeClosest(el, ROW_SEL) !== row) return; // nested entry
+      if (/^(BUTTON|SVG|IMG|SCRIPT|STYLE)$/i.test(el.tagName)) return;
+      let childHasText = false;
+      for (const c of el.children || []) {
+        if ((c.textContent || '').trim()) {
+          childHasText = true;
+          break;
+        }
+      }
+      if (!childHasText) {
+        const t = (el.textContent || '').trim();
+        if (t) leaves.push(t);
+        return;
+      }
+      for (const c of el.children || []) walk(c);
+    };
+    walk(row);
+    return clean(leaves);
+  }
+
+  /** The nested entries directly under a row — a grouped company's roles. */
+  function nestedRows(row) {
+    return safeQueryAll(row, ROW_SEL).filter((el) => {
+      const parentRow = safeClosest(el.parentElement, ROW_SEL);
+      return parentRow === row;
+    });
+  }
+
+  /** Outbound links inside an entry, excluding LinkedIn's own. */
+  function rowLinks(row) {
+    const out = [];
+    for (const a of safeQueryAll(row, 'a[href]')) {
+      if (safeClosest(a, ROW_SEL) !== row) continue;
+      const href = a.getAttribute('href') || '';
+      if (!/^https?:/i.test(href)) continue;
+      if (/^https?:\/\/([a-z0-9-]+\.)*(linkedin\.com|licdn\.com)\//i.test(href) && !/\/redir\/|\/safety\/go/i.test(href)) continue;
+      out.push(href);
+    }
+    return out;
+  }
+
+  /**
+   * Every entry under a root, as span lists — the leaf entries, with a
+   * grouped company's name handed down to each role beneath it.
+   *
+   * LinkedIn renders several roles at one employer as a company header with
+   * the roles nested inside it. Reading every descendant row flat turned the
+   * header into a job with no company and each role into a job whose company
+   * was its employment type. A row that contains rows is a group, not an
+   * entry; its first string is the company and it is spliced into each role
+   * where the company would have been.
    */
   function rowsFrom(root, limit) {
     const rows = [];
     if (!root) return rows;
-    let items;
-    try {
-      items = root.querySelectorAll('li');
-    } catch (_) {
-      return rows;
-    }
-    for (const li of items) {
-      const spans = [...li.querySelectorAll('span[aria-hidden="true"]')]
-        .map((s) => (s.textContent || '').trim())
-        .filter(Boolean);
-      if (!spans.length) continue;
+    const cap = limit || 40;
+
+    const all = safeQueryAll(root, ROW_SEL);
+    const topLevel = all.filter((el) => {
+      const parentRow = safeClosest(el.parentElement, ROW_SEL);
+      return !parentRow || !root.contains(parentRow);
+    });
+
+    const push = (spans, el) => {
+      if (!spans.length) return;
+      spans.links = rowLinks(el);
       rows.push(spans);
-      if (rows.length >= (limit || 40)) break;
+    };
+
+    for (const row of topLevel) {
+      if (rows.length >= cap) break;
+      const spans = rowSpans(row);
+      const children = nestedRows(row);
+      if (!children.length) {
+        push(spans, row);
+        continue;
+      }
+      // A group. Its own strings name the company; each nested row is a role.
+      const company = spans[0] || '';
+      let any = false;
+      for (const sub of children) {
+        const sp = rowSpans(sub);
+        if (!sp.length) continue;
+        any = true;
+        const merged = sp.slice();
+        if (company) {
+          // The role's own second string is its employment type; the company
+          // goes ahead of it in the same "Company · Type" form a flat row uses.
+          const type = merged[1] && !looksLikeDateRange(merged[1]) && merged[1] !== company ? merged[1] : '';
+          merged.splice(1, type ? 1 : 0, type ? `${company} · ${type}` : company);
+        }
+        push(merged, sub);
+        if (rows.length >= cap) break;
+      }
+      // A "group" with no readable roles is just an entry with a sub-list
+      // (a skill and its endorsements, say) — keep it as itself.
+      if (!any) push(spans, row);
     }
     return rows;
   }
@@ -2662,7 +2898,7 @@
   // The same month names the date formatter already keeps, as an alternation.
   const MONTH_ALT = MONTHS.slice(1).join('|');
   const DATE_RANGE_RE = new RegExp(
-    `^(?:(?:${MONTH_ALT})[a-z]*\\.?\\s*)?\\d{4}\\s*[\u2013\u2014-]\\s*(?:present|(?:(?:${MONTH_ALT})[a-z]*\\.?\\s*)?\\d{4})` +
+    `^(?:(?:${MONTH_ALT})[a-z]*\\.?\\s*)?\\d{4}\\s*[–—-]\\s*(?:present|(?:(?:${MONTH_ALT})[a-z]*\\.?\\s*)?\\d{4})` +
       `|^present\\b|^\\d+\\s*(?:yrs?|mos?|years?|months?)\\b`,
     'i'
   );
@@ -2689,16 +2925,63 @@
     return cols;
   }
 
+  const LOCATION_TYPE_RE = /\b(remote|hybrid|on-site|onsite)\b/i;
+  /** Short, no sentence punctuation, and either a comma, a dot or a place word. */
+  function looksLikeLocation(s) {
+    const t = String(s || '').trim();
+    if (!t || t.length > 80) return false;
+    if (/[.!?]\s/.test(t)) return false;
+    return /,|·/.test(t) || LOCATION_TYPE_RE.test(t) || /^[A-Z][\w' .-]+(?:, [A-Z][\w' .-]+)*$/.test(t);
+  }
+
+  /**
+   * The tail of a row — everything after the four positional fields — sorted
+   * into what it is: a "Skills:" line, a "Grade:" line, an "Activities and
+   * societies:" line, and the prose that is the description.
+   */
+  function tailFields(spans) {
+    const out = { skills: [], grade: '', activities: '', description: [] };
+    for (const raw of spans) {
+      const t = String(raw || '').trim();
+      if (!t) continue;
+      let m;
+      if ((m = t.match(/^Skills?:\s*(.+)$/i))) {
+        out.skills.push(...m[1].split(/\s*·\s*|\s*,\s*/).map((x) => x.trim()).filter(Boolean));
+      } else if ((m = t.match(/^Grade:\s*(.+)$/i))) {
+        out.grade = m[1].trim();
+      } else if ((m = t.match(/^Activities( and societies)?:\s*(.+)$/i))) {
+        out.activities = m[2].trim();
+      } else {
+        out.description.push(t);
+      }
+    }
+    return out;
+  }
+
   function experienceFromRows(rows) {
     return rows.map((row) => {
       const spans = realignDates(row, 1);
+      // "Content Daddy · Full-time" — the employment type rides on the company line.
+      const companyParts = String(spans[1] || '').split('·').map((x) => x.trim()).filter(Boolean);
+      // A location is short and place-like; a description that happens to sit
+      // fourth is neither, and used to be filed as the location while the
+      // description came out empty.
+      const hasLocation = looksLikeLocation(spans[3]);
+      const location = hasLocation ? spans[3] : '';
+      const tail = tailFields(spans.slice(hasLocation ? 4 : 3));
+      const locParts = location.split('·').map((x) => x.trim()).filter(Boolean);
+      const locationType = locParts.find((x) => LOCATION_TYPE_RE.test(x)) || '';
       return {
         title: spans[0] || '',
-        company: (spans[1] || '').split('·')[0].trim(),
-        location: spans[3] || '',
+        company: companyParts[0] || '',
+        employmentType: companyParts.slice(1).join(' · '),
+        location: locParts.filter((x) => x !== locationType).join(', '),
+        locationType,
         dates: spans[2] || '',
         current: /present/i.test(spans[2] || ''),
-        description: spans.slice(4).join(' ')
+        skills: tail.skills,
+        url: (row.links || [])[0] || null,
+        description: tail.description.join('\n')
       };
     });
   }
@@ -2709,13 +2992,18 @@
       .map((row) => {
         const spans = realignDates(row, 1);
         // "Bachelor of Commerce, Accounting and Finance" is one span.
-        const parts = (spans[1] || '').split(',').map((s) => s.trim()).filter(Boolean);
+        const parts = (spans[1] || '').split(',').map((x) => x.trim()).filter(Boolean);
+        const tail = tailFields(spans.slice(3));
         return {
           school: spans[0],
           degree: parts[0] || '',
           field: parts.slice(1).join(', '),
           dates: spans[2] || '',
-          description: spans.slice(3).join(' ')
+          grade: tail.grade,
+          activities: tail.activities,
+          skills: tail.skills,
+          url: (row.links || [])[0] || null,
+          description: tail.description.join('\n')
         };
       });
   }
@@ -2723,28 +3011,31 @@
   function entriesFromRows(rows) {
     return rows
       .filter((spans) => spans[0])
-      .map((spans) => ({
-        name: spans[0],
-        detail: spans[1] || '',
-        dates: spans[2] || '',
-        url: null,
-        description: spans.slice(3).join(' ')
-      }));
+      .map((spans) => {
+        const tail = tailFields(spans.slice(3));
+        return {
+          name: spans[0],
+          detail: spans[1] || '',
+          dates: spans[2] || '',
+          // Was hard-coded to null on the only live path, so every credential,
+          // publication and featured card lost the one thing worth keeping.
+          url: (spans.links || [])[0] || null,
+          skills: tail.skills,
+          description: tail.description.join('\n')
+        };
+      });
   }
 
   function experienceFromDom(doc) {
     return experienceFromRows(sectionRows('experience', 40, doc));
   }
 
-  /*
-   * Education and skills used to be hardcoded empty here, so a run that fell
-   * through to the DOM strategy produced education.txt saying "(no education
-   * captured)" and a profile.json with no skills — for a profile that showed
-   * both on screen.
-   */
   function educationFromDom(doc) {
     return educationFromRows(sectionRows('education', 40, doc));
   }
+
+  /** Rows a skills section carries that are not skills. */
+  const NOT_A_SKILL = /^\d+\s+endorsements?$|^endorsed by\b|\d+\s+experiences? across|^show all/i;
 
   function skillsFromDom(doc) {
     const out = [];
@@ -2752,12 +3043,13 @@
     // Nested <li>s (a skill's endorsement list) repeat the name; dedupe.
     for (const spans of sectionRows('skills', 80, doc)) {
       const name = spans[0];
-      if (!name || seen.has(name)) continue;
+      if (!name || seen.has(name) || NOT_A_SKILL.test(name)) continue;
       seen.add(name);
       out.push(name);
     }
     return out;
   }
+
 
   /* ------------------------------------------------------------------ *
    * Pagination health
@@ -2954,118 +3246,237 @@
    * than on any class name: the URN is the one thing that has to stay put for
    * LinkedIn's own code to work.
    * ------------------------------------------------------------------ */
+  const URN_ATTRS = ['data-urn', 'data-id', 'data-entity-urn', 'data-activity-urn'];
+  const URN_SEL = URN_ATTRS.map((a) => `[${a}*="urn:li:activity:"]`).join(',');
+
+  /** The activity URN an element carries in any of the attributes LinkedIn uses. */
+  function activityUrnOf(el) {
+    for (const a of URN_ATTRS) {
+      let v = '';
+      try {
+        v = el.getAttribute(a) || '';
+      } catch (_) {
+        continue;
+      }
+      if (v.indexOf('urn:li:activity:') >= 0) return v;
+    }
+    return '';
+  }
+
+  /**
+   * The card that owns a URN node.
+   *
+   * The attribute is not always on the card's root — sometimes it sits on an
+   * inner element, and reading from there meant the text, media and counts
+   * (its siblings) were never found. Climb until the next step up would take
+   * in another post.
+   */
+  function cardOf(el) {
+    const ownUrn = activityUrnOf(el);
+    const top = document.querySelector('main') || document.body;
+    let card = el;
+    for (let i = 0; i < 12; i++) {
+      const parent = card.parentElement;
+      if (!parent || parent === top || parent === document.body || parent === document.documentElement) break;
+      const others = safeQueryAll(parent, URN_SEL).some((n) => {
+        const u = activityUrnOf(n);
+        return u && u !== ownUrn && !el.contains(n) && !n.contains(el);
+      });
+      if (others) break;
+      card = parent;
+    }
+    return card;
+  }
+
+  /**
+   * Every post card on the page, once each.
+   *
+   * A reshare renders the original post *inside* the resharer's card, with
+   * its own URN. Reading every URN node flat counted that inner post as a
+   * second post of the profile's — which it is not — and gave the outer one
+   * the original's text, because the original's body is the longer string.
+   * A URN node with a URN ancestor is the inner card: it is recorded on the
+   * outer as what was reshared, and not as a post.
+   */
   function harvestFeedCards() {
     const found = [];
     const seen = new Set();
-    let nodes;
-    try {
-      nodes = document.querySelectorAll('[data-urn],[data-id],[data-entity-urn],[data-activity-urn]');
-    } catch (_) {
-      return found;
+    const nodes = safeQueryAll(document, URN_SEL);
+
+    const innerOf = new Map(); // outer activityId -> inner node
+    const inner = new Set();
+    for (const el of nodes) {
+      const outer = safeClosest(el.parentElement, URN_SEL);
+      if (!outer) continue;
+      const outerId = VY.activityId(activityUrnOf(outer));
+      if (!outerId) continue;
+      inner.add(el);
+      if (!innerOf.has(outerId)) innerOf.set(outerId, el);
     }
 
     for (const el of nodes) {
-      let urn = '';
-      for (const a of ['data-urn', 'data-id', 'data-entity-urn', 'data-activity-urn']) {
-        const v = el.getAttribute(a) || '';
-        if (v.indexOf('urn:li:activity:') >= 0) {
-          urn = v;
-          break;
-        }
-      }
-      if (!urn) continue;
-      const activityId = VY.activityId(urn);
+      if (inner.has(el)) continue;
+      const activityId = VY.activityId(activityUrnOf(el));
       if (!activityId || seen.has(activityId)) continue;
       seen.add(activityId);
-      found.push(readCard(el, activityId));
+      found.push(readCard(el, activityId, innerOf.get(activityId) || null));
     }
     return found;
   }
 
-  function readCard(el, activityId) {
-    const textPick = (sels) => {
-      for (const s of sels) {
-        try {
-          const n = el.querySelector(s);
-          const t = n && (n.innerText || n.textContent || '').trim();
-          if (t) return t;
-        } catch (_) {
-          /* ignore an unsupported selector */
-        }
-      }
-      return '';
-    };
+  /** "…see more" / "see less" and the ellipsis LinkedIn prints before it. */
+  const SEE_MORE_RE = /\s*(?:…|\.\.\.)?\s*(?:see|show)\s+(?:more|less)\s*$/i;
+  const CARD_CHROME = '.social-details-social-counts, .feed-shared-social-action-bar, .update-components-header, .update-components-actor, .feed-shared-actor, .comments-comments-list';
 
-    const text = textPick([
+  /**
+   * The post's own words.
+   *
+   * Tried in order of how specifically the selector names the body, and the
+   * longest candidate wins — but only among candidates that are neither the
+   * card's chrome (author block, social bar) nor a reshared inner card. The
+   * text of any button inside is removed, which is how "…see more" stopped
+   * being part of the post.
+   */
+  function cardText(card, exclude) {
+    const SELS = [
       '.update-components-text',
       '.feed-shared-update-v2__description',
       '.feed-shared-inline-show-more-text',
-      '[class*="update-components-text"]'
-    ]);
+      '[class*="update-components-text"]',
+      '.feed-shared-text',
+      '.break-words',
+      '[dir="ltr"]'
+    ];
+    let best = '';
+    for (const sel of SELS) {
+      for (const n of safeQueryAll(card, sel)) {
+        if (exclude && exclude.contains(n)) continue;
+        if (safeClosest(n, CARD_CHROME)) continue;
+        let t = String(n.innerText || n.textContent || '');
+        for (const b of safeQueryAll(n, 'button')) {
+          const bt = String(b.innerText || b.textContent || '').trim();
+          if (bt) t = t.replace(bt, '');
+        }
+        t = t.replace(SEE_MORE_RE, '').replace(/[ \t]+\n/g, '\n').trim();
+        if (t.length > best.length) best = t;
+      }
+      // The most specific selector that answered is the answer; the generic
+      // ones below it are only for markup where the specific ones are absent.
+      if (best && sel !== '[dir="ltr"]' && sel !== '.break-words') break;
+    }
+    return best;
+  }
 
+  /** Content images and videos under a card, however the markup carries them. */
+  function cardMedia(card, exclude) {
     const media = [];
     const seenUrl = new Set();
-    try {
-      for (const img of el.querySelectorAll('img')) {
-        /*
-         * A feed image below the fold has no `src` yet — LinkedIn parks the
-         * real URL on data-delayed-url until the image scrolls into view. Read
-         * that too, or everything past the first screen comes back with no
-         * media even though the URN was harvested fine.
-         */
-        const src =
-          img.currentSrc ||
-          img.src ||
-          img.getAttribute('data-delayed-url') ||
-          img.getAttribute('data-li-src') ||
-          '';
-        // Only content images: avatars and icons live on different paths.
-        if (!/licdn\.com\/dms\/image/.test(src)) continue;
-        if (NON_CONTENT_IMAGE.test(src)) continue;
-        if (seenUrl.has(src)) continue;
-        seenUrl.add(src);
-        media.push({ type: 'image', url: src });
-      }
+    const addImage = (src, alt) => {
+      if (!src || !/licdn\.com\/dms\/image/.test(src)) return;
+      if (NON_CONTENT_IMAGE.test(src)) return;
+      if (seenUrl.has(src)) return;
+      seenUrl.add(src);
+      media.push({ type: 'image', url: src, alt: alt || '' });
+    };
+    for (const img of safeQueryAll(card, 'img')) {
+      if (exclude && exclude.contains(img)) continue;
       /*
-       * LinkedIn's video player carries its source list as JSON in a
-       * data-sources attribute — the only place a progressive URL is visible
-       * from the DOM at all.
+       * A feed image below the fold has no `src` yet — LinkedIn parks the
+       * real URL on data-delayed-url until the image scrolls into view.
        */
-      for (const v of el.querySelectorAll('video,[data-sources]')) {
-        const raw = v.getAttribute('data-sources');
-        if (raw) {
-          try {
-            for (const s of JSON.parse(raw)) {
-              if (s && s.src && /^https?:/i.test(s.src)) {
-                media.push({
-                  type: 'video',
-                  url: /\.m3u8|\.mpd/.test(s.src) ? null : s.src,
-                  manifestUrl: /\.m3u8|\.mpd/.test(s.src) ? s.src : null,
-                  protocol: s.type || null,
-                  downloadable: !/\.m3u8|\.mpd/.test(s.src)
-                });
-              }
+      const src = img.currentSrc || img.src || img.getAttribute('data-delayed-url') || img.getAttribute('data-li-src') || '';
+      addImage(src, img.getAttribute('alt') || '');
+    }
+    // An image painted as a CSS background is still an image.
+    for (const el of safeQueryAll(card, '[style*="background-image"]')) {
+      if (exclude && exclude.contains(el)) continue;
+      const m = String(el.getAttribute('style') || '').match(/url\((['"]?)(.*?)\1\)/i);
+      if (m) addImage(m[2].replace(/&quot;/g, ''), el.getAttribute('aria-label') || '');
+    }
+    /*
+     * LinkedIn's video player carries its source list as JSON in a
+     * data-sources attribute — the only place a progressive URL is visible
+     * from the DOM at all.
+     */
+    for (const v of safeQueryAll(card, 'video,[data-sources]')) {
+      if (exclude && exclude.contains(v)) continue;
+      const raw = v.getAttribute('data-sources');
+      const poster = v.getAttribute('poster') || v.getAttribute('data-poster-url') || '';
+      if (raw) {
+        try {
+          for (const sSrc of JSON.parse(raw)) {
+            if (sSrc && sSrc.src && /^https?:/i.test(sSrc.src)) {
+              const adaptive = /\.m3u8|\.mpd/.test(sSrc.src);
+              media.push({
+                type: 'video',
+                url: adaptive ? null : sSrc.src,
+                manifestUrl: adaptive ? sSrc.src : null,
+                protocol: sSrc.type || null,
+                thumbnail: poster || null,
+                downloadable: !adaptive
+              });
             }
-          } catch (_) {
-            /* attribute shape changed; the post is still recorded */
           }
-        } else if (v.src && /^https?:/i.test(v.src)) {
-          media.push({ type: 'video', url: v.src, downloadable: true });
+        } catch (_) {
+          /* attribute shape changed; the post is still recorded */
         }
+      } else if (v.src && /^https?:/i.test(v.src)) {
+        media.push({ type: 'video', url: v.src, thumbnail: poster || null, downloadable: true });
+      }
+    }
+    return media;
+  }
+
+  function readCard(el, activityId, innerNode) {
+    const card = cardOf(el);
+    const exclude = innerNode && card.contains(innerNode) ? innerNode : null;
+
+    let text = '';
+    let media = [];
+    let repost = null;
+    try {
+      text = cardText(card, exclude);
+      media = cardMedia(card, exclude);
+      if (exclude) {
+        const innerId = VY.activityId(activityUrnOf(exclude));
+        repost = {
+          activityId: innerId || null,
+          urn: innerId ? `urn:li:activity:${innerId}` : null,
+          postUrl: innerId ? U.postUrlFromActivityId(innerId) : null,
+          text: cardText(exclude, null),
+          media: cardMedia(exclude, null)
+        };
       }
     } catch (_) {
       /* a card that will not read is still worth recording by URN */
     }
 
-    const counts = readCounts(el);
+    const counts = readCounts(card, exclude);
     const derived = timestampFromActivityId(activityId);
+
+    /*
+     * A card that still shows a "…see more" is showing the first lines, not
+     * the post. expandSeeMore() opens them before each read; one that stays
+     * closed (LinkedIn re-renders, the click landed on a detached button) is
+     * recorded as truncated so the detail pass fetches the whole body.
+     */
+    let textTruncated = false;
+    for (const b of safeQueryAll(card, 'button')) {
+      if (exclude && exclude.contains(b)) continue;
+      if (/^(?:…|\.\.\.)?\s*(?:see|show)\s+more$/i.test(String(b.innerText || b.textContent || '').trim())) {
+        textTruncated = true;
+        break;
+      }
+    }
 
     return {
       activityId,
       urn: `urn:li:activity:${activityId}`,
       postUrl: U.postUrlFromActivityId(activityId),
-      type: media.some((m) => m.type === 'video') ? 'video' : media.length ? 'image' : 'text',
+      type: media.some((m) => m.type === 'video') ? 'video' : media.length ? 'image' : repost ? 'repost' : 'text',
       text,
+      textTruncated,
+      repost,
       publishedAt: derived,
       timestampSource: derived ? 'derived-from-urn' : 'unknown',
       reactions: counts.reactions,
@@ -3079,32 +3490,74 @@
     };
   }
 
-  function readCounts(el) {
+  /**
+   * The three counts under a card. Known selectors first; failing those, the
+   * words themselves — "1,234 reactions", "56 comments" — wherever they sit.
+   */
+  function readCounts(el, exclude) {
     const out = { reactions: null, comments: null, reposts: null };
-    const grab = (sels, key, re) => {
-      for (const s of sels) {
-        try {
-          const n = el.querySelector(s);
-          if (!n) continue;
+    const NUM = /([\d.,]+[KMB]?)/i;
+    const grab = (sels, key) => {
+      for (const sel of sels) {
+        for (const n of safeQueryAll(el, sel)) {
+          if (exclude && exclude.contains(n)) continue;
           const label = n.getAttribute('aria-label') || n.innerText || n.textContent || '';
-          const m = label.replace(/,/g, '').match(re);
+          const m = label.replace(/,/g, '').match(NUM);
           if (m) {
             out[key] = parseCompact(m[1]);
-            return;
+            return true;
           }
-        } catch (_) {
-          /* ignore */
         }
       }
+      return false;
     };
-    grab(
-      ['[class*="social-details-social-counts__reactions-count"]', '[aria-label*="reaction"]', '[data-reaction-details]'],
-      'reactions',
-      /([\d.,KMB]+)/i
-    );
-    grab(['[aria-label*="comment"]', '[class*="social-details-social-counts__comments"]'], 'comments', /([\d.,KMB]+)/i);
-    grab(['[aria-label*="repost"]', '[class*="social-details-social-counts__reposts"]'], 'reposts', /([\d.,KMB]+)/i);
+    grab(['[class*="social-details-social-counts__reactions-count"]', '[aria-label*="reaction"]', '[data-reaction-details]'], 'reactions');
+    grab(['[aria-label*="comment"]', '[class*="social-details-social-counts__comments"]'], 'comments');
+    grab(['[aria-label*="repost"]', '[class*="social-details-social-counts__reposts"]'], 'reposts');
+
+    if (out.reactions == null || out.comments == null || out.reposts == null) {
+      let text = '';
+      try {
+        text = String(el.innerText || el.textContent || '');
+      } catch (_) {
+        text = '';
+      }
+      if (exclude) {
+        const inner = String(exclude.innerText || exclude.textContent || '');
+        if (inner) text = text.replace(inner, '');
+      }
+      const words = (re) => {
+        const m = text.replace(/,/g, '').match(re);
+        return m ? parseCompact(m[1]) : null;
+      };
+      if (out.reactions == null) out.reactions = words(/([\d.]+[KMB]?)\s*(?:reactions?|likes?)\b/i);
+      if (out.comments == null) out.comments = words(/([\d.]+[KMB]?)\s*comments?\b/i);
+      if (out.reposts == null) out.reposts = words(/([\d.]+[KMB]?)\s*reposts?\b/i);
+    }
     return out;
+  }
+
+  /**
+   * Opens every "…see more" on the page, so the harvested text is the post
+   * and not its first two lines. Only ever expands — never collapses — and is
+   * bounded per round, because it is a click on the page like any other.
+   */
+  function expandSeeMore(limit) {
+    let n = 0;
+    for (const b of safeQueryAll(document, 'button')) {
+      if (n >= (limit || 40)) break;
+      const t = String(b.innerText || b.textContent || '').trim();
+      const cls = String(b.className || '');
+      const isSeeMore = /^(?:…|\.\.\.)?\s*(?:see|show)\s+more$/i.test(t) || (/see-more/.test(cls) && !/less/i.test(t));
+      if (!isSeeMore) continue;
+      try {
+        b.click();
+        n++;
+      } catch (_) {
+        /* a detached button */
+      }
+    }
+    return n;
   }
 
   async function harvestViaDom(add) {
@@ -3124,6 +3577,9 @@
       await waitWhilePaused();
 
       const before = S.collected;
+      // The card renders the first lines and a "…see more"; the post is
+      // behind the button. Opened before reading, so the text is the post.
+      expandSeeMore();
       for (const p of harvestFeedCards()) {
         add(p);
         if (S.collected >= S.cfg.maxPosts) break;
@@ -4042,6 +4498,7 @@
       harvestFeedCards,
       readCard,
       readCounts,
+      expandSeeMore,
       linkedDetailPages,
       rowsFrom,
       componentRows,

@@ -301,6 +301,8 @@ if (!globalThis.LIS) {
       if (!p.detailFetched) return true;
       // Declared media the list response did not carry.
       if (p.mediaIncomplete) return true;
+      // The feed showed the first lines and a "…see more" that stayed closed.
+      if (p.textTruncated) return true;
       // An image post is allowed to have no words; nothing else is.
       if (!p.text && p.type !== 'image') return true;
       return p.reactions == null || p.comments == null;

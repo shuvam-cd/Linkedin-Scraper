@@ -703,7 +703,7 @@ check('detailPass routes media through the merge and re-derives the count', () =
 group('DOM harvest — images below the fold');
 
 check('the delayed-url attribute is read as a source', () => {
-  const body = CS_SRC.slice(CS_SRC.indexOf('function readCard'), CS_SRC.indexOf('function readCounts'));
+  const body = CS_SRC.slice(CS_SRC.indexOf('function cardMedia'), CS_SRC.indexOf('function readCard('));
   ok(/data-delayed-url/.test(body), 'LinkedIn parks the real URL there until the image scrolls in');
 });
 

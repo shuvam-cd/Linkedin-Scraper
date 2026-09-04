@@ -351,11 +351,16 @@ check('posts.csv has exactly the specified columns, in order', () => {
   const m = backgroundJs.match(/const head = \[([^\]]+)\]/);
   if (!m) throw new Error('csv header not found');
   const cols = m[1].match(/'([^']+)'/g).map((s) => s.replace(/'/g, ''));
+  // The literal names only: one column per reaction kind is generated from
+  // REACTION_LABELS between media_count and comments_captured.
   const want = [
-    'post_url', 'date', 'type', 'folder', 'text', 'reactions', 'comments', 'reposts', 'media_count',
+    'post_number', 'activity_id', 'post_url', 'date', 'date_source', 'type', 'folder', 'text', 'text_truncated',
+    'reactions', 'comments', 'reposts', 'media_count',
+    'comments_captured', 'comments_capped', 'comment_error',
     // Flat projections of what posts.json carries structurally.
-    'hashtags', 'article_url', 'poll_votes', 'reshared_from', 'reshared_url'
+    'hashtags', 'mentions', 'article_url', 'poll_votes', 'reshared_from', 'reshared_url', 'edited'
   ];
+  if (!/\.\.\.REACTION_KEYS\.map/.test(m[1])) throw new Error('the per-reaction columns must be generated');
   if (JSON.stringify(cols) !== JSON.stringify(want)) {
     throw new Error(`got ${cols.join(',')}`);
   }

@@ -48,10 +48,9 @@
       fetchConcurrency: Math.max(1, Math.min(4, tier === 'small' ? 1 : tier === 'modest' ? 2 : cores - 1)),
       // Longest edge of an extracted frame.
       frameEdge: tier === 'small' ? 720 : tier === 'modest' ? 960 : 1280,
-      // The finest interval the worker may ask for; coarser requests are kept.
-      minFrameIntervalSec: tier === 'small' ? 4 : tier === 'modest' ? 2 : 1,
       // Stills across the whole export. Twenty long videos at one a second is
       // eighteen thousand JPEGs, which is a ten-minute pack on a slow disk.
+      // Shared out per video at ZIP_INIT, so the first three do not take it all.
       maxFramesPerExport: tier === 'small' ? 600 : tier === 'modest' ? 1500 : 4000
     };
   })();
@@ -82,8 +81,8 @@
   async function fetchBlob(url) {
     if (cancelled) throw new Error('cancelled');
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
-    const timedOut = () => new Error(`no response within ${Math.round(FETCH_TIMEOUT_MS / 1000)}s`);
+    let timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
+    const timedOut = () => new Error(`no bytes for ${Math.round(FETCH_TIMEOUT_MS / 1000)}s`);
     try {
       let res = null;
       try {
@@ -96,9 +95,32 @@
         res = await fetch(url, { credentials: 'include', cache: 'no-store', signal: ctl.signal });
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      // Awaited under the same deadline: a body that stalls after its headers
-      // arrive is the same hang, and returning the promise would escape it.
-      return await res.blob();
+      /*
+       * The body is read in chunks and the deadline restarts on each one.
+       * As a single total-transfer timeout it dropped every large video on
+       * a slow link — a 200 MB file at 2 MB/s is a hundred seconds — and
+       * then blamed an expired CDN link. A stall is a *gap*: sixty seconds
+       * with no bytes at all.
+       */
+      if (!res.body || !res.body.getReader) return await res.blob();
+      const reader = res.body.getReader();
+      const chunks = [];
+      for (;;) {
+        clearTimeout(timer);
+        timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (cancelled) {
+          try {
+            await reader.cancel();
+          } catch (_) {
+            /* already closed */
+          }
+          throw new Error('cancelled');
+        }
+        chunks.push(value);
+      }
+      return new Blob(chunks, { type: res.headers.get('content-type') || '' });
     } catch (err) {
       if (ctl.signal.aborted) throw timedOut();
       throw err;
@@ -128,6 +150,21 @@
 
   /** Stills written so far in this archive — reset with it. */
   let framesThisExport = 0;
+  /*
+   * Each video's share of the export's frame budget. A first-come budget gave
+   * the first three videos every still and the other seventeen an empty
+   * _frames/ folder; the worker says how many videos the archive holds and
+   * the budget is divided among them. Never below 30, so a short clip still
+   * gets a usable sequence, and never above one per second.
+   */
+  let framesPerVideo = FRAMES.MAX_PER_VIDEO;
+
+  /** Divides the archive's frame budget among its videos. */
+  function shareFrameBudget(videoCount) {
+    const videos = Math.max(1, Number(videoCount) || 1);
+    framesPerVideo = Math.max(30, Math.floor(MACHINE.maxFramesPerExport / videos));
+    return framesPerVideo;
+  }
 
   /*
    * Decoding is serialised. The media fetches run four wide, but four videos
@@ -143,10 +180,16 @@
 
   function onceEvent(el, name, timeoutMs) {
     return new Promise((resolve, reject) => {
+      let timer = null;
+      let watch = null;
+      // Every exit — the event, an error, the timeout, a cancel — clears
+      // both timers. A watch left running after a timeout would hold the
+      // event loop open for good.
       const clean = () => {
         el.removeEventListener(name, ok);
         el.removeEventListener('error', bad);
         clearTimeout(timer);
+        clearInterval(watch);
       };
       const ok = () => {
         clean();
@@ -156,10 +199,17 @@
         clean();
         reject(new Error(`video ${name} failed`));
       };
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         clean();
         reject(new Error(`video ${name} timed out`));
       }, timeoutMs);
+      // Cancel is a flag, and a seek that never fires would otherwise hold
+      // the worker for the full timeout before the flag was looked at.
+      watch = setInterval(() => {
+        if (!cancelled) return;
+        clean();
+        reject(new Error('cancelled'));
+      }, 250);
       el.addEventListener(name, ok, { once: true });
       el.addEventListener('error', bad, { once: true });
     });
@@ -245,22 +295,31 @@
       canvas.height = Math.max(1, Math.round((video.videoHeight || 1) * scale));
       const ctx = canvas.getContext('2d');
 
-      const step = Math.max(MACHINE.minFrameIntervalSec, Number(intervalSec) || 1);
+      /*
+       * The step is whatever spreads this video's share of the budget across
+       * its length — one a second when it fits, wider when it does not — so a
+       * long video on a small machine gets a still every few seconds rather
+       * than the first few minutes at full rate and nothing after.
+       */
+      const asked = Math.max(0.1, Number(intervalSec) || 1);
+      const share = Math.max(1, Math.min(FRAMES.MAX_PER_VIDEO, framesPerVideo));
+      const step = Math.max(asked, duration / share);
+      let hitCeiling = false;
       for (let t = 0; t < duration && count < FRAMES.MAX_PER_VIDEO; t += step) {
-        if (framesThisExport >= MACHINE.maxFramesPerExport) break;
+        if (cancelled) throw new Error('cancelled');
+        if (framesThisExport >= MACHINE.maxFramesPerExport) {
+          hitCeiling = true;
+          break;
+        }
         framesThisExport++;
         await seekTo(video, Math.min(t, Math.max(0, duration - 0.05)));
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         if (onFrame) await onFrame({ at: t, index: count, blob: await canvasBlob(canvas) });
         count++;
       }
-      return {
-        count,
-        duration,
-        step,
-        truncated: count >= FRAMES.MAX_PER_VIDEO || framesThisExport >= MACHINE.maxFramesPerExport,
-        exportCapped: framesThisExport >= MACHINE.maxFramesPerExport
-      };
+      // A video that finished its own length exactly as the archive reached
+      // its ceiling was not cut short; only a loop that stopped early was.
+      return { count, duration, step, truncated: count >= FRAMES.MAX_PER_VIDEO || hitCeiling, exportCapped: hitCeiling };
     } finally {
       video.removeAttribute('src');
       video.load();
@@ -382,11 +441,12 @@
 
     (async () => {
       switch (msg.type) {
-        case 'ZIP_INIT':
+        case 'ZIP_INIT': {
           zip = newZipWriter();
           cancelled = false;
           framesThisExport = 0;
-          return { ok: true, machine: MACHINE };
+          return { ok: true, machine: MACHINE, framesPerVideo: shareFrameBudget(msg.videoCount) };
+        }
 
         case 'ZIP_CANCEL':
           cancelled = true;
@@ -474,6 +534,6 @@
    * that contains a video.
    */
   if (globalThis.__LIS_OFFSCREEN_TEST__) {
-    Object.assign(globalThis.__LIS_OFFSCREEN_TEST__, { extractFrames, FRAMES, framesReadme, fetchBlob, MACHINE });
+    Object.assign(globalThis.__LIS_OFFSCREEN_TEST__, { extractFrames, FRAMES, framesReadme, fetchBlob, MACHINE, shareFrameBudget });
   }
 })();

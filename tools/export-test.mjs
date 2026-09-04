@@ -400,13 +400,24 @@ check('has a BOM so Excel reads UTF-8 correctly', () => {
   ok(BG.postsCsv(POSTS).charCodeAt(0) === 0xfeff);
 });
 
+/** The index of a named column, read from the header row itself. */
+function col(name) {
+  const head = csvFields(csvRows(BG.postsCsv(POSTS))[0]);
+  const i = head.indexOf(name);
+  if (i < 0) throw new Error(`no column ${name} in ${head.join(',')}`);
+  return i;
+}
+
 check('header is exactly the specified columns', () => {
   loadFixture();
-  eq(
-    csvRows(BG.postsCsv(POSTS))[0],
-    '"post_url","date","type","folder","text","reactions","comments","reposts","media_count",' +
-      '"hashtags","article_url","poll_votes","reshared_from","reshared_url"'
-  );
+  const reactionCols = Object.keys(globalThis.LIS.REACTION_LABELS).map((k) => `reactions_${k.toLowerCase()}`);
+  eq(csvFields(csvRows(BG.postsCsv(POSTS))[0]), [
+    'post_number', 'activity_id', 'post_url', 'date', 'date_source', 'type', 'folder', 'text', 'text_truncated',
+    'reactions', 'comments', 'reposts', 'media_count',
+    ...reactionCols,
+    'comments_captured', 'comments_capped', 'comment_error',
+    'hashtags', 'mentions', 'article_url', 'poll_votes', 'reshared_from', 'reshared_url', 'edited'
+  ]);
 });
 
 check('one row per post, plus the header', () => {
@@ -422,24 +433,27 @@ check('a multi-line post body never splits a row', () => {
   eq(rows.length, 6, 'row count is unaffected by the embedded newline');
 });
 
-check('every row has exactly fourteen fields', () => {
+check('every row has exactly as many fields as the header', () => {
   loadFixture();
-  for (const row of csvRows(BG.postsCsv(POSTS))) {
+  const rows = csvRows(BG.postsCsv(POSTS));
+  const width = csvFields(rows[0]).length;
+  for (const row of rows) {
     const n = csvFields(row).length;
-    if (n !== 14) throw new Error(`${n} fields in: ${row.slice(0, 70)}…`);
+    if (n !== width) throw new Error(`${n} fields (header has ${width}) in: ${row.slice(0, 70)}…`);
   }
 });
 
 check('the folder column names the post’s folder in this archive', () => {
   loadFixture();
   const rows = csvRows(BG.postsCsv(POSTS));
-  eq(csvFields(rows[1])[3], 'Posts/Text/Post_001');
-  eq(csvFields(rows[2])[3], 'Posts/Photos/Post_002');
-  eq(csvFields(rows[5])[3], 'Posts/Documents/Post_005');
+  const F = col('folder');
+  eq(csvFields(rows[1])[F], 'Posts/Text/Post_001');
+  eq(csvFields(rows[2])[F], 'Posts/Photos/Post_002');
+  eq(csvFields(rows[5])[F], 'Posts/Documents/Post_005');
   // Every row must point at a folder the archive actually contains.
   const paths = pathsOf(BG.zipEntries());
   for (const r of rows.slice(1)) {
-    const f = csvFields(r)[3];
+    const f = csvFields(r)[F];
     ok(paths.some((p) => p.includes(f + '/')), `no such folder: ${f}`);
   }
 });
@@ -450,26 +464,29 @@ check('a missing count is an empty cell, not a zero', () => {
   // arrive empty so a spreadsheet treats them as absent rather than averaging
   // them in as real zeros.
   const f = csvFields(csvRows(BG.postsCsv(POSTS))[4]);
-  eq([f[5], f[6], f[7]], ['', '', ''], 'reactions/comments/reposts');
+  eq([f[col('reactions')], f[col('comments')], f[col('reposts')]], ['', '', ''], 'reactions/comments/reposts');
   // A genuine zero must still be a zero.
   const img = csvFields(csvRows(BG.postsCsv(POSTS))[2]);
-  eq(img[6], '0', 'a real zero comment count');
+  eq(img[col('comments')], '0', 'a real zero comment count');
 });
 
 check('media_count reflects the media list', () => {
   loadFixture();
   const rows = csvRows(BG.postsCsv(POSTS));
-  eq(csvFields(rows[2])[8], '2', 'image post has two media');
-  eq(csvFields(rows[1])[8], '0', 'text post has none');
+  eq(csvFields(rows[2])[col('media_count')], '2', 'image post has two media');
+  eq(csvFields(rows[1])[col('media_count')], '0', 'text post has none');
 });
 
 check('the post URL and type survive round-trip unaltered', () => {
   loadFixture();
   const f = csvFields(csvRows(BG.postsCsv(POSTS))[1]);
-  eq(f[0], 'https://www.linkedin.com/feed/update/urn:li:activity:7100000000000000001/');
-  eq(f[2], 'text');
-  eq(f[1], '2023-11-14 22:13:20');
-  eq(f[4], 'Line one\\nLine two, with a "quote" and a comma.', 'text unescapes to the escaped form');
+  eq(f[col('post_url')], 'https://www.linkedin.com/feed/update/urn:li:activity:7100000000000000001/');
+  eq(f[col('type')], 'text');
+  eq(f[col('date')], '2023-11-14 22:13:20');
+  eq(f[col('text')], 'Line one\\nLine two, with a "quote" and a comma.', 'text unescapes to the escaped form');
+  // The stable id and the archive number travel with the row.
+  eq(f[col('activity_id')], '7100000000000000001');
+  eq(f[col('post_number')], '1');
 });
 
 /* ================================================================== */

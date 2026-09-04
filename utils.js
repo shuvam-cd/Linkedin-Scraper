@@ -111,7 +111,10 @@ if (!globalThis.LIS) {
       PERSIST_DEBOUNCE_MS: 1500,
       // Posts persist in fixed-size buckets so a write costs O(changed) rather
       // than re-serialising the whole result set on every batch.
-      CHUNK_SIZE: 100,
+      // 25, not 100. A post updated by the detail or comment pass rewrites its
+      // whole chunk plus the state — at 100 posts a chunk that was ~7 MB per
+      // one-post update, and a 500-post run wrote gigabytes to a slow disk.
+      CHUNK_SIZE: 25,
       // Comment paging is the most expensive thing the scraper does — one
       // request per page, per post — and it collects other people's personal
       // data. Both ceilings are hard.

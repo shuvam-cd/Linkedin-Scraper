@@ -873,6 +873,46 @@ const crlf = (lines) => lines.join('\r\n') + '\r\n';
 const padWidth = () => 3;
 
 const mediaOf = (post) => (Array.isArray(post.media) ? post.media : []);
+
+/**
+ * The file each of a post's media becomes, decided once.
+ *
+ * metadata.txt numbered media 1..N across every kind while the files beside
+ * it were numbered per kind — media_01.jpg, video_01.mp4, document.txt — so
+ * the MEDIA list did not name the files it sat next to. Both sides now ask
+ * here. Returns one record per media item, in order, with the names that
+ * item produces (some produce none: an adaptive stream has no file).
+ */
+function mediaFileNames(post) {
+  const media = mediaOf(post);
+  let mediaNo = 0;
+  let videoNo = 0;
+  let docNo = 0;
+  let posterNo = 0;
+  return media.map((m) => {
+    const has = (u) => !!u && /^https?:/i.test(u);
+    if (m.type === 'document') {
+      docNo++;
+      const stem = docNo === 1 ? 'document' : `document_${U.pad(docNo, 2)}`;
+      return {
+        kind: 'document',
+        file: has(m.url) ? `${U.sanitizeSegment(m.title || stem)}.${U.extFromUrl(m.url, 'pdf')}` : null,
+        note: `${stem}.txt`,
+        stem
+      };
+    }
+    if (m.type === 'video') {
+      const poster = has(m.thumbnail) ? `poster_${U.pad(++posterNo, 2)}.jpg` : null;
+      if (!has(m.url)) return { kind: 'video', file: null, poster, stranded: true, stem: null };
+      videoNo++;
+      const stem = `video_${U.pad(videoNo, 2)}`;
+      return { kind: 'video', file: `${stem}.${U.extFromUrl(m.url, 'mp4')}`, poster, frames: `${stem}_frames`, stem };
+    }
+    if (!has(m.url)) return { kind: m.type || 'image', file: null, stem: null };
+    const stem = `media_${U.pad(++mediaNo, 2)}`;
+    return { kind: m.type || 'image', file: `${stem}.${U.extFromUrl(m.url, 'jpg')}`, stem };
+  });
+}
 const postedAt = (post) => U.fmtTimestamp(post.publishedAt);
 
 /*
@@ -1091,7 +1131,9 @@ function postFileText(post) {
  * the difference between "nobody reacted" and "not obtainable" matters when
  * these rows feed an outreach decision.
  */
-function metadataFileText(post) {
+function metadataFileText(post, n) {
+  // The archive number, which is the loop position and not post.index.
+  const num = n != null ? n : post.index != null ? post.index + 1 : 0;
   const out = [];
   out.push(kv('Post URL', post.postUrl || 'unknown'));
   out.push(kv('URN', post.urn || 'unknown'));
@@ -1115,6 +1157,16 @@ function metadataFileText(post) {
 
   out.push(kv('Comments', nOf(post.comments)));
   out.push(kv('Reposts', nOf(post.reposts)));
+  out.push(
+    kv(
+      'Comments captured',
+      Array.isArray(post.commentList)
+        ? `${post.commentList.length}${post.commentsTruncated ? ' (capped)' : ''} — see Comments/Post_${U.pad(num, padWidth())}_comments.txt`
+        : post.commentError
+          ? `failed: ${post.commentError}`
+          : 'not fetched'
+    )
+  );
   if (Array.isArray(post.hashtags) && post.hashtags.length) {
     out.push(kv('Hashtags', post.hashtags.map((h) => '#' + h).join(' ')));
   }
@@ -1184,14 +1236,19 @@ function metadataFileText(post) {
       out.push('(none)');
     }
   } else {
+    const names = mediaFileNames(post);
     media.forEach((m, i) => {
+      const nm = names[i] || {};
       const label = `${String(i + 1).padStart(3)}. ${m.type}`;
       if (m.type === 'video' && !m.url) {
-        out.push(`${label} — adaptive stream only, not downloaded`);
+        out.push(`${label} — adaptive stream only, not downloaded${nm.poster ? ` (poster: ${nm.poster})` : ''}`);
         if (m.manifestUrl) out.push(`     manifest: ${m.manifestUrl}`);
         if (m.protocol) out.push(`     protocol: ${m.protocol}`);
       } else {
-        out.push(`${label}`);
+        // The file this item became, so the list names what sits beside it.
+        const files = [nm.file, nm.poster, nm.frames ? `${nm.frames}/` : null, nm.note].filter(Boolean);
+        out.push(`${label}${files.length ? ` — ${files.join(', ')}` : ''}`);
+        if (m.alt) out.push(`     alt: ${m.alt}`);
         if (m.url) out.push(`     ${m.url}`);
         if (m.type === 'document' && m.pages) out.push(`     pages: ${m.pages}`);
       }
@@ -1224,20 +1281,50 @@ function commentsFileText(post) {
        */
       out.push(`(the comment pass ran and LinkedIn returned none of the ${post.comments} it reports)`);
     } else if (post.comments) out.push('(not captured — the run ended before the comment pass)');
-    else out.push('(no comments)');
+    else if (post.comments === 0) out.push('(no comments)');
+    else if (post.commentsFetchedAt) out.push('(the comment pass ran; LinkedIn returned none and did not report a count)');
+    else out.push('(comment count unknown — the run ended before the comment pass)');
     return crlf(out);
   }
 
-  list.forEach((c, i) => {
+  /*
+   * Threaded. A reply carries the URN of the comment it answers; printed
+   * flat, a thread read as unrelated comments in arrival order. Replies are
+   * indented under their parent, and a reply whose parent was not captured
+   * (past the cap, or on a later page) is printed at top level and says so.
+   */
+  const byUrn = new Map();
+  for (const c of list) if (c.urn) byUrn.set(c.urn, c);
+  const children = new Map();
+  const roots = [];
+  for (const c of list) {
+    if (c.parentUrn && byUrn.has(c.parentUrn) && byUrn.get(c.parentUrn) !== c) {
+      if (!children.has(c.parentUrn)) children.set(c.parentUrn, []);
+      children.get(c.parentUrn).push(c);
+    } else {
+      roots.push(c);
+    }
+  }
+  let n = 0;
+  const printOne = (c, depth) => {
+    const pad = '      ' + '    '.repeat(depth);
     const when = c.at ? U.fmtTimestamp(c.at) : '';
-    out.push(`${String(i + 1).padStart(4)}. ${c.author || '(unknown)'}${when ? '   [' + when + ']' : ''}`);
-    if (c.headline) out.push(`      ${c.headline}`);
-    if (c.profileUrl) out.push(`      ${c.profileUrl}`);
-    if (c.reactions != null) out.push(`      reactions: ${nOf(c.reactions)}`);
+    n++;
+    const head = depth ? `${'    '.repeat(depth)}  ↳ ` : `${String(n).padStart(4)}. `;
+    out.push(`${head}${c.author || '(unknown)'}${when ? '   [' + when + ']' : ''}`);
+    if (c.headline) out.push(`${pad}${c.headline}`);
+    if (c.profileUrl) out.push(`${pad}${c.profileUrl}`);
+    const facts = [];
+    if (c.reactions != null) facts.push(`reactions: ${nOf(c.reactions)}`);
+    if (c.replyCount) facts.push(`replies: ${c.replyCount}`);
+    if (c.parentUrn && !byUrn.has(c.parentUrn)) facts.push('a reply to a comment not captured');
+    if (facts.length) out.push(`${pad}${facts.join('   ·   ')}`);
     out.push('');
-    for (const line of String(c.text || '(empty)').split(/\r?\n/)) out.push(`      ${line}`);
+    for (const line of String(c.text || '(empty)').split(/\r?\n/)) out.push(`${pad}${line}`);
     out.push('');
-  });
+    for (const r of children.get(c.urn) || []) printOne(r, depth + 1);
+  };
+  for (const c of roots) printOne(c, 0);
 
   if (post.commentsTruncated) {
     out.push(`(capped at ${list.length} of ${nOf(post.comments)} — see MAX_COMMENTS_PER_POST in utils.js)`);
@@ -1286,32 +1373,48 @@ function videoNoteText(videos) {
 function postsCsv(list) {
   // `folder` is what makes the type-grouped tree navigable from a spreadsheet:
   // sort or filter on any column and the path to that post's files is on the row.
+  const REACTION_KEYS = Object.keys(U.REACTION_LABELS || {});
   const head = [
-    'post_url', 'date', 'type', 'folder', 'text', 'reactions', 'comments', 'reposts', 'media_count',
+    'post_number', 'activity_id', 'post_url', 'date', 'date_source', 'type', 'folder', 'text', 'text_truncated',
+    'reactions', 'comments', 'reposts', 'media_count',
+    // One column per reaction kind, blank when the breakdown was not returned.
+    ...REACTION_KEYS.map((k) => `reactions_${k.toLowerCase()}`),
+    'comments_captured', 'comments_capped', 'comment_error',
     // Everything past here is flat by necessity — the structured form of all
     // of it is in posts.json, which is what these columns point at.
-    'hashtags', 'article_url', 'poll_votes', 'reshared_from', 'reshared_url'
+    'hashtags', 'mentions', 'article_url', 'poll_votes', 'reshared_from', 'reshared_url', 'edited'
   ];
   // A BOM so Excel opens UTF-8 correctly instead of mangling every accent.
   let out = '﻿' + U.csvRow(head);
   let n = 0;
   for (const p of list) {
     n++;
+    const by = p.reactionsByType || {};
     out += U.csvRow([
+      n,
+      p.activityId || '',
       p.postUrl || '',
       p.publishedAt ? U.fmtTimestamp(p.publishedAt).replace(' UTC', '') : '',
+      p.timestampSource || '',
       p.type || '',
       `Posts/${folderForType(p.type)}/Post_${U.pad(n, padWidth())}`,
       p.text || '',
+      p.textTruncated ? 'yes' : '',
       p.reactions == null ? '' : p.reactions,
       p.comments == null ? '' : p.comments,
       p.reposts == null ? '' : p.reposts,
       mediaOf(p).length,
+      ...REACTION_KEYS.map((k) => (by[k] == null ? '' : by[k])),
+      Array.isArray(p.commentList) ? p.commentList.length : '',
+      p.commentsTruncated ? 'yes' : '',
+      p.commentError || '',
       Array.isArray(p.hashtags) ? p.hashtags.map((h) => '#' + h).join(' ') : '',
+      Array.isArray(p.mentions) ? p.mentions.map((m) => m.name + (m.url ? ` <${m.url}>` : '')).join('; ') : '',
       (p.article && p.article.url) || '',
       p.poll && p.poll.totalVotes != null ? p.poll.totalVotes : '',
       (p.repost && p.repost.author) || '',
-      (p.repost && p.repost.postUrl) || ''
+      (p.repost && p.repost.postUrl) || '',
+      p.edited ? 'yes' : ''
     ]);
   }
   return out;
@@ -1344,7 +1447,28 @@ function postsJson(list) {
   );
 }
 
-function readmeFileText(stats) {
+/** The archive's tree, folded: each folder once, the file names under it. */
+function treeSummary(items, root) {
+  const folders = new Map();
+  for (const it of items) {
+    const rel = it.path.startsWith(root + '/') ? it.path.slice(root.length + 1) : it.path;
+    const parts = rel.split('/');
+    const file = parts.pop();
+    // Post folders repeat by the hundred; fold them to their kind.
+    const folded = parts.map((seg) => (/^Post_\d+$/.test(seg) ? 'Post_NNN' : seg)).join('/') || '(root)';
+    const name = file.replace(/^(media|video|poster|reshared|document)_\d+/, '$1_NN').replace(/^frame_\d+/, 'frame_NNNN');
+    if (!folders.has(folded)) folders.set(folded, new Set());
+    folders.get(folded).add(name);
+  }
+  const out = [];
+  for (const [folder, files] of [...folders.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    out.push(`${folder}/`);
+    for (const f of [...files].sort()) out.push(`    ${f}`);
+  }
+  return out;
+}
+
+function readmeFileText(stats, items) {
   const p = state.profile || {};
   const out = [];
   out.push(`LinkedIn export — ${p.fullName || state.publicId}`);
@@ -1391,7 +1515,18 @@ function readmeFileText(stats) {
   out.push('posts.json      the same posts with nothing flattened: every media URL,');
   out.push('                the poll breakdown, the article card, the reshare it came');
   out.push('                from. Comments are not duplicated here — see below.');
+  out.push('Posts/index.txt every post on one line — number, date, kind, folder,');
+  out.push('                first line, permalink, comments — and index_by_date.txt');
+  out.push('                the same sorted newest first.');
   out.push('');
+  if (Array.isArray(items) && items.length) {
+    // Generated from what was actually written, so this list cannot drift
+    // from the archive the way a hand-kept one did.
+    out.push('EVERY FILE IN THIS ARCHIVE');
+    out.push(RULE);
+    for (const line of treeSummary(items, U.sanitizeSegment(state.publicId, 'profile'))) out.push(line);
+    out.push('');
+  }
 
   out.push('COMPLETENESS');
   out.push(RULE);
@@ -1600,7 +1735,7 @@ function zipEntries() {
     const media = mediaOf(post);
 
     items.push({ path: `${folder}/post.txt`, text: postFileText(post) });
-    items.push({ path: `${folder}/metadata.txt`, text: metadataFileText(post) });
+    items.push({ path: `${folder}/metadata.txt`, text: metadataFileText(post, n) });
 
     /*
      * Comments live in one top-level folder rather than scattered through the
@@ -1627,16 +1762,11 @@ function zipEntries() {
       });
     }
 
-    let mediaNo = 0;
-    let videoNo = 0;
-    let docNo = 0;
-    // Posters are numbered independently of videos: a stranded stream gets a
-    // poster but never a video file, so sharing one counter made the next
-    // video's poster reuse a number that was already taken.
-    let posterNo = 0;
     const strandedVideos = [];
+    const names = mediaFileNames(post);
 
-    for (const m of media) {
+    media.forEach((m, mi) => {
+      const nm = names[mi] || {};
       if (m.type === 'document') {
         /*
          * Numbered like every other media kind. A post carrying two documents
@@ -1645,16 +1775,9 @@ function zipEntries() {
          * The first keeps the plain name so the common single-document post
          * looks the way it always has.
          */
-        docNo++;
-        const stem = docNo === 1 ? 'document' : `document_${U.pad(docNo, 2)}`;
-        if (m.url && /^https?:/i.test(m.url)) {
-          items.push({
-            path: `${folder}/${U.sanitizeSegment(m.title || stem)}.${U.extFromUrl(m.url, 'pdf')}`,
-            url: m.url
-          });
-        }
+        if (nm.file) items.push({ path: `${folder}/${nm.file}`, url: m.url });
         items.push({
-          path: `${folder}/${stem}.txt`,
+          path: `${folder}/${nm.note}`,
           text: crlf(
             [
               kv('From post', post.postUrl || 'unknown'),
@@ -1665,23 +1788,19 @@ function zipEntries() {
             ].filter(Boolean)
           )
         });
-        continue;
+        return;
       }
 
       if (m.type === 'video') {
         // The poster is worth having either way — it is the only still that
         // exists for a stream that cannot be downloaded.
-        if (m.thumbnail && /^https?:/i.test(m.thumbnail)) {
-          items.push({ path: `${folder}/poster_${U.pad(++posterNo, 2)}.jpg`, url: m.thumbnail });
-        }
-        if (!m.url || !/^https?:/i.test(m.url)) {
+        if (nm.poster) items.push({ path: `${folder}/${nm.poster}`, url: m.thumbnail });
+        if (!nm.file) {
           strandedVideos.push(m);
-          continue;
+          return;
         }
-        videoNo++;
-        const stem = `video_${U.pad(videoNo, 2)}`;
         items.push({
-          path: `${folder}/${stem}.${U.extFromUrl(m.url, 'mp4')}`,
+          path: `${folder}/${nm.file}`,
           url: m.url,
           /*
            * Tells the offscreen document to decode this one after it lands and
@@ -1689,13 +1808,29 @@ function zipEntries() {
            * that produces more entries than it declares, so the progress total
            * is a floor rather than an exact count.
            */
-          video: { framesDir: `${folder}/${stem}_frames`, intervalSec: 1 }
+          video: { framesDir: `${folder}/${nm.frames}`, intervalSec: 1 }
         });
-        continue;
+        return;
       }
 
-      if (!m.url || !/^https?:/i.test(m.url)) continue;
-      items.push({ path: `${folder}/media_${U.pad(++mediaNo, 2)}.${U.extFromUrl(m.url, 'jpg')}`, url: m.url });
+      if (!nm.file) return;
+      items.push({ path: `${folder}/${nm.file}`, url: m.url, alt: m.alt || '' });
+    });
+
+    /*
+     * A reshare's original media. The post's own media list is empty for a
+     * bare reshare — the picture belongs to the original — but the picture
+     * is still what the profile chose to show, so it is downloaded beside
+     * the post under its own prefix.
+     */
+    if (post.repost && Array.isArray(post.repost.media)) {
+      let rn = 0;
+      for (const m of post.repost.media) {
+        if (!m || !m.url || !/^https?:/i.test(m.url)) continue;
+        if (m.type === 'video' && !m.url) continue;
+        const ext = U.extFromUrl(m.url, m.type === 'video' ? 'mp4' : 'jpg');
+        items.push({ path: `${folder}/reshared_${U.pad(++rn, 2)}.${ext}`, url: m.url });
+      }
     }
 
     if (strandedVideos.length) {
@@ -1704,9 +1839,45 @@ function zipEntries() {
   }
 
   /* ---- top level ---- */
+  /*
+   * The index. Posts are grouped by kind, so reading in order means jumping
+   * between folders — and nothing said which folder held post 7, or what
+   * order the numbers follow. One line per post, in number order, and the
+   * same again by date.
+   */
+  const indexLine = (p, n) => {
+    const when = p.publishedAt ? U.fmtTimestamp(p.publishedAt).replace(' UTC', '') : '(date unknown)';
+    const first = String(p.text || (p.repost && p.repost.text) || '').split(/\r?\n/)[0].slice(0, 80);
+    const cmts = Array.isArray(p.commentList) ? `comments: ${p.commentList.length}` : p.comments != null ? `comments: ${p.comments}` : '';
+    return [
+      `Post_${U.pad(n, padWidth())}`,
+      when,
+      (p.type || 'text').padEnd(8),
+      `Posts/${folderForType(p.type)}/Post_${U.pad(n, padWidth())}`,
+      first ? `"${first}"` : '',
+      p.postUrl || '',
+      cmts
+    ].filter(Boolean).join('  ');
+  };
+  const numbered = posts.map((p, i) => ({ p, n: i + 1 }));
+  const byNumber = [
+    `POSTS — ${posts.length}`,
+    RULE,
+    'Numbered in the order they were collected, which is the order LinkedIn',
+    'lists them: newest first. Each line: number, date, kind, folder, first',
+    'line, permalink, comments.',
+    ''
+  ].concat(numbered.map(({ p, n }) => indexLine(p, n)));
+  items.push({ path: `${root}/Posts/index.txt`, text: crlf(byNumber) });
+  const byDate = numbered
+    .slice()
+    .sort((a, b) => (Number(b.p.publishedAt) || 0) - (Number(a.p.publishedAt) || 0))
+    .map(({ p, n }) => indexLine(p, n));
+  items.push({ path: `${root}/Posts/index_by_date.txt`, text: crlf([`POSTS BY DATE — ${posts.length}`, RULE, 'Newest first. Same columns as index.txt.', ''].concat(byDate)) });
+
   items.push({ path: `${root}/posts.csv`, text: postsCsv(posts) });
   items.push({ path: `${root}/posts.json`, text: postsJson(posts) });
-  items.push({ path: `${root}/README.txt`, text: readmeFileText(stats) });
+  items.push({ path: `${root}/README.txt`, text: readmeFileText(stats, items) });
 
   return dedupePaths(items);
 }
@@ -1776,7 +1947,7 @@ async function buildZip() {
   keepAliveStart();
   try {
     await ensureOffscreen();
-    const init = await offscreenSend({ type: 'ZIP_INIT' });
+    const init = await offscreenSend({ type: 'ZIP_INIT', videoCount });
     if (!init || !init.ok) throw new Error((init && init.error) || 'could not start the archive');
 
     const BATCH = 20;

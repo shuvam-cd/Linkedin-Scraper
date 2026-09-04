@@ -303,7 +303,7 @@ check('resolves images to the widest artifact', () => {
       ]
     }
   });
-  eq(imgs, [{ type: 'image', url: 'https://media.licdn.com/dms/image/A/1200/a.jpg' }]);
+  eq(imgs, [{ type: 'image', url: 'https://media.licdn.com/dms/image/A/1200/a.jpg', alt: '' }]);
 });
 
 check('extracts a document with its page count', () => {

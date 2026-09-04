@@ -784,6 +784,10 @@
 
     if (typeof v.text === 'string') return v.text;
     if (typeof v.rawText === 'string') return v.rawText;
+    // A comment body arrives as { values: [{ value: "…" }, …] } in one of the
+    // two shapes LinkedIn uses; neither branch below reached it, and the
+    // fallback then dropped the comment for having no text.
+    if (Array.isArray(v.values)) return v.values.map((x) => textOf(x && x.value != null ? x.value : x, depth + 1)).join('');
     if (typeof v.defaultLocalizedName === 'string') return v.defaultLocalizedName;
     if (typeof v.name === 'string') return v.name;
     if (v.text && typeof v.text === 'object') return textOf(v.text, depth + 1);
@@ -931,16 +935,27 @@
   function imagesFrom(node) {
     const out = [];
     const seen = new Set();
-    const push = (u) => {
+    const push = (u, alt) => {
       if (u && /^https?:/i.test(u) && !seen.has(u)) {
         seen.add(u);
-        out.push({ type: 'image', url: u });
+        out.push({ type: 'image', url: u, alt: alt || '' });
       }
     };
+    /*
+     * The alt text lives on the image's parent — the ImageViewModel that
+     * wraps the vectorImage — as accessibilityText. Read the wrapper first
+     * so the caption travels with the picture; a bare vectorImage with no
+     * wrapper still gets its URL.
+     */
+    const isWrapper = (n) =>
+      n.accessibilityText != null ||
+      (Array.isArray(n.attributes) && n.attributes.some((a) => a && a.detailData && (a.detailData.vectorImage || a.detailData.imageUrl)));
     const isVectorImage = (n) => Array.isArray(n.artifacts) && (n.rootUrl || n.root);
-    for (const vi of collectContent(node, isVectorImage, { skip: IMAGE_SKIP_KEYS })) {
-      push(VY.vectorImageUrl(vi));
+    for (const w of collectContent(node, isWrapper, { skip: IMAGE_SKIP_KEYS })) {
+      const alt = textOf(w.accessibilityText) || textOf(w.altText) || '';
+      for (const vi of collectContent(w, isVectorImage, { skip: IMAGE_SKIP_KEYS })) push(VY.vectorImageUrl(vi), alt);
     }
+    for (const vi of collectContent(node, isVectorImage, { skip: IMAGE_SKIP_KEYS })) push(VY.vectorImageUrl(vi), '');
     return out;
   }
 
@@ -1387,21 +1402,31 @@
    * others. Unknown reaction names are carried through rather than dropped,
    * so a new one shows up in the export instead of vanishing.
    */
+  /** Containers whose counts belong to another post or to a comment. */
+  const OTHER_COUNT_KEYS = new Set(['resharedUpdate', 'comments', 'comment', 'commentsPreview', 'replies']);
+
   function reactionsFrom(node) {
     const byType = {};
     let total = null;
 
-    for (const s of VY.collect(node, (n) => Array.isArray(n.reactionTypeCounts))) {
-      for (const r of s.reactionTypeCounts) {
+    /*
+     * The breakdown comes from ONE socialDetail — the first in walk order
+     * that is the post's own. Summing every nested one added the reshared
+     * original's reactions and each comment's to the post's, so a repost's
+     * per-type split came out far past its own total.
+     */
+    const own = collectContent(node, (n) => Array.isArray(n.reactionTypeCounts), { skip: OTHER_COUNT_KEYS, limit: 1 })[0];
+    if (own) {
+      for (const r of own.reactionTypeCounts) {
         const kind = String(r.reactionType || r.type || '').toUpperCase();
         const c = num(r.count);
         if (kind && c != null) byType[kind] = (byType[kind] || 0) + c;
       }
-      if (total == null) total = num(s.numLikes) ?? num(s.numReactions) ?? null;
+      total = num(own.numLikes) ?? num(own.numReactions) ?? null;
     }
 
     if (total == null) {
-      for (const s of VY.collect(node, (n) => n.numLikes != null || n.numReactions != null)) {
+      for (const s of collectContent(node, (n) => n.numLikes != null || n.numReactions != null, { skip: OTHER_COUNT_KEYS })) {
         total = num(s.numLikes) ?? num(s.numReactions);
         if (total != null) break;
       }
@@ -1428,6 +1453,14 @@
    * ------------------------------------------------------------------ */
   /** Reads a field that may be inline or still a `*`-prefixed reference. */
   const linked = (n, key) => (n[key] !== undefined ? n[key] : n['*' + key]);
+
+  /** LinkedIn's pronoun enum, as the words it stands for. */
+  function pronounText(v) {
+    const s = String(textOf(v) || '').toUpperCase();
+    if (!s) return '';
+    const map = { HE_HIM: 'he/him', SHE_HER: 'she/her', THEY_THEM: 'they/them' };
+    return map[s] || s.toLowerCase().replace(/_/g, '/');
+  }
 
   function mapProfileEntity(rawProfile, pool) {
     if (!rawProfile) return null;
@@ -1488,8 +1521,26 @@
       lastName: last,
       headline: textOf(p.headline),
       location: geo,
-      industry: textOf(p.industryName) || textOf(p.industry),
+      industry:
+        textOf(p.industryName) ||
+        textOf(p.industry) ||
+        textOf(linked(p, 'industryV2Taxonomy')) ||
+        textOf(linked(p, 'industryV2')) ||
+        '',
       about: textOf(p.summary) || textOf(p.about),
+      /*
+       * Fields the entity carries that were being dropped on the floor:
+       * the pronoun (an enum or a custom string), the birthday, the address,
+       * the maiden name, and the two states a profile can be in that change
+       * how everything else should be read.
+       */
+      pronouns: textOf(p.customPronoun) || pronounText(p.pronoun),
+      birthday: p.birthDateOn ? (p.birthDateOn.month && MONTHS[p.birthDateOn.month] ? `${MONTHS[p.birthDateOn.month]} ${p.birthDateOn.day || ''}`.trim() : textOf(p.birthDateOn)) : '',
+      address: textOf(p.address),
+      maidenName: textOf(p.maidenName),
+      memorialized: !!p.memorialized,
+      tempStatus: textOf(p.tempStatus),
+      creator: !!(p.creator || p.influencer),
       followers: num(p.followerCount) ?? num(p.followersCount),
       connections: num(p.connectionsCount) ?? num(p.connections),
       photoUrl: photo,
@@ -1653,6 +1704,29 @@
      * did is the heading, and the organisation qualifies it. Every other
      * section names itself through `name` or `title`.
      */
+    /*
+     * A recommendation has no name of its own: it is who wrote it, how they
+     * knew the person, and what they said. Read that shape first, or every
+     * recommendation was discarded for want of a `name`.
+     */
+    if (n.recommendationText != null || n.recommender != null || n['*recommender'] != null) {
+      const who = n.recommender && typeof n.recommender === 'object' ? n.recommender : null;
+      const byName =
+        (who && [textOf(who.firstName), textOf(who.lastName)].filter(Boolean).join(' ')) ||
+        textOf(n.recommenderName) ||
+        textOf(who && who.name) ||
+        '';
+      if (byName || textOf(n.recommendationText)) {
+        return {
+          name: byName || '(name not returned)',
+          detail: textOf(n.relationship) || (who && textOf(who.headline)) || '',
+          dates: datePointText(n.createdAt || n.created || n.dateRange) || '',
+          url: who && who.publicIdentifier ? U.profileUrl(who.publicIdentifier) : null,
+          description: textOf(n.recommendationText) || textOf(n.text)
+        };
+      }
+    }
+
     const name = textOf(n.name) || textOf(n.title) || textOf(n.role) || textOf(n.schoolName) || textOf(n.companyName);
     if (!name) return null;
     const range = n.dateRange || n.timePeriod || n.issuedOn || n.issueDate;
@@ -1665,6 +1739,11 @@
         textOf(n.companyName) ||
         textOf(n.issuer) ||
         textOf(n.occupation) ||
+        // Patents, test scores and organizations qualify themselves differently.
+        textOf(n.patentNumber ? `${n.filingState || ''} ${n.patentNumber}`.trim() : '') ||
+        textOf(n.score) ||
+        textOf(n.position) ||
+        textOf(n.licenseNumber) ||
         '',
       dates: (section && section.point ? datePointText(range) : dateRangeText(range)) || '',
       url: typeof n.url === 'string' && /^https?:/i.test(n.url) ? n.url : null,
@@ -1717,16 +1796,82 @@
    * a `description` too, and on a short post it is the *longer* string, so the
    * unscoped walk handed back the poster's job title as the post body.
    */
+  /** Containers whose text belongs to somebody else's post, or to the chrome. */
+  const OTHER_TEXT_KEYS = new Set([...CHROME_KEYS, 'resharedUpdate', 'articleComponent', 'comments', 'commentsPreview', 'socialDetail', 'actor', 'header']);
+
   function postTextFrom(node) {
+    if (!node || typeof node !== 'object') return '';
+    /*
+     * The update's own commentary, when it has one. The longest-string scan
+     * below is only for shapes without it — left as the rule, it handed a
+     * reshare the original's body and an article post its summary, because
+     * both are longer than the poster's own words.
+     */
+    const own = textOf(node.commentary) || (node.commentary && textOf(node.commentary.text)) || '';
+    if (own) return own;
     let best = '';
     for (const n of collectContent(
       node,
-      (x) => x.commentary || x.text != null || x.attributedText != null || x.description != null
+      (x) => x.commentary || x.text != null || x.attributedText != null || x.description != null,
+      { skip: OTHER_TEXT_KEYS }
     )) {
       const t = textOf(n.commentary) || textOf(n.text) || textOf(n.attributedText) || textOf(n.description);
       if (t && t.length > best.length) best = t;
     }
     return best;
+  }
+
+  /**
+   * @mentions and links, with where they point.
+   *
+   * LinkedIn keeps a post's mentions as attributes over the text — a start,
+   * a length, and the profile or company mentioned. Reading the text alone
+   * flattened "Ada Lovelace" to plain words and lost the URL entirely.
+   */
+  function mentionsFrom(node) {
+    const out = [];
+    const seen = new Set();
+    const c = node && node.commentary;
+    const textObj = c && (c.text && typeof c.text === 'object' ? c.text : c);
+    const full = textOf(c) || '';
+    const attrs = (textObj && (textObj.attributesV2 || textObj.attributes)) || [];
+    for (const a of Array.isArray(attrs) ? attrs : []) {
+      const d = (a && (a.detailData || a.value || a)) || {};
+      const start = num(a.start);
+      const length = num(a.length);
+      const shown = start != null && length != null ? full.substr(start, length) : '';
+      let kind = '';
+      let target = null;
+      if (d.profileMention || d['*profileMention'] || d.miniProfile || d['*miniProfile']) {
+        kind = 'person';
+        target = d.profileMention || d.miniProfile || null;
+      } else if (d.companyMention || d['*companyMention'] || d.miniCompany || d['*miniCompany']) {
+        kind = 'company';
+        target = d.companyMention || d.miniCompany || null;
+      } else if (d.hyperlink || d.url) {
+        kind = 'link';
+      } else if (d.hashtag || d['*hashtag']) {
+        continue; // hashtags are read elsewhere
+      } else {
+        continue;
+      }
+      const id = (target && (target.publicIdentifier || target.universalName)) || '';
+      const url =
+        kind === 'link'
+          ? String((d.hyperlink && (d.hyperlink.url || d.hyperlink)) || d.url || '')
+          : kind === 'person' && id
+            ? U.profileUrl(id)
+            : kind === 'company' && id
+              ? `${ORIGIN}/company/${encodeURIComponent(id)}/`
+              : '';
+      const name = shown || (target && [textOf(target.firstName), textOf(target.lastName)].filter(Boolean).join(' ')) || textOf(target && target.name) || '';
+      if (!name && !url) continue;
+      const key = `${kind}|${name}|${url}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ kind, name, url: url || null });
+    }
+    return out;
   }
 
   function mapUpdate(node) {
@@ -1780,6 +1925,8 @@
       poll: pollFrom(node),
       repost: repostFrom(node),
       hashtags: hashtagsFrom(text),
+      mentions: mentionsFrom(node),
+      edited: !!(node.edited || (node.commentary && node.commentary.edited) || num(node.lastModifiedAt) || num(node.editedAt)),
       publishedAt: publishedAt || derived || null,
       timestampSource,
       reactions: social.reactions,
@@ -2359,6 +2506,49 @@
     return out;
   }
 
+  /**
+   * The contact-info overlay's embedded payload. The page carries a
+   * ProfileContactInfo entity — email, phone numbers, websites, Twitter
+   * handles, birthday, address — and reading only the rendered markup meant
+   * a redesign of the overlay lost all of it. Both are read and merged.
+   */
+  function contactFromPayload(pool) {
+    const out = {};
+    if (!pool) return out;
+    const isContact = (n) =>
+      n.emailAddress != null ||
+      Array.isArray(n.phoneNumbers) ||
+      Array.isArray(n.websites) ||
+      Array.isArray(n.twitterHandles) ||
+      n.birthDateOn != null ||
+      n.address != null ||
+      Array.isArray(n.ims);
+    for (const n of VY.collect(pool, isContact)) {
+      const email = n.emailAddress && (typeof n.emailAddress === 'object' ? n.emailAddress.emailAddress : n.emailAddress);
+      if (email && !out.email) out.email = String(email);
+      if (Array.isArray(n.phoneNumbers) && n.phoneNumbers.length && !out.phone) {
+        out.phone = n.phoneNumbers.map((ph) => (ph && (ph.number || ph.phoneNumber)) || textOf(ph)).filter(Boolean).join(', ');
+      }
+      if (Array.isArray(n.websites) && n.websites.length) {
+        const sites = n.websites.map((w) => (w && (w.url || w.website)) || textOf(w)).filter(Boolean);
+        out.websites = mergeById(out.websites, sites, (u) => String(u));
+      }
+      if (Array.isArray(n.twitterHandles) && n.twitterHandles.length && !out.twitter) {
+        out.twitter = n.twitterHandles.map((t) => (t && (t.name || t.handle)) || textOf(t)).filter(Boolean).join(', ');
+      }
+      if (Array.isArray(n.ims) && n.ims.length && !out.im) {
+        out.im = n.ims.map((im) => (im && im.id ? `${textOf(im.provider) || ''} ${im.id}`.trim() : textOf(im))).filter(Boolean).join(', ');
+      }
+      if (n.birthDateOn && !out.birthday) {
+        const b = n.birthDateOn;
+        out.birthday = b.month && MONTHS[b.month] ? `${MONTHS[b.month]} ${b.day || ''}`.trim() : textOf(b);
+      }
+      if (n.address && !out.address) out.address = textOf(n.address);
+      if (n.connectedAt && !out.connectedOn) out.connectedOn = new Date(Number(n.connectedAt)).toISOString().slice(0, 10);
+    }
+    return out;
+  }
+
   /** innerText where the page offers it, textContent otherwise. */
   function textOfNode(el) {
     try {
@@ -2399,10 +2589,16 @@
     { key: 'testScores',    path: 'test-scores',             map: entriesFromRows,    id: entryKey },
     { key: 'organizations', path: 'organizations',           map: entriesFromRows,    id: entryKey },
     { key: 'causes',        path: 'volunteering-causes',     map: entriesFromRows,    id: entryKey },
-    // LinkedIn splits recommendations into received and given behind one link;
-    // both render as rows on the same page, so one fetch covers the section.
-    { key: 'recommendations', path: 'recommendations',       map: entriesFromRows,    id: entryKey },
-    { key: 'interests',     path: 'interests',               map: entriesFromRows,    id: entryKey },
+    /*
+     * Two pages are tabbed, and a fetch returns only the default tab —
+     * recommendations received but not given, interests' top voices but not
+     * the companies, groups, newsletters or schools. Each tab is its own
+     * fetch, by index, and the rows say which tab they came from.
+     */
+    { key: 'recommendations', path: 'recommendations',       map: entriesFromRows,    id: entryKey,
+      tabs: [{ index: 0, label: 'received' }, { index: 1, label: 'given' }] },
+    { key: 'interests',     path: 'interests',               map: entriesFromRows,    id: entryKey,
+      tabs: [{ index: 0, label: 'top voices' }, { index: 1, label: 'companies' }, { index: 2, label: 'groups' }, { index: 3, label: 'newsletters' }, { index: 4, label: 'schools' }] },
     { key: 'featured',      path: 'featured',                map: entriesFromRows,    id: entryKey }
   ];
 
@@ -2498,11 +2694,19 @@
     if (!wanted.length) return profile;
     log('info', `Following ${wanted.length} "Show all" page(s) for the full profile history.`);
 
-    let added = 0;
+    // One fetch per page, or per tab of a tabbed page.
+    const fetches = [];
     for (const d of wanted) {
+      for (const tab of d.tabs || [null]) fetches.push({ d, tab });
+    }
+
+    let added = 0;
+    for (const { d, tab } of fetches) {
       if (S.stop) break;
       await waitWhilePaused();
-      const url = `${ORIGIN}/in/${encodeURIComponent(publicId)}/details/${d.path}/`;
+      const url =
+        `${ORIGIN}/in/${encodeURIComponent(publicId)}/details/${d.path}/` +
+        (tab ? `?detailScreenTabIndex=${tab.index}` : '');
       try {
         const html = await apiGet(url, { expectJson: false });
         let doc = null;
@@ -2527,7 +2731,9 @@
         if (!rows.length) continue;
 
         const before = (profile[d.key] || []).length;
-        profile[d.key] = mergeById(profile[d.key], d.map(rows), d.id);
+        const mapped = d.map(rows);
+        if (tab) for (const r of mapped) if (r && typeof r === 'object') r.tab = tab.label;
+        profile[d.key] = mergeById(profile[d.key], mapped, d.id);
         added += profile[d.key].length - before;
       } catch (err) {
         if (err instanceof Abort) throw err;
@@ -2549,7 +2755,14 @@
       try {
         const html = await apiGet(url, { expectJson: false });
         const doc = new DOMParser().parseFromString(html, 'text/html');
-        const contact = contactFromDoc(doc);
+        // Markup and payload, merged: the payload's fields win where both
+        // answer, because they are structured rather than read off a label.
+        const fromDoc = contactFromDoc(doc);
+        const fromPayload = contactFromPayload(mergePayloads(payloadsFromHtml(html)));
+        const contact = Object.assign({}, fromDoc, fromPayload);
+        if (Array.isArray(fromDoc.websites) || Array.isArray(fromPayload.websites)) {
+          contact.websites = mergeById(fromDoc.websites, fromPayload.websites, (u) => String(u));
+        }
         if (Object.keys(contact).length) {
           profile.contact = Object.assign({}, profile.contact || {}, contact);
           if (Array.isArray(contact.websites)) {
@@ -3901,13 +4114,31 @@
     }
 
     const r = reactionsFrom(c);
+    /*
+     * The body in either of LinkedIn's Comment shapes: the newer `commentary`
+     * (an attributed-text object) or the older `comment` (a values[] list).
+     * The actor of the newer shape is a `commenter` with a title.
+     */
+    const commenter = c.commenter && typeof c.commenter === 'object' ? c.commenter : null;
+    const cName = name || (commenter && (textOf(commenter.title) || textOf(commenter.name))) || '';
+    const cHeadline = textOf(author.occupation) || textOf(author.headline) || (commenter && textOf(commenter.subtitle)) || '';
+    const cUrl =
+      (publicId && U.profileUrl(publicId)) ||
+      (commenter && commenter.navigationUrl && /^https?:/i.test(commenter.navigationUrl) ? commenter.navigationUrl : null);
+    let replyCount = null;
+    for (const sd of collectContent(c, (n) => n.numComments != null, { skip: new Set(['replies']), limit: 1 })) {
+      replyCount = num(sd.numComments);
+    }
     return {
-      author: name,
-      headline: textOf(author.occupation) || textOf(author.headline) || '',
-      profileUrl: publicId ? U.profileUrl(publicId) : null,
-      text: textOf(c.comment) || textOf(c.commentV2) || textOf(c.message) || textOf(c.text) || '',
+      urn: c.entityUrn || c.urn || null,
+      parentUrn: c.parentCommentUrn || c['*parentComment'] || (c.parentComment && c.parentComment.entityUrn) || null,
+      author: cName,
+      headline: cHeadline,
+      profileUrl: cUrl,
+      text: textOf(c.commentary) || textOf(c.comment) || textOf(c.commentV2) || textOf(c.message) || textOf(c.text) || '',
       at,
-      reactions: r.total
+      reactions: r.total,
+      replyCount
     };
   }
 

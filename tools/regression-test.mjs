@@ -1043,16 +1043,19 @@ await checkAsync('the frames note records duration, interval and count', async (
  * ================================================================== */
 group('the packer sizes itself to the machine');
 
-await checkAsync('a small machine widens the frame interval and says so', async () => {
-  const { OS } = loadOffscreen(12, { deviceMemory: 2, hardwareConcurrency: 2 });
+await checkAsync('a small machine shares its frame budget and says so', async () => {
+  const { OS } = loadOffscreen(120, { deviceMemory: 2, hardwareConcurrency: 2 });
   eq(OS.MACHINE.tier, 'small');
   eq(OS.MACHINE.fetchConcurrency, 1, 'one CDN fetch at a time');
   eq(OS.FRAMES.MAX_EDGE, 720, 'smaller stills');
+  // 600 stills across 30 videos is 30 each — well under a two-minute video
+  // at one a second, so the step widens to spread them across its length.
+  eq(OS.shareFrameBudget(30), 30);
   const at = [];
   const r = await OS.extractFrames({ size: 1 }, 1, (f) => at.push(f.at));
-  // Asked for one a second; the machine floor is four.
   eq(r.step, 4);
-  eq(at, [0, 4, 8]);
+  eq(r.count, 30);
+  eq(at.slice(0, 3), [0, 4, 8]);
   const note = OS.framesReadme({ path: 'a/video_01.mp4', video: { intervalSec: 1 } }, r);
   ok(/Interval\s+: 4s \(asked for 1s; widened for this machine\)/.test(note), 'frames.txt explains the widening');
 });
@@ -1066,21 +1069,23 @@ await checkAsync('a roomy machine keeps the interval it was asked for', async ()
   eq(r.count, 5);
 });
 
-await checkAsync('the whole export has a frame ceiling, and frames.txt names it', async () => {
+await checkAsync('the frame budget is shared fairly, not first-come', async () => {
   const { OS } = loadOffscreen(1000, { deviceMemory: 2, hardwareConcurrency: 2 });
-  // 1000 s at a 4 s step is 250 frames per video; the small ceiling is 600,
-  // so the third video is where it bites.
+  // Three long videos on a 600-still budget: 200 each, and every one of
+  // them gets its share. First-come gave the first three everything and the
+  // rest an empty folder.
+  eq(OS.shareFrameBudget(3), 200);
   let total = 0;
   const results = [];
-  for (let i = 0; i < 3; i++) {
-    const r = await OS.extractFrames({ size: 1 }, 1, () => total++);
-    results.push(r);
-  }
-  eq(total, 600, 'no more than the ceiling across the export');
-  ok(!results[0].exportCapped && !results[1].exportCapped, 'the first two ran to their own length');
-  ok(results[2].exportCapped, 'the third hit the archive ceiling');
-  eq(results[2].count, 100);
-  const note = OS.framesReadme({ path: 'a/video_03.mp4', video: { intervalSec: 1 } }, results[2]);
+  for (let i = 0; i < 3; i++) results.push(await OS.extractFrames({ size: 1 }, 1, () => total++));
+  eq(results.map((r) => r.count), [200, 200, 200], 'each video gets its share');
+  eq(total, 600, 'and together they meet the ceiling exactly');
+  ok(results.every((r) => !r.exportCapped), 'finishing on the ceiling is not being cut by it');
+  // A fourth video the worker did not count is the one that gets cut.
+  const extra = await OS.extractFrames({ size: 1 }, 1, () => total++);
+  eq(extra.count, 0);
+  ok(extra.exportCapped, 'and says so');
+  const note = OS.framesReadme({ path: 'a/video_04.mp4', video: { intervalSec: 1 } }, extra);
   ok(/600-frame ceiling for a 2 GB machine/.test(note), 'and the note says which ceiling');
 });
 
@@ -1181,9 +1186,14 @@ check('the worker drops the post from its failure list', () => {
 group('archive path collisions');
 
 check('documents are numbered like every other media kind', () => {
+  // The counter lives where every media file is named, so the archive and
+  // metadata.txt cannot disagree about it.
+  const naming = BG_SRC.slice(BG_SRC.indexOf('function mediaFileNames'), BG_SRC.indexOf('function zipEntries'));
+  ok(/let docNo = 0;/.test(naming), 'a counter exists');
   const body = BG_SRC.slice(BG_SRC.indexOf('function zipEntries'));
-  ok(/let docNo = 0;/.test(body), 'a counter exists');
   ok(!/`\$\{folder\}\/document\.txt`/.test(body), 'the fixed path is what collided');
+  ok(/mediaFileNames\(post\)/.test(body), 'and the archive asks the helper');
+  ok(/mediaFileNames\(post\)/.test(BG_SRC.slice(BG_SRC.indexOf('function metadataFileText'), BG_SRC.indexOf('function commentsFileText'))), 'so does metadata.txt');
 });
 
 check('a final pass guarantees every path is unique', () => {

@@ -1871,7 +1871,8 @@
             : kind === 'company' && id
               ? `${ORIGIN}/company/${encodeURIComponent(id)}/`
               : '';
-      const name = shown || (target && [textOf(target.firstName), textOf(target.lastName)].filter(Boolean).join(' ')) || textOf(target && target.name) || '';
+      // The span covers the name; if a shape ever includes the @, drop it.
+      const name = (shown || (target && [textOf(target.firstName), textOf(target.lastName)].filter(Boolean).join(' ')) || textOf(target && target.name) || '').replace(/^@/, '').trim();
       if (!name && !url) continue;
       const key = `${kind}|${name}|${url}`;
       if (seen.has(key)) continue;
@@ -4803,6 +4804,13 @@
       readCard,
       readCounts,
       expandSeeMore,
+      // The rewritten payload mappers, pure and therefore testable here.
+      contactFromPayload,
+      mentionsFrom,
+      reactionsFrom,
+      postTextFrom,
+      pronounText,
+      mapComment,
       linkedDetailPages,
       rowsFrom,
       componentRows,

@@ -830,6 +830,103 @@ check('a role with no resolvable company is still a role', () => {
 });
 
 /* ================================================================== */
+/* ================================================================== */
+group('the rewritten mappers');
+
+check('a post keeps its own words when it reshares a longer one', () => {
+  const t = E.postTextFrom({
+    commentary: { text: 'Worth a read.' },
+    resharedUpdate: { commentary: { text: 'A very long original post that goes on and on and on and on and on.' } }
+  });
+  eq(t, 'Worth a read.');
+});
+
+check('a post with no commentary of its own still finds its text, but not the reshare', () => {
+  const t = E.postTextFrom({
+    content: { description: { text: 'An article summary' } },
+    resharedUpdate: { commentary: { text: 'Somebody else wrote this, at length, and it is the longest string here.' } }
+  });
+  eq(t, 'An article summary');
+});
+
+check('the reaction breakdown comes from the post, not the sum of every nested one', () => {
+  const r = E.reactionsFrom({
+    socialDetail: { reactionTypeCounts: [{ reactionType: 'LIKE', count: 10 }, { reactionType: 'PRAISE', count: 2 }], numLikes: 12 },
+    resharedUpdate: { socialDetail: { reactionTypeCounts: [{ reactionType: 'LIKE', count: 900 }], numLikes: 900 } },
+    comments: [{ socialDetail: { reactionTypeCounts: [{ reactionType: 'LIKE', count: 5 }], numLikes: 5 } }]
+  });
+  eq(r.total, 12);
+  eq(r.byType, { LIKE: 10, PRAISE: 2 });
+});
+
+check('@mentions carry the profile they point at', () => {
+  const text = 'Thanks @Ada Lovelace and Acme Corp for this';
+  const m = E.mentionsFrom({
+    commentary: {
+      text: {
+        text,
+        attributesV2: [
+          // LinkedIn's span covers the name, not the @ it was typed with.
+          { start: 8, length: 12, detailData: { profileMention: { publicIdentifier: 'ada-l', firstName: 'Ada', lastName: 'Lovelace' } } },
+          { start: 25, length: 9, detailData: { companyMention: { universalName: 'acme' } } },
+          { start: 0, length: 6, detailData: { hashtag: { text: '#x' } } }
+        ]
+      }
+    }
+  });
+  eq(m, [
+    { kind: 'person', name: 'Ada Lovelace', url: 'https://www.linkedin.com/in/ada-l/' },
+    { kind: 'company', name: 'Acme Corp', url: 'https://www.linkedin.com/company/acme/' }
+  ]);
+});
+
+check('a comment body in the values[] shape is read, and the newer commentary shape too', () => {
+  const older = E.mapComment({ comment: { values: [{ value: 'Great ' }, { value: 'post!' }] }, commenter: { title: { text: 'Bo' } } });
+  eq(older.text, 'Great post!');
+  eq(older.author, 'Bo');
+  const newer = E.mapComment({ commentary: { text: 'Agreed.' }, entityUrn: 'urn:li:comment:1', parentCommentUrn: 'urn:li:comment:0', socialDetail: { numComments: 2 } });
+  eq(newer.text, 'Agreed.');
+  eq(newer.urn, 'urn:li:comment:1');
+  eq(newer.parentUrn, 'urn:li:comment:0');
+  eq(newer.replyCount, 2);
+});
+
+check('images carry their alt text', () => {
+  const imgs = E.imagesFrom({
+    images: [{
+      accessibilityText: 'A chart of growth',
+      attributes: [{ detailData: { vectorImage: { rootUrl: 'https://media.licdn.com/dms/image/B/', artifacts: [{ fileIdentifyingUrlPathSegment: '800/b.jpg', width: 800 }] } } }]
+    }]
+  });
+  eq(imgs, [{ type: 'image', url: 'https://media.licdn.com/dms/image/B/800/b.jpg', alt: 'A chart of growth' }]);
+});
+
+check('the contact overlay payload is read', () => {
+  const c = E.contactFromPayload({
+    included: [{
+      $type: 'com.linkedin.voyager.identity.profile.ProfileContactInfo',
+      emailAddress: { emailAddress: 'ada@example.com' },
+      phoneNumbers: [{ number: '+44 20 7946 0000', type: 'MOBILE' }],
+      websites: [{ url: 'https://ada.example', category: 'PERSONAL' }, { url: 'https://engines.example' }],
+      twitterHandles: [{ name: 'ada' }],
+      birthDateOn: { month: 12, day: 10 },
+      address: '12 Analytical Row'
+    }]
+  });
+  eq(c.email, 'ada@example.com');
+  eq(c.phone, '+44 20 7946 0000');
+  eq(c.websites, ['https://ada.example', 'https://engines.example']);
+  eq(c.twitter, 'ada');
+  eq(c.birthday, 'Dec 10');
+  eq(c.address, '12 Analytical Row');
+});
+
+check('the pronoun enum reads as words', () => {
+  eq(E.pronounText('SHE_HER'), 'she/her');
+  eq(E.pronounText({ text: 'THEY_THEM' }), 'they/them');
+  eq(E.pronounText(''), '');
+});
+
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
 
 /*

@@ -130,7 +130,25 @@ const VARIANTS = {
   // The anchor ids are locale-independent; the headings are not. With no
   // anchors at all, a French interface still has to be readable.
   'V9 French headings, no anchor ids': (F) => head(F.name, F.headline) +
-    headingOnly('Expérience', ul(F.exp, ariaPair)) + headingOnly('Formation', ul(F.edu, ariaPair)) + headingOnly('Compétences', ul(F.skills.map((s) => [s]), ariaPair)) + tail
+    headingOnly('Expérience', ul(F.exp, ariaPair)) + headingOnly('Formation', ul(F.edu, ariaPair)) + headingOnly('Compétences', ul(F.skills.map((s) => [s]), ariaPair)) + tail,
+
+  // Everything a top card can carry — and, below it, a section full of links
+  // that belong to posts and past employers, none of which is the profile's.
+  'V10 a full top card, with a linky section beneath it': (F) => `<!doctype html><html><head><meta charset="utf-8"></head><body><nav id="global-nav"><img src="https://media.licdn.com/dms/image/v2/D56/profile-displayphoto-shrink_100_100/0/99?e=1" alt="Viewer"></nav><main>
+<section class="pv-top-card">
+  <img class="pv-top-card-profile-picture__image--show" src="https://media.licdn.com/dms/image/v2/D56/profile-displayphoto-shrink_400_400/0/17?e=1" alt="${F.name}">
+  <img src="https://media.licdn.com/dms/image/v2/D56/profile-framedphoto-shrink_400_400/0/18?e=1" alt="${F.name}, #OPEN_TO_WORK">
+  <h1 class="text-heading-xlarge">${F.name}</h1><span class="text-body-small">(she/her)</span>
+  <svg data-test-icon="verified-small"></svg>
+  <div class="text-body-medium break-words">${F.headline}</div>
+  <a href="https://www.linkedin.com/company/content-daddy/">Content Daddy</a>
+  <a href="https://www.linkedin.com/school/calcutta/">University of Calcutta</a>
+  <a href="https://contentdaddy.example/">contentdaddy.example</a>
+  <ul><li><span class="t-bold">18,432 followers</span></li><li><span class="t-bold">500+ connections</span></li></ul>
+</section>
+${anchored('experience', ul(F.exp, ariaPair))}${anchored('education', ul(F.edu, ariaPair))}${anchored('skills', ul(F.skills.map((s) => [s]), ariaPair))}
+<section><h2>Activity</h2><a href="https://www.linkedin.com/company/old-employer/">Old Employer</a><a href="https://somebodyelse.example/post/1">a post link</a><a href="https://another.example/">another</a></section>
+</main></body></html>`
 };
 
   return { FACTS, VARIANTS };
@@ -143,9 +161,16 @@ async function profileShapes(browser) {
     const r = await page.evaluate(() => {
       const p = globalThis.__LIS_TEST__.profileFromDom('sumon', document);
       const e0 = (p.experience || [])[0] || {};
-      return { name: p.fullName, exp: (p.experience || []).length, edu: (p.education || []).length, skills: (p.skills || []).length, first: `${e0.title || '?'} @ ${e0.company || '?'}` };
+      return { name: p.fullName, exp: (p.experience || []).length, edu: (p.education || []).length, skills: (p.skills || []).length, first: `${e0.title || '?'} @ ${e0.company || '?'}`,
+               pronouns: p.pronouns, verified: p.verified, openTo: p.openTo, company: p.currentCompany, school: p.currentSchool, websites: p.websites, photo: p.photoUrl };
     });
-    const ok = r.name === FACTS.name && r.exp === 3 && r.edu === 2 && r.skills === 3 && r.first === 'Founder @ Content Daddy';
+    let ok = r.name === FACTS.name && r.exp === 3 && r.edu === 2 && r.skills === 3 && r.first === 'Founder @ Content Daddy';
+    if (label.startsWith('V10')) {
+      // The card's own facts, and none of the section-below's links.
+      ok = ok && r.pronouns === 'she/her' && r.verified === true && r.openTo === 'Open to work' && r.company === 'Content Daddy' && r.school === 'University of Calcutta'
+        && JSON.stringify(r.websites) === JSON.stringify(['https://contentdaddy.example/'])
+        && /profile-displayphoto-shrink_400_400\/0\/17/.test(r.photo || '');
+    }
     report(label, ok, ok ? '' : JSON.stringify(r));
     await page.close();
   }

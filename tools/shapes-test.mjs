@@ -125,7 +125,12 @@ const VARIANTS = {
     anchored('experience', ul(F.exp, hiddenFirst)) + anchored('education', ul(F.edu, hiddenFirst)) + anchored('skills', ul(F.skills.map((s) => [s]), hiddenFirst)) + tail,
 
   'V8 no spans at all — text in divs': (F) => head(F.name, F.headline) +
-    anchored('experience', ul(F.exp, bareText)) + anchored('education', ul(F.edu, bareText)) + anchored('skills', ul(F.skills.map((s) => [s]), bareText)) + tail
+    anchored('experience', ul(F.exp, bareText)) + anchored('education', ul(F.edu, bareText)) + anchored('skills', ul(F.skills.map((s) => [s]), bareText)) + tail,
+
+  // The anchor ids are locale-independent; the headings are not. With no
+  // anchors at all, a French interface still has to be readable.
+  'V9 French headings, no anchor ids': (F) => head(F.name, F.headline) +
+    headingOnly('Expérience', ul(F.exp, ariaPair)) + headingOnly('Formation', ul(F.edu, ariaPair)) + headingOnly('Compétences', ul(F.skills.map((s) => [s]), ariaPair)) + tail
 };
 
   return { FACTS, VARIANTS };
@@ -205,9 +210,10 @@ async function detailShapes(browser) {
 }
 
 /* ---------------- one feed card, eight ways ---------------- */
-const { TEXT, FEED_VARIANTS } = (() => {
+const { TEXT, TEXT9, FEED_VARIANTS } = (() => {
 const URN = 'urn:li:activity:7100000000000000001';
 const TEXT = 'Post number 1 about repurposing podcast footage into a month of clips.';
+const TEXT9 = 'If you want to see more of this, say so — see more posts like it every week.';
 const IMG = 'https://media.licdn.com/dms/image/v2/D56/feedshare-shrink_800/0/17?e=1';
 const wrap = (inner) => `<!doctype html><html><body><nav id="global-nav"></nav><main>${inner}</main></body></html>`;
 const social = `<div class="social-details-social-counts"><button aria-label="1,234 reactions"><span>1,234</span></button><button aria-label="56 comments">56 comments</button><button aria-label="7 reposts">7 reposts</button></div>`;
@@ -235,10 +241,15 @@ const FEED_VARIANTS = {
     wrap(`<div data-urn="${URN}"><div class="update-components-text">${TEXT}</div><img src="${IMG}"><div class="social-details-social-counts"><span class="social-details-social-counts__reactions-count">1,234</span><span class="social-details-social-counts__comments">56 comments</span><span class="social-details-social-counts__reposts">7 reposts</span></div></div>`),
 
   'F8 image as CSS background, not <img>':
-    wrap(`<div data-urn="${URN}"><div class="update-components-text">${TEXT}</div><div class="update-components-image__image" style="background-image:url(&quot;${IMG}&quot;)"></div>${social}</div>`)
+    wrap(`<div data-urn="${URN}"><div class="update-components-text">${TEXT}</div><div class="update-components-image__image" style="background-image:url(&quot;${IMG}&quot;)"></div>${social}</div>`),
+
+  // The post itself says "see more". Removing the button's text by first
+  // occurrence would cut the post; only the trailing button may go.
+  'F9 the post text itself contains "see more"':
+    wrap(`<div data-urn="${URN}"><div class="update-components-text"><span dir="ltr" id="tt9">${TEXT9}</span><button class="feed-shared-inline-show-more-text__see-more-less-toggle">see less</button></div><img src="${IMG}">${social}</div>`)
 };
 
-  return { TEXT, FEED_VARIANTS };
+  return { TEXT, TEXT9, FEED_VARIANTS };
 })();
 
 async function feedShapes(browser) {
@@ -255,7 +266,9 @@ async function feedShapes(browser) {
     const counts = r.reactions === 1234 && r.comments === 56 && r.reposts === 7;
     const ok = label.startsWith('F6')
       ? r.n === 1 && r.type === 'repost' && r.text === '' && r.media === 0 && r.repostText === TEXT && r.repostMedia === 1 && counts
-      : r.n === 1 && r.id === '7100000000000000001' && r.text === TEXT && r.media === 1 && counts && !r.truncated;
+      : label.startsWith('F9')
+        ? r.n === 1 && r.text === TEXT9 && r.media === 1 && counts && !r.truncated
+        : r.n === 1 && r.id === '7100000000000000001' && r.text === TEXT && r.media === 1 && counts && !r.truncated;
     report(label, ok, ok ? '' : JSON.stringify(r));
     await page.close();
   }

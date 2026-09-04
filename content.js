@@ -2263,11 +2263,7 @@
       'span.text-body-small:not(.inline-show-more-text)'
     ]);
 
-    const about = pick([
-      '#about ~ div .inline-show-more-text',
-      'section:has(#about) .display-flex.full-width span[aria-hidden="true"]',
-      '[data-section="summary"]'
-    ]);
+    const about = aboutText(d);
 
     /*
      * The avatar and cover, by CDN path. `main` first so a commenter's or a
@@ -2344,6 +2340,43 @@
       scrapedAt: new Date().toISOString(),
       source: 'dom'
     });
+  }
+
+  /**
+   * The About text, once.
+   *
+   * LinkedIn's About card holds the visible copy in an aria-hidden span, a
+   * screen-reader twin beside it, and the "…see more" toggle — and reading
+   * the container's textContent returned all three glued together: the
+   * paragraph twice, with the button's label on the end.
+   */
+  function aboutText(d) {
+    let box = null;
+    for (const sel of ['#about ~ div .inline-show-more-text', 'section:has(#about) .inline-show-more-text', '#about ~ div', 'section:has(#about)', '[data-section="summary"]']) {
+      try {
+        box = d.querySelector(sel);
+      } catch (_) {
+        box = null;
+      }
+      if (box) break;
+    }
+    if (!box) return '';
+    const clean = (t) => String(t || '').replace(SEE_MORE_RE, '').replace(/[ \t]+\n/g, '\n').trim();
+    const aria = safeQueryAll(box, 'span[aria-hidden="true"]').map((el) => el.textContent).filter((t) => t && t.trim());
+    if (aria.length) return clean(aria.map((t) => t.trim()).join('\n'));
+    const hidden = safeQueryAll(box, '.visually-hidden').map((el) => el.textContent).filter((t) => t && t.trim());
+    if (hidden.length) return clean(hidden.map((t) => t.trim()).join('\n'));
+    let t = String(box.innerText || box.textContent || '');
+    for (const b of safeQueryAll(box, 'button')) {
+      const bt = String(b.textContent || '').trim();
+      const at = bt ? t.lastIndexOf(bt) : -1;
+      if (at >= 0) t = t.slice(0, at) + t.slice(at + bt.length);
+    }
+    t = clean(t);
+    // The same paragraph twice, back to back, is the visible copy and its twin.
+    const half = Math.floor(t.length / 2);
+    if (t.length > 20 && t.slice(0, half).trim() === t.slice(half).trim()) t = t.slice(0, half).trim();
+    return t;
   }
 
   /**
@@ -2641,9 +2674,51 @@
    */
   function componentRows(pool) {
     const out = [];
+    const consumed = new Set();
+    const fourOf = (c) =>
+      [textOf(c.titleV2) || textOf(c.title), textOf(c.subtitle), textOf(c.caption), textOf(c.metadata)].map((v) => v || '');
+    const trim = (spans) => {
+      while (spans.length && !spans[spans.length - 1]) spans.pop();
+      return spans;
+    };
     for (const n of VY.collect(pool, (x) => !!x.entityComponent || (x.components && x.components.entityComponent))) {
       const c = n.entityComponent || (n.components && n.components.entityComponent);
-      if (!c || typeof c !== 'object') continue;
+      if (!c || typeof c !== 'object' || consumed.has(c)) continue;
+      /*
+       * A grouped company in the payload: the header component names the
+       * company on its title and carries the roles as nested components in
+       * subComponents, each with only its employment type for a subtitle.
+       * Read flat, the header became a role called "Content Daddy" and every
+       * role beneath it lost its company. Same rule as the markup: a header
+       * whose children carry date ranges is a group.
+       */
+      const kids = c.subComponents
+        ? VY.collect(c.subComponents, (x) => !!x.entityComponent || (x.components && x.components.entityComponent))
+            .map((k) => k.entityComponent || (k.components && k.components.entityComponent))
+            .filter((k) => k && typeof k === 'object')
+        : [];
+      const head = fourOf(c);
+      const roleKids = kids.filter((k) => {
+        const sp = fourOf(k);
+        return isDateRange(sp[1]) || isDateRange(sp[2]);
+      });
+      if (roleKids.length && !isDateRange(head[1]) && !isDateRange(head[2])) {
+        const company = head[0];
+        for (const k of kids) {
+          consumed.add(k);
+          const sp = fourOf(k);
+          if (!roleKids.includes(k)) continue;
+          const second = sp[1] || '';
+          const names = second && second.split('·')[0].trim().toLowerCase() === company.toLowerCase();
+          if (company && !names) {
+            const type = second && !looksLikeDateRange(second) ? second : '';
+            sp.splice(1, type ? 1 : 0, type ? `${company} · ${type}` : company);
+          }
+          const spans = trim(sp);
+          if (spans.length) out.push(spans);
+        }
+        continue;
+      }
       /*
        * Positions preserved, not compacted.
        *
@@ -2654,13 +2729,13 @@
        * filed as the company and `current` computed from the location.
        * Only trailing blanks go, so `spans.slice(3)` stays clean.
        */
-      const spans = [
-        textOf(c.titleV2) || textOf(c.title),
-        textOf(c.subtitle),
-        textOf(c.caption),
-        textOf(c.metadata)
-      ].map((v) => v || '');
-      while (spans.length && !spans[spans.length - 1]) spans.pop();
+      const spans = trim(fourOf(c));
+      // Whatever else the component nests — a Skills line, a description —
+      // belongs to it, not to a row of its own.
+      for (const k of kids) {
+        consumed.add(k);
+        for (const t of trim(fourOf(k))) if (t) spans.push(t);
+      }
       if (spans.length) out.push(spans);
     }
     return out;
@@ -3729,14 +3804,27 @@
   }
 
   /** Content images and videos under a card, however the markup carries them. */
+  /** A video's cover image, by CDN path — not a picture the post attached. */
+  const POSTER_PATH = /videocover|video-thumbnail|videothumbnail|\/vid\//i;
+
   function cardMedia(card, exclude) {
     const media = [];
     const seenUrl = new Set();
+    const posters = [];
     const addImage = (src, alt) => {
       if (!src || !/licdn\.com\/dms\/image/.test(src)) return;
       if (NON_CONTENT_IMAGE.test(src)) return;
       if (seenUrl.has(src)) return;
       seenUrl.add(src);
+      /*
+       * video.js renders the poster as its own element beside the <video>
+       * rather than as the poster attribute, and by path it is a video
+       * cover, not a picture the post attached. Kept for the video below.
+       */
+      if (POSTER_PATH.test(src)) {
+        posters.push(src);
+        return;
+      }
       media.push({ type: 'image', url: src, alt: alt || '' });
     };
     for (const img of safeQueryAll(card, 'img')) {
@@ -3759,10 +3847,20 @@
      * data-sources attribute — the only place a progressive URL is visible
      * from the DOM at all.
      */
+    // The poster element video.js draws, when it is not on the <video> itself.
+    for (const el of safeQueryAll(card, '.vjs-poster, [class*="poster"]')) {
+      if (exclude && exclude.contains(el)) continue;
+      const img = el.tagName === 'IMG' ? el : el.querySelector ? el.querySelector('img') : null;
+      const src = (img && (img.currentSrc || img.src || img.getAttribute('data-delayed-url'))) || '';
+      const m = String(el.getAttribute('style') || '').match(/url\((['"]?)(.*?)\1\)/i);
+      const url = src || (m ? m[2].replace(/&quot;/g, '') : '');
+      if (url && /licdn\.com/.test(url) && !posters.includes(url)) posters.push(url);
+    }
+    let videoNo = 0;
     for (const v of safeQueryAll(card, 'video,[data-sources]')) {
       if (exclude && exclude.contains(v)) continue;
       const raw = v.getAttribute('data-sources');
-      const poster = v.getAttribute('poster') || v.getAttribute('data-poster-url') || '';
+      const poster = v.getAttribute('poster') || v.getAttribute('data-poster-url') || posters[videoNo++] || '';
       if (raw) {
         try {
           for (const sSrc of JSON.parse(raw)) {

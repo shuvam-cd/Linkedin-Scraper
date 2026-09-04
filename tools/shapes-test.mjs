@@ -53,7 +53,8 @@ const report = (label, ok, detail) => {
 };
 
 /* ---------------- one profile, eight ways ---------------- */
-const { FACTS, VARIANTS } = (() => {
+const { FACTS, VARIANTS, ABOUT } = (() => {
+const ABOUT = 'I help founders turn one podcast episode into a month of clips. Ten years in video, three in growth.';
 const FACTS = {
   name: 'Sumon Chowdhury',
   headline: 'Podcast growth partner for founders',
@@ -160,6 +161,12 @@ const VARIANTS = {
     return head(F.name, F.headline) + anchored('experience', `<ul>${rows}</ul>`) + anchored('education', ul(F.edu, bareText)) + anchored('skills', ul(F.skills.map((s) => [s]), bareText)) + tail;
   },
 
+  // The About card as rendered: the visible copy in an aria-hidden span, its
+  // screen-reader twin, and the "…see more" toggle, all in one container.
+  'V13 About card with aria twin and see-more': (F) => head(F.name, F.headline) +
+    `<section class="artdeco-card pv-profile-card"><div id="about"></div><div class="display-flex"><div class="inline-show-more-text"><span aria-hidden="true">${ABOUT}</span><span class="visually-hidden">${ABOUT}</span><button class="inline-show-more-text__button">…see more</button></div></div></section>` +
+    anchored('experience', ul(F.exp, ariaPair)) + anchored('education', ul(F.edu, ariaPair)) + anchored('skills', ul(F.skills.map((s) => [s]), ariaPair)) + tail,
+
   // Everything a top card can carry — and, below it, a section full of links
   // that belong to posts and past employers, none of which is the profile's.
   'V10 a full top card, with a linky section beneath it': (F) => `<!doctype html><html><head><meta charset="utf-8"></head><body><nav id="global-nav"><img src="https://media.licdn.com/dms/image/v2/D56/profile-displayphoto-shrink_100_100/0/99?e=1" alt="Viewer"></nav><main>
@@ -179,7 +186,7 @@ ${anchored('experience', ul(F.exp, ariaPair))}${anchored('education', ul(F.edu, 
 </main></body></html>`
 };
 
-  return { FACTS, VARIANTS };
+  return { FACTS, VARIANTS, ABOUT };
 })();
 
 async function profileShapes(browser) {
@@ -191,7 +198,7 @@ async function profileShapes(browser) {
       const e0 = (p.experience || [])[0] || {};
       return { name: p.fullName, exp: (p.experience || []).length, edu: (p.education || []).length, skills: (p.skills || []).length, first: `${e0.title || '?'} @ ${e0.company || '?'}`,
                roles: (p.experience || []).map((e) => `${e.title} @ ${e.company}`), firstSkills: e0.skills || [], firstDescription: e0.description || '',
-               skillNames: p.skills || [], grade: ((p.education || [])[0] || {}).grade || '',
+               skillNames: p.skills || [], grade: ((p.education || [])[0] || {}).grade || '', about: p.about || '',
                pronouns: p.pronouns, verified: p.verified, openTo: p.openTo, company: p.currentCompany, school: p.currentSchool, websites: p.websites, photo: p.photoUrl };
     });
     let ok = r.name === FACTS.name && r.exp === 3 && r.edu === 2 && r.skills === 3 && r.first === 'Founder @ Content Daddy';
@@ -201,6 +208,7 @@ async function profileShapes(browser) {
       ok = ok && r.roles.includes('Junior Editor @ Studio Nine') && !r.roles.some((x) => /^Studio Nine @|Skills:|endorsements/.test(x))
         && r.firstSkills.join('|') === 'Editing|Strategy' && r.skillNames.join('|') === FACTS.skills.join('|') && r.grade === 'First';
     }
+    if (label.startsWith('V13')) ok = ok && r.about === ABOUT;
     if (label.startsWith('V12')) {
       ok = ok && r.firstSkills.join('|') === 'Editing|Strategy' && r.firstDescription === '';
     }
@@ -244,6 +252,20 @@ const DETAIL_VARIANTS = {
       <ul><li>${ariaPair('Junior Editor')}${ariaPair('Full-time')}${ariaPair('Jun 2017 - Feb 2019 · 1 yr 9 mos')}${ariaPair('Kolkata, India')}</li>
           <li>${ariaPair('Intern')}${ariaPair('Internship')}${ariaPair('Jan 2017 - May 2017 · 5 mos')}${ariaPair('Kolkata, India')}</li></ul>
     </li></ul>`),
+  // The payload's grouped company: the header names the company on its
+  // title and nests the roles in subComponents with only their employment
+  // type for a subtitle.
+  'D7 payload with positions grouped under a company': wrap('<ul></ul>' + `<code style="display:none">${JSON.stringify({ included: [
+    { entityUrn: 'urn:li:fsd_profilePositionGroup:1', components: { entityComponent: {
+      titleV2: { text: 'Studio Nine' }, subtitle: { text: 'Full-time · 2 yrs 2 mos' }, caption: null, metadata: null,
+      subComponents: { components: [
+        { components: { entityComponent: { titleV2: { text: 'Junior Editor' }, subtitle: { text: 'Full-time' }, caption: { text: 'Jun 2017 - Feb 2019 · 1 yr 9 mos' }, metadata: { text: 'Kolkata, India' } } } },
+        { components: { entityComponent: { titleV2: { text: 'Intern' }, subtitle: { text: 'Internship' }, caption: { text: 'Jan 2017 - May 2017 · 5 mos' }, metadata: { text: 'Kolkata, India' } } } }
+      ] } } } },
+    { entityUrn: 'urn:li:fsd_profilePosition:2', components: { entityComponent: { titleV2: { text: 'Founder' }, subtitle: { text: 'Content Daddy · Full-time' }, caption: { text: 'Jan 2023 - Present · 2 yrs' }, metadata: { text: 'Kolkata, India' } } } },
+    { entityUrn: 'urn:li:fsd_profilePosition:3', components: { entityComponent: { titleV2: { text: 'Video Editor' }, subtitle: { text: 'Freelance · Self-employed' }, caption: { text: 'Mar 2019 - Dec 2022 · 3 yrs 10 mos' }, metadata: { text: 'Remote' } } } }
+  ] })}</code>`),
+
   'D6 rows with a description paragraph and skills line': wrap(`<ul>${ROLES.map((r) => `<li>${r.map(ariaPair).join('')}${ariaPair('Built the studio from zero to a team of six.')}${ariaPair('Skills: Editing · Strategy')}</li>`).join('')}</ul>`)
 };
 
@@ -274,11 +296,13 @@ async function detailShapes(browser) {
 }
 
 /* ---------------- one feed card, eight ways ---------------- */
-const { TEXT, TEXT9, TEXT10, FEED_VARIANTS } = (() => {
+const { TEXT, TEXT9, TEXT10, MP4, POSTER, FEED_VARIANTS } = (() => {
 const URN = 'urn:li:activity:7100000000000000001';
 const TEXT = 'Post number 1 about repurposing podcast footage into a month of clips.';
 const TEXT9 = 'If you want to see more of this, say so — see more posts like it every week.';
 const TEXT10 = 'We got 3 comments on the first draft and 900 reposts on the second — here is what changed.';
+const MP4 = 'https://dms.licdn.com/playlist/vid/v2/D5605AQ/mp4-720p-30fp-crf28/0/1700000000000?e=1';
+const POSTER = 'https://media.licdn.com/dms/image/v2/D5605AQ/videocover-low/0/1700000000000?e=1';
 const IMG = 'https://media.licdn.com/dms/image/v2/D56/feedshare-shrink_800/0/17?e=1';
 const wrap = (inner) => `<!doctype html><html><body><nav id="global-nav"></nav><main>${inner}</main></body></html>`;
 const social = `<div class="social-details-social-counts"><button aria-label="1,234 reactions"><span>1,234</span></button><button aria-label="56 comments">56 comments</button><button aria-label="7 reposts">7 reposts</button></div>`;
@@ -316,11 +340,20 @@ const FEED_VARIANTS = {
   'F10 same-URN holder and inner card, a comment URN, a body that says "3 comments"':
     wrap(`<div data-id="${URN}"><div class="feed-shared-update-v2" data-urn="${URN}"><div class="update-components-text">${TEXT10}</div><img src="${IMG}"><div class="social-details-social-counts"><button aria-label="1,234 reactions">1,234</button><button aria-label="56 comments">56 comments</button></div><div class="comments-comments-list"><article data-id="urn:li:comment:(${URN},7777)"><span>Nice — 3 comments already</span></article></div></div></div>`),
 
+  // video.js: the poster is its own element beside the <video>, the sources
+  // ride on video.vjs-tech, and there is no poster attribute at all.
+  'F11 video.js player: poster beside the video, not on it':
+    wrap(`<div data-urn="${URN}"><div class="update-components-text">${TEXT}</div><div class="video-js"><div class="vjs-poster" style="background-image:url(&quot;${POSTER}&quot;)"></div><video class="vjs-tech" data-sources='[{"src":"${MP4}","type":"video/mp4"}]'></video></div>${social}</div>`),
+
+  // A comment preview inside the card: its avatar and its words are not the post's.
+  'F12 a comment preview inside the card':
+    wrap(`<div data-urn="${URN}"><div class="update-components-text">${TEXT}</div><img src="${IMG}">${social}<div class="comments-comments-list"><article><img src="https://media.licdn.com/dms/image/v2/D56/profile-displayphoto-shrink_100_100/0/5?e=1"><span dir="ltr">This is a much longer comment than the post itself, written by somebody else entirely, going on and on.</span></article></div></div>`),
+
   'F9 the post text itself contains "see more"':
     wrap(`<div data-urn="${URN}"><div class="update-components-text"><span dir="ltr" id="tt9">${TEXT9}</span><button class="feed-shared-inline-show-more-text__see-more-less-toggle">see less</button></div><img src="${IMG}">${social}</div>`)
 };
 
-  return { TEXT, TEXT9, TEXT10, FEED_VARIANTS };
+  return { TEXT, TEXT9, TEXT10, MP4, POSTER, FEED_VARIANTS };
 })();
 
 async function feedShapes(browser) {
@@ -332,14 +365,17 @@ async function feedShapes(browser) {
       T.expandSeeMore();
       const cards = T.harvestFeedCards();
       const c = cards[0] || {};
-      return { n: cards.length, id: c.activityId, text: c.text || '', media: (c.media || []).length, reactions: c.reactions, comments: c.comments, reposts: c.reposts, type: c.type, truncated: !!c.textTruncated, repostText: c.repost ? c.repost.text : null, repostMedia: c.repost ? c.repost.media.length : null };
+      return { n: cards.length, id: c.activityId, text: c.text || '', media: (c.media || []).length, reactions: c.reactions, comments: c.comments, reposts: c.reposts, type: c.type, truncated: !!c.textTruncated, repostText: c.repost ? c.repost.text : null, repostMedia: c.repost ? c.repost.media.length : null,
+               video: (c.media || []).find((m) => m.type === 'video') || null };
     });
     const counts = r.reactions === 1234 && r.comments === 56 && r.reposts === 7;
     const ok = label.startsWith('F6')
       ? r.n === 1 && r.type === 'repost' && r.text === '' && r.media === 0 && r.repostText === TEXT && r.repostMedia === 1 && counts
       : label.startsWith('F9')
         ? r.n === 1 && r.text === TEXT9 && r.media === 1 && counts && !r.truncated
-        : label.startsWith('F10')
+        : label.startsWith('F11')
+          ? r.n === 1 && r.type === 'video' && r.media === 1 && r.video && r.video.url === MP4 && r.video.thumbnail === POSTER && r.text === TEXT && counts
+          : label.startsWith('F10')
           // one post, its own text and picture, the strip's counts, and zero reposts — not 900
           ? r.n === 1 && r.type !== 'repost' && r.text === TEXT10 && r.media === 1 && r.reactions === 1234 && r.comments === 56 && r.reposts === 0
           : r.n === 1 && r.id === '7100000000000000001' && r.text === TEXT && r.media === 1 && counts && !r.truncated;

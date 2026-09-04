@@ -24,7 +24,9 @@ const SUITES = [
   ['engine-test.mjs', 'content.js — session detection, entity mapping, paging'],
   ['export-test.mjs', 'background.js — archive tree, CSV, README'],
   ['wiring-check.mjs', 'manifest / popup / message wiring, safety limits'],
-  ['regression-test.mjs', 'the async glue — tabs, ports, timers, worker lifetime']
+  ['regression-test.mjs', 'the async glue — tabs, ports, timers, worker lifetime'],
+  // Needs Playwright and a Chromium; prints one line and passes when absent.
+  ['shapes-test.mjs', 'the DOM readers against 32 page shapes (opt-in, browser)']
 ];
 
 let failed = 0;

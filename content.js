@@ -2839,10 +2839,16 @@
    * redesign so far, but a reader that has only one way to find a section
    * returns nothing the day that changes. A heading is the other way.
    */
+  /*
+   * The anchor ids are the same in every locale; the headings are not. The
+   * fallback carries the big three in the languages LinkedIn's interface is
+   * most often set to, so a page with no anchors is still readable off its
+   * headings for a French or Spanish or German user.
+   */
   const SECTION_TITLES = {
-    experience: /^experience$/i,
-    education: /^education$/i,
-    skills: /^skills$/i,
+    experience: /^(experience|expérience|experiencia|erfahrung|berufserfahrung|experiência|esperienza|ervaring|経歴|职业经历)$/i,
+    education: /^(education|formation|educación|ausbildung|formação|formazione|opleiding|学歴|教育经历)$/i,
+    skills: /^(skills|compétences|aptitudes|kenntnisse|competências|competenze|vaardigheden|スキル|技能)$/i,
     licenses_and_certifications: /^licen[cs]es\s*&?\s*(and\s*)?certifications$/i,
     languages: /^languages$/i,
     volunteering_experience: /^volunteering( experience)?$/i,
@@ -3568,7 +3574,11 @@
         let t = String(n.innerText || n.textContent || '');
         for (const b of safeQueryAll(n, 'button')) {
           const bt = String(b.innerText || b.textContent || '').trim();
-          if (bt) t = t.replace(bt, '');
+          if (!bt) continue;
+          // The button sits at the end of the text, so remove the *last*
+          // occurrence — a post that itself says "see more" keeps its words.
+          const at = t.lastIndexOf(bt);
+          if (at >= 0) t = t.slice(0, at) + t.slice(at + bt.length);
         }
         t = t.replace(SEE_MORE_RE, '').replace(/[ \t]+\n/g, '\n').trim();
         if (t.length > best.length) best = t;

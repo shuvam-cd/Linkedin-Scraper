@@ -878,7 +878,17 @@ group('video frames');
 
 // A <video> that seeks instantly and a <canvas> that yields a stub blob, so
 // the seek loop's arithmetic can be checked without a decoder.
-function loadOffscreen(duration) {
+function loadOffscreen(duration, machine) {
+  // The packer sizes itself to the machine it runs on. Tests declare one, and
+  // the default is roomy so the frame-per-second assertions below hold as
+  // written; the small-machine tests declare theirs explicitly.
+  // Node 22 defines `navigator` as a getter on globalThis, so plain assignment
+  // throws under strict mode; define it instead.
+  Object.defineProperty(globalThis, 'navigator', {
+    value: Object.assign({ deviceMemory: 8, hardwareConcurrency: 4 }, machine || {}),
+    configurable: true,
+    writable: true
+  });
   const seeks = [];
   const el = {
     _t: 0,
@@ -1022,6 +1032,60 @@ await checkAsync('the frames note records duration, interval and count', async (
   const note = OS.framesReadme({ path: 'a/video_01.mp4', video: { intervalSec: 1 } }, r);
   ok(note.includes('3.0s'), 'duration');
   ok(note.includes('Frames written : 3'), 'count');
+});
+
+/* ================================================================== *
+ * The packer sizes itself to the machine
+ *
+ * Measured before it was written: twenty one-minute videos at a still per
+ * second held ~550 MB above Chrome's floor and took 138 s on four cores.
+ * On a 2 GB two-core laptop the same defaults are a stall.
+ * ================================================================== */
+group('the packer sizes itself to the machine');
+
+await checkAsync('a small machine widens the frame interval and says so', async () => {
+  const { OS } = loadOffscreen(12, { deviceMemory: 2, hardwareConcurrency: 2 });
+  eq(OS.MACHINE.tier, 'small');
+  eq(OS.MACHINE.fetchConcurrency, 1, 'one CDN fetch at a time');
+  eq(OS.FRAMES.MAX_EDGE, 720, 'smaller stills');
+  const at = [];
+  const r = await OS.extractFrames({ size: 1 }, 1, (f) => at.push(f.at));
+  // Asked for one a second; the machine floor is four.
+  eq(r.step, 4);
+  eq(at, [0, 4, 8]);
+  const note = OS.framesReadme({ path: 'a/video_01.mp4', video: { intervalSec: 1 } }, r);
+  ok(/Interval\s+: 4s \(asked for 1s; widened for this machine\)/.test(note), 'frames.txt explains the widening');
+});
+
+await checkAsync('a roomy machine keeps the interval it was asked for', async () => {
+  const { OS } = loadOffscreen(5, { deviceMemory: 16, hardwareConcurrency: 8 });
+  eq(OS.MACHINE.tier, 'roomy');
+  eq(OS.MACHINE.fetchConcurrency, 4, 'capped at four however many cores');
+  const r = await OS.extractFrames({ size: 1 }, 1, () => {});
+  eq(r.step, 1);
+  eq(r.count, 5);
+});
+
+await checkAsync('the whole export has a frame ceiling, and frames.txt names it', async () => {
+  const { OS } = loadOffscreen(1000, { deviceMemory: 2, hardwareConcurrency: 2 });
+  // 1000 s at a 4 s step is 250 frames per video; the small ceiling is 600,
+  // so the third video is where it bites.
+  let total = 0;
+  const results = [];
+  for (let i = 0; i < 3; i++) {
+    const r = await OS.extractFrames({ size: 1 }, 1, () => total++);
+    results.push(r);
+  }
+  eq(total, 600, 'no more than the ceiling across the export');
+  ok(!results[0].exportCapped && !results[1].exportCapped, 'the first two ran to their own length');
+  ok(results[2].exportCapped, 'the third hit the archive ceiling');
+  eq(results[2].count, 100);
+  const note = OS.framesReadme({ path: 'a/video_03.mp4', video: { intervalSec: 1 } }, results[2]);
+  ok(/600-frame ceiling for a 2 GB machine/.test(note), 'and the note says which ceiling');
+});
+
+check('the ceiling resets with the archive', () => {
+  ok(/case 'ZIP_INIT':[\s\S]{0,200}framesThisExport = 0;/.test(read('offscreen.js')), 'ZIP_INIT resets the count');
 });
 
 /* ================================================================== *

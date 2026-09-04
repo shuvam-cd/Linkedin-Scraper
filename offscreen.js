@@ -26,8 +26,38 @@
   let zip = null;
   const urls = new Set();
 
+  /*
+   * What this machine can carry.
+   *
+   * Measured before it was written: packing twenty one-minute videos with a
+   * still per second held ~550 MB above Chrome's own floor and took 138 s on
+   * four cores. That is fine on a workstation and a bad afternoon on a 4 GB
+   * laptop with two cores — so the levers below scale with the machine rather
+   * than assuming the one this was written on. navigator.deviceMemory is
+   * coarse (2, 4, 8…) and absent on some browsers; absence reads as "modest".
+   */
+  const MACHINE = (() => {
+    const mem = Number(navigator.deviceMemory) || 4;
+    const cores = Number(navigator.hardwareConcurrency) || 2;
+    const tier = mem <= 2 ? 'small' : mem <= 4 ? 'modest' : 'roomy';
+    return {
+      tier,
+      mem,
+      cores,
+      // CDN fetches in flight at once. Each holds a Blob until it is written.
+      fetchConcurrency: Math.max(1, Math.min(4, tier === 'small' ? 1 : tier === 'modest' ? 2 : cores - 1)),
+      // Longest edge of an extracted frame.
+      frameEdge: tier === 'small' ? 720 : tier === 'modest' ? 960 : 1280,
+      // The finest interval the worker may ask for; coarser requests are kept.
+      minFrameIntervalSec: tier === 'small' ? 4 : tier === 'modest' ? 2 : 1,
+      // Stills across the whole export. Twenty long videos at one a second is
+      // eighteen thousand JPEGs, which is a ten-minute pack on a slow disk.
+      maxFramesPerExport: tier === 'small' ? 600 : tier === 'modest' ? 1500 : 4000
+    };
+  })();
+
   /** Media comes from the CDN, so a few in parallel — same as a page load. */
-  const FETCH_CONCURRENCY = 4;
+  const FETCH_CONCURRENCY = MACHINE.fetchConcurrency;
 
   /**
    * Media URLs on media.licdn.com are signed and normally fetch anonymously.
@@ -91,10 +121,13 @@
    * ---------------------------------------------------------------- */
   const FRAMES = {
     MAX_PER_VIDEO: 900, // 15 minutes at one per second; a hard stop, not a target
-    MAX_EDGE: 1280,     // downscale big frames — 900 stills add up fast
+    MAX_EDGE: MACHINE.frameEdge, // downscale big frames — 900 stills add up fast
     QUALITY: 0.82,
     SEEK_TIMEOUT_MS: 15000
   };
+
+  /** Stills written so far in this archive — reset with it. */
+  let framesThisExport = 0;
 
   /*
    * Decoding is serialised. The media fetches run four wide, but four videos
@@ -180,7 +213,21 @@
     let count = 0;
     try {
       await onceEvent(video, 'loadedmetadata', FRAMES.SEEK_TIMEOUT_MS);
-      const duration = Number(video.duration);
+      let duration = Number(video.duration);
+      /*
+       * A file whose container carries no duration — a fragmented MP4, or
+       * anything a recorder wrote — reports Infinity here, and Chrome only
+       * learns the real length once it has been asked to seek past the end.
+       * Giving up on Infinity threw away every frame of a video that would
+       * have decoded fine.
+       */
+      if (!isFinite(duration)) {
+        video.currentTime = 1e9;
+        await onceEvent(video, 'durationchange', FRAMES.SEEK_TIMEOUT_MS).catch(() => {});
+        duration = Number(video.duration);
+        video.currentTime = 0;
+        await onceEvent(video, 'seeked', FRAMES.SEEK_TIMEOUT_MS).catch(() => {});
+      }
       if (!isFinite(duration) || duration <= 0) throw new Error('video reported no duration');
 
       /*
@@ -198,14 +245,22 @@
       canvas.height = Math.max(1, Math.round((video.videoHeight || 1) * scale));
       const ctx = canvas.getContext('2d');
 
-      const step = Math.max(0.1, Number(intervalSec) || 1);
+      const step = Math.max(MACHINE.minFrameIntervalSec, Number(intervalSec) || 1);
       for (let t = 0; t < duration && count < FRAMES.MAX_PER_VIDEO; t += step) {
+        if (framesThisExport >= MACHINE.maxFramesPerExport) break;
+        framesThisExport++;
         await seekTo(video, Math.min(t, Math.max(0, duration - 0.05)));
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         if (onFrame) await onFrame({ at: t, index: count, blob: await canvasBlob(canvas) });
         count++;
       }
-      return { count, duration, truncated: count >= FRAMES.MAX_PER_VIDEO };
+      return {
+        count,
+        duration,
+        step,
+        truncated: count >= FRAMES.MAX_PER_VIDEO || framesThisExport >= MACHINE.maxFramesPerExport,
+        exportCapped: framesThisExport >= MACHINE.maxFramesPerExport
+      };
     } finally {
       video.removeAttribute('src');
       video.load();
@@ -220,10 +275,14 @@
       `Frames from ${item.path.split('/').pop()}`,
       '-'.repeat(70),
       `Duration       : ${r.duration.toFixed(1)}s`,
-      `Interval       : ${item.video.intervalSec}s`,
+      `Interval       : ${r.step}s${r.step !== item.video.intervalSec ? ` (asked for ${item.video.intervalSec}s; widened for this machine)` : ''}`,
       `Frames written : ${r.count}`
     ];
-    if (r.truncated) lines.push(`Truncated      : yes — capped at ${FRAMES.MAX_PER_VIDEO} frames`);
+    if (r.exportCapped) {
+      lines.push(`Truncated      : yes — this archive reached its ${MACHINE.maxFramesPerExport}-frame ceiling for a ${MACHINE.mem} GB machine`);
+    } else if (r.truncated) {
+      lines.push(`Truncated      : yes — capped at ${FRAMES.MAX_PER_VIDEO} frames`);
+    }
     lines.push('', 'Each file is named for its position in the video, in seconds.');
     return lines.join('\r\n') + '\r\n';
   }
@@ -326,7 +385,8 @@
         case 'ZIP_INIT':
           zip = newZipWriter();
           cancelled = false;
-          return { ok: true };
+          framesThisExport = 0;
+          return { ok: true, machine: MACHINE };
 
         case 'ZIP_CANCEL':
           cancelled = true;
@@ -414,6 +474,6 @@
    * that contains a video.
    */
   if (globalThis.__LIS_OFFSCREEN_TEST__) {
-    Object.assign(globalThis.__LIS_OFFSCREEN_TEST__, { extractFrames, FRAMES, framesReadme, fetchBlob });
+    Object.assign(globalThis.__LIS_OFFSCREEN_TEST__, { extractFrames, FRAMES, framesReadme, fetchBlob, MACHINE });
   }
 })();

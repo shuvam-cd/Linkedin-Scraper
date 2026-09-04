@@ -4038,6 +4038,10 @@
       run,
       S,
       CFG,
+      // The feed reader, so page shapes it has never seen can be put to it.
+      harvestFeedCards,
+      readCard,
+      readCounts,
       linkedDetailPages,
       rowsFrom,
       componentRows,

@@ -1595,6 +1595,18 @@ check('a pending Stop never escalates the run into a new page', () => {
   ok(/throwIfStopped\(\);\s*await tryStrategy\('Feed scroll'/.test(body), 'so is the feed-scroll leg');
 });
 
+check('finding a card is linear in the length of the feed', () => {
+  // cardOf climbed from every URN node and asked each ancestor for the other
+  // URN nodes beneath it — quadratic. A thousand-card feed cost a second per
+  // harvest round on four cores, and rounds repeat for the length of the
+  // scroll. The counts are taken once per harvest and looked up.
+  const body = stripComments(fnBody('function cardOf'));
+  ok(!/querySelectorAll|safeQueryAll/.test(body), 'cardOf never queries an ancestor');
+  ok(/counts\.get\(parent\)/.test(body), 'it reads a precomputed count');
+  ok(/function countUrnsPerAncestor/.test(CS_SRC), 'built once per harvest');
+  ok(/const urnCount = countUrnsPerAncestor\(nodes, top\)/.test(fnBody('function harvestFeedCards')), 'and harvestFeedCards builds it');
+});
+
 check('a strategy that never makes a request still notices Stop', () => {
   // On the activity page the payload comes out of the document, so this
   // strategy can run start to finish without touching apiGet — which is where

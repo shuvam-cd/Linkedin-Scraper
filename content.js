@@ -3490,21 +3490,38 @@
    * (its siblings) were never found. Climb until the next step up would take
    * in another post.
    */
-  function cardOf(el) {
-    const ownUrn = activityUrnOf(el);
+  function cardOf(el, urnCount) {
     const top = document.querySelector('main') || document.body;
+    // How many distinct posts each ancestor holds, counted once per harvest.
+    // Asking each ancestor with querySelectorAll instead was quadratic: a
+    // thousand-card feed cost a second per round on four cores, and rounds
+    // repeat for the length of the scroll.
+    const counts = urnCount || countUrnsPerAncestor([el], top);
     let card = el;
     for (let i = 0; i < 12; i++) {
       const parent = card.parentElement;
       if (!parent || parent === top || parent === document.body || parent === document.documentElement) break;
-      const others = safeQueryAll(parent, URN_SEL).some((n) => {
-        const u = activityUrnOf(n);
-        return u && u !== ownUrn && !el.contains(n) && !n.contains(el);
-      });
-      if (others) break;
+      if ((counts.get(parent) || 0) > 1) break; // the next step up takes in another post
       card = parent;
     }
     return card;
+  }
+
+  /** For every ancestor of the given URN nodes, how many of them it contains. */
+  function countUrnsPerAncestor(nodes, top) {
+    const counts = new Map();
+    for (const n of nodes) {
+      // A reshare's inner URN belongs to its outer card; count the pair once.
+      let outerMost = n;
+      for (let a = n.parentElement; a && a !== top; a = a.parentElement) {
+        if (activityUrnOf(a)) outerMost = a;
+      }
+      if (outerMost !== n) continue;
+      for (let a = n.parentElement; a && a !== top && a !== document.body; a = a.parentElement) {
+        counts.set(a, (counts.get(a) || 0) + 1);
+      }
+    }
+    return counts;
   }
 
   /**
@@ -3533,12 +3550,14 @@
       if (!innerOf.has(outerId)) innerOf.set(outerId, el);
     }
 
+    const top = document.querySelector('main') || document.body;
+    const urnCount = countUrnsPerAncestor(nodes, top);
     for (const el of nodes) {
       if (inner.has(el)) continue;
       const activityId = VY.activityId(activityUrnOf(el));
       if (!activityId || seen.has(activityId)) continue;
       seen.add(activityId);
-      found.push(readCard(el, activityId, innerOf.get(activityId) || null));
+      found.push(readCard(el, activityId, innerOf.get(activityId) || null, urnCount));
     }
     return found;
   }
@@ -3650,8 +3669,8 @@
     return media;
   }
 
-  function readCard(el, activityId, innerNode) {
-    const card = cardOf(el);
+  function readCard(el, activityId, innerNode, urnCount) {
+    const card = cardOf(el, urnCount);
     const exclude = innerNode && card.contains(innerNode) ? innerNode : null;
 
     let text = '';

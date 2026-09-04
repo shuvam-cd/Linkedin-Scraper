@@ -98,15 +98,15 @@ their API" from the outside. So it lives in its own file, has no DOM or
 `chrome.*` dependency, and is tested in isolation:
 
 ```
-node tools/test.mjs               434 assertions, no dependencies
+node tools/test.mjs               480 assertions, no dependencies
 
   resolver-test.mjs   58   URN resolution, session cookies, Rest.li encoding
   utils-test.mjs      33   public-id normalisation, CSV escaping
-  engine-test.mjs     89   session detection, entity mapping, post kinds, profile, mappers
-  export-test.mjs     62   archive tree, CSV, JSON, README, path collisions
+  engine-test.mjs     94   session detection, entity mapping, post kinds, profile, mappers
+  export-test.mjs     67   archive tree, CSV, JSON, README, path collisions, threading
   wiring-check.mjs    34   manifest / popup / message wiring, safety limits
-  regression-test.mjs 158  tab navigation, timeouts, Stop, profile reads, packaging, storage
-  shapes-test.mjs      25  the readers against 25 page shapes (opt-in: needs a browser)
+  regression-test.mjs 162  tab navigation, timeouts, Stop, profile reads, packaging, storage
+  shapes-test.mjs      32  the readers against 32 page shapes (opt-in: needs a browser)
 ```
 
 None of it can talk to LinkedIn, which is the point — it covers exactly the
@@ -741,16 +741,16 @@ that means for other people's data; the checkbox is still there.
 ## One page, many shapes
 
 Every fixture the readers had been tested against was written by the same hand
-that wrote the readers. So a new test renders **one profile eight ways, its
-"Show all" page six ways, and one feed card eight ways** — same facts,
+that wrote the readers. So a new test renders **one profile thirteen ways, its
+"Show all" page seven ways, and one feed card twelve ways** — same facts,
 different markup — and each reader has to produce the same answer from all of
 them:
 
 ```
                       before   after
-profile page          3 / 8    8 / 8
-"Show all" page       4 / 6    6 / 6
-feed card             3 / 8    8 / 8
+profile page          3 / 8    13 / 13
+"Show all" page       4 / 6     7 / 7
+feed card             3 / 8    12 / 12
 ```
 
 Every reader had exactly one strategy: rows are `<li>`, text is in

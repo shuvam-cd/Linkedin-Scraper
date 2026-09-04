@@ -98,7 +98,7 @@ their API" from the outside. So it lives in its own file, has no DOM or
 `chrome.*` dependency, and is tested in isolation:
 
 ```
-node tools/test.mjs               480 assertions, no dependencies
+node tools/test.mjs               481 assertions, no dependencies
 
   resolver-test.mjs   58   URN resolution, session cookies, Rest.li encoding
   utils-test.mjs      33   public-id normalisation, CSV escaping
@@ -106,7 +106,7 @@ node tools/test.mjs               480 assertions, no dependencies
   export-test.mjs     67   archive tree, CSV, JSON, README, path collisions, threading
   wiring-check.mjs    34   manifest / popup / message wiring, safety limits
   regression-test.mjs 162  tab navigation, timeouts, Stop, profile reads, packaging, storage
-  shapes-test.mjs      32  the readers against 32 page shapes (opt-in: needs a browser)
+  shapes-test.mjs      33  the readers against 33 page shapes (opt-in: needs a browser)
 ```
 
 None of it can talk to LinkedIn, which is the point — it covers exactly the
@@ -742,7 +742,7 @@ that means for other people's data; the checkbox is still there.
 
 Every fixture the readers had been tested against was written by the same hand
 that wrote the readers. So a new test renders **one profile thirteen ways, its
-"Show all" page seven ways, and one feed card twelve ways** — same facts,
+"Show all" page seven ways, and one feed card thirteen ways** — same facts,
 different markup — and each reader has to produce the same answer from all of
 them:
 
@@ -750,7 +750,7 @@ them:
                       before   after
 profile page          3 / 8    13 / 13
 "Show all" page       4 / 6     7 / 7
-feed card             3 / 8    12 / 12
+feed card             3 / 8    13 / 13
 ```
 
 Every reader had exactly one strategy: rows are `<li>`, text is in

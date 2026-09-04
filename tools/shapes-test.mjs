@@ -349,6 +349,10 @@ const FEED_VARIANTS = {
   'F12 a comment preview inside the card':
     wrap(`<div data-urn="${URN}"><div class="update-components-text">${TEXT}</div><img src="${IMG}">${social}<div class="comments-comments-list"><article><img src="https://media.licdn.com/dms/image/v2/D56/profile-displayphoto-shrink_100_100/0/5?e=1"><span dir="ltr">This is a much longer comment than the post itself, written by somebody else entirely, going on and on.</span></article></div></div>`),
 
+  // F10 without a picture: nothing to outrank a wrongly-derived 'repost'.
+  'F10b the same, with no media — a plain text post':
+    wrap(`<div data-id="${URN}"><div class="feed-shared-update-v2" data-urn="${URN}"><div class="update-components-text">${TEXT10}</div><div class="social-details-social-counts"><button aria-label="1,234 reactions">1,234</button><button aria-label="56 comments">56 comments</button></div><div class="comments-comments-list"><article data-id="urn:li:comment:(${URN},7777)"><span>Nice — 3 comments already</span></article></div></div></div>`),
+
   'F9 the post text itself contains "see more"':
     wrap(`<div data-urn="${URN}"><div class="update-components-text"><span dir="ltr" id="tt9">${TEXT9}</span><button class="feed-shared-inline-show-more-text__see-more-less-toggle">see less</button></div><img src="${IMG}">${social}</div>`)
 };
@@ -366,7 +370,7 @@ async function feedShapes(browser) {
       const cards = T.harvestFeedCards();
       const c = cards[0] || {};
       return { n: cards.length, id: c.activityId, text: c.text || '', media: (c.media || []).length, reactions: c.reactions, comments: c.comments, reposts: c.reposts, type: c.type, truncated: !!c.textTruncated, repostText: c.repost ? c.repost.text : null, repostMedia: c.repost ? c.repost.media.length : null,
-               video: (c.media || []).find((m) => m.type === 'video') || null };
+               video: (c.media || []).find((m) => m.type === 'video') || null, repost: c.repost || null };
     });
     const counts = r.reactions === 1234 && r.comments === 56 && r.reposts === 7;
     const ok = label.startsWith('F6')
@@ -375,10 +379,13 @@ async function feedShapes(browser) {
         ? r.n === 1 && r.text === TEXT9 && r.media === 1 && counts && !r.truncated
         : label.startsWith('F11')
           ? r.n === 1 && r.type === 'video' && r.media === 1 && r.video && r.video.url === MP4 && r.video.thumbnail === POSTER && r.text === TEXT && counts
-          : label.startsWith('F10')
+          : label.startsWith('F10b')
+          // a plain text post: no repost record, no 'repost' type, the strip's counts
+          ? r.n === 1 && r.type === 'text' && r.repost === null && r.text === TEXT10 && r.media === 0 && r.reactions === 1234 && r.comments === 56 && r.reposts === 0
+        : label.startsWith('F10')
           // one post, its own text and picture, the strip's counts, and zero reposts — not 900
-          ? r.n === 1 && r.type !== 'repost' && r.text === TEXT10 && r.media === 1 && r.reactions === 1234 && r.comments === 56 && r.reposts === 0
-          : r.n === 1 && r.id === '7100000000000000001' && r.text === TEXT && r.media === 1 && counts && !r.truncated;
+          ? r.n === 1 && r.type !== 'repost' && r.repost === null && r.text === TEXT10 && r.media === 1 && r.reactions === 1234 && r.comments === 56 && r.reposts === 0
+          : r.n === 1 && r.id === '7100000000000000001' && r.text === TEXT && r.media === 1 && counts && !r.truncated && r.repost === null;
     report(label, ok, ok ? '' : JSON.stringify(r));
     await page.close();
   }

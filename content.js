@@ -3661,7 +3661,9 @@
    * LinkedIn's own code to work.
    * ------------------------------------------------------------------ */
   const URN_ATTRS = ['data-urn', 'data-id', 'data-entity-urn', 'data-activity-urn'];
-  const URN_SEL = URN_ATTRS.map((a) => `[${a}*="urn:li:activity:"]`).join(',');
+  // Anchored: a comment's data-id *contains* the post's URN, and a substring
+  // match let it into the card list with no URN of its own.
+  const URN_SEL = URN_ATTRS.map((a) => `[${a}^="urn:li:activity:"]`).join(',');
 
   /** The activity URN an element carries in any of the attributes LinkedIn uses. */
   function activityUrnOf(el) {
@@ -3747,6 +3749,8 @@
     const inner = new Set();
     for (const el of nodes) {
       const ownId = VY.activityId(activityUrnOf(el));
+      // No URN of its own means it is not a post, inner or otherwise.
+      if (!ownId) continue;
       // The nearest URN ancestor that is a *different* post. LinkedIn wraps a
       // card in a data-id holder carrying the same URN as the data-urn inside
       // it; read as a reshare of itself, the card's text and media were

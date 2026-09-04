@@ -1063,16 +1063,41 @@ await checkAsync('a small machine shares its frame budget and says so', async ()
   eq(OS.MACHINE.tier, 'small');
   eq(OS.MACHINE.fetchConcurrency, 1, 'one CDN fetch at a time');
   eq(OS.FRAMES.MAX_EDGE, 720, 'smaller stills');
-  // 600 stills across 30 videos is 30 each — well under a two-minute video
+  // 600 stills across 30 videos is 20 each — well under a two-minute video
   // at one a second, so the step widens to spread them across its length.
-  eq(OS.shareFrameBudget(30), 30);
+  eq(OS.shareFrameBudget(30), 20);
   const at = [];
   const r = await OS.extractFrames({ size: 1 }, 1, (f) => at.push(f.at));
-  eq(r.step, 4);
-  eq(r.count, 30);
-  eq(at.slice(0, 3), [0, 4, 8]);
+  eq(r.step, 6);
+  eq(r.count, 20);
+  eq(at.slice(0, 3), [0, 6, 12]);
   const note = OS.framesReadme({ path: 'a/video_01.mp4', video: { intervalSec: 1 } }, r);
-  ok(/Interval\s+: 4s \(asked for 1s; widened for this machine\)/.test(note), 'frames.txt explains the widening');
+  ok(/Interval\s+: 6s \(asked for 1s; widened for this machine\)/.test(note), 'frames.txt explains the widening');
+});
+
+await checkAsync('every video gets a share, however many there are', async () => {
+  // A floor of thirty times forty videos exceeded a 600-frame ceiling, and
+  // the videos at the tail of the archive got an empty folder.
+  const { OS } = loadOffscreen(60, { deviceMemory: 2, hardwareConcurrency: 2 });
+  eq(OS.shareFrameBudget(40), 15);
+  let total = 0;
+  const counts = [];
+  for (let i = 0; i < 40; i++) counts.push((await OS.extractFrames({ size: 1 }, 1, () => total++)).count);
+  ok(counts.every((c) => c === 15), `every one of forty gets its fifteen: ${[...new Set(counts)].join(',')}`);
+  eq(total, 600);
+});
+
+await checkAsync('a fractional step yields exactly the share, never one over', async () => {
+  // 100 s at a share of 30 is a step of 3.333…; adding it repeatedly landed
+  // at 99.99999999999997 and took a 31st frame, so every video overshot its
+  // share and the last was falsely reported as cut by the ceiling.
+  const { OS } = loadOffscreen(100, { deviceMemory: 2, hardwareConcurrency: 2 });
+  OS.shareFrameBudget(20); // 600 / 20 = 30
+  const at = [];
+  const r = await OS.extractFrames({ size: 1 }, 1, (f) => at.push(f.at));
+  eq(r.count, 30);
+  ok(!r.exportCapped, 'and not reported as cut');
+  ok(at[29] < 100, 'the last frame is inside the video');
 });
 
 await checkAsync('a roomy machine keeps the interval it was asked for', async () => {
@@ -1213,7 +1238,10 @@ check('documents are numbered like every other media kind', () => {
 
 check('a final pass guarantees every path is unique', () => {
   ok(/function dedupePaths\(/.test(BG_SRC), 'dedupePaths exists');
-  ok(/return dedupePaths\(items\);/.test(BG_SRC), 'zipEntries returns through it');
+  // The README is rendered from the deduped list, so the pass runs before
+  // the last entry is added rather than on the way out.
+  const ze = BG_SRC.slice(BG_SRC.indexOf('function zipEntries'), BG_SRC.indexOf('async function buildZip'));
+  ok(/const deduped = dedupePaths\(items\);/.test(ze) && /return deduped;/.test(ze), 'zipEntries returns through it');
   // Renamed, never dropped — losing the file is the worse archive.
   const body = BG_SRC.slice(BG_SRC.indexOf('function dedupePaths'));
   ok(!/splice|filter|continue;\s*\}\s*$/.test(body.slice(0, body.indexOf('return items'))) || /item\.path = /.test(body),
@@ -1564,8 +1592,69 @@ check('an aborted request is told apart from a network error', () => {
   ok(/signal\.aborted/.test(body), 'and a timeout is reported as one');
 });
 
+await checkAsync('a media body that stops sending bytes is abandoned, one that trickles on is kept', async () => {
+  const { OS } = loadOffscreen(1);
+  OS.setFetchTimeout(120);
+  // A body that follows a plan of delays, and — as a real fetch's body does —
+  // errors when the request's signal is aborted.
+  const bodyThat = (plan) => {
+    let ctrl = null;
+    let closed = false;
+    const stream = new ReadableStream({
+      start(c) {
+        ctrl = c;
+        let i = 0;
+        const tick = () => {
+          const step = plan[i++];
+          if (closed) return;
+          if (step === undefined) {
+            closed = true;
+            return c.close();
+          }
+          if (step === 'stall') return; // never enqueue again
+          setTimeout(() => {
+            if (closed) return;
+            c.enqueue(new Uint8Array([i]));
+            tick();
+          }, step);
+        };
+        tick();
+      }
+    });
+    const abort = () => {
+      if (closed) return;
+      closed = true;
+      try {
+        ctrl.error(new DOMException('The operation was aborted.', 'AbortError'));
+      } catch (_) {
+        /* already closed */
+      }
+    };
+    return { stream, abort };
+  };
+  const responses = [];
+  globalThis.fetch = async (url, init) => {
+    const r = responses.shift();
+    if (init && init.signal) init.signal.addEventListener('abort', () => r.abort());
+    return { ok: true, status: 200, headers: new Headers(), body: r.stream };
+  };
+  // Byte, byte, byte … each within the deadline, for longer than the deadline in total.
+  responses.push(bodyThat([40, 40, 40, 40, 40, 40]));
+  const blob = await OS.fetchBlob('https://media.licdn.com/trickle');
+  eq(blob.size, 6, 'a slow but live transfer completes');
+  // A body that sends two bytes and then nothing.
+  responses.push(bodyThat([10, 10, 'stall']));
+  let err = null;
+  try {
+    await OS.fetchBlob('https://media.licdn.com/stall');
+  } catch (e) {
+    err = e;
+  }
+  ok(err && /no bytes for/.test(err.message), `a stalled body is abandoned with the reason: ${err && err.message}`);
+});
+
 check('the packer gives its media fetches a deadline too', () => {
-  ok(/const FETCH_TIMEOUT_MS = /.test(OS_SRC), 'a deadline is defined');
+  ok(/(const|let) FETCH_TIMEOUT_MS = /.test(OS_SRC), 'a deadline is defined');
   const body = OS_SRC.slice(OS_SRC.indexOf('async function fetchBlob'));
   ok((body.match(/signal: ctl\.signal/g) || []).length >= 2, 'both attempts run under it');
   // `return res.blob()` would hand the promise back outside the try, and with
@@ -1700,6 +1789,14 @@ await checkAsync('a stored layout with another chunk size is rewritten whole', a
   await again.loadFromStorage();
   eq(again.posts().map((p) => p.activityId), W.posts().map((p) => p.activityId), 'round-trips');
   eq(again.dirty().size, 0, 'and is recognised as its own layout');
+});
+
+check('a "…see more" is answered by the detail fetch, once', () => {
+  const U = globalThis.LIS;
+  eq(U.postNeedsDetail({ detailFetched: true, text: 'full', reactions: 1, comments: 1, textTruncated: true }), false, 'fetched detail settles it');
+  eq(U.postNeedsDetail({ detailFetched: false, text: 'short…', reactions: 1, comments: 1, textTruncated: true }), true, 'unfetched, it is wanted');
+  const merge = stripComments(CS_SRC.slice(CS_SRC.indexOf('const { mapped } = await fetchPostDetail(post);'), CS_SRC.indexOf('const { mapped } = await fetchPostDetail(post);') + 3000));
+  ok(/if \(post\.text\) post\.textTruncated = false;/.test(merge), 'and the detail merge clears the flag');
 });
 
 check('a strategy that never makes a request still notices Stop', () => {

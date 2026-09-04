@@ -358,7 +358,7 @@ check('posts.csv has exactly the specified columns, in order', () => {
     'reactions', 'comments', 'reposts', 'media_count',
     'comments_captured', 'comments_capped', 'comment_error',
     // Flat projections of what posts.json carries structurally.
-    'hashtags', 'mentions', 'article_url', 'poll_votes', 'reshared_from', 'reshared_url', 'edited'
+    'hashtags', 'mentions', 'article_url', 'poll_votes', 'reshared_from', 'reshared_url', 'reshared_media_count', 'edited'
   ];
   if (!/\.\.\.REACTION_KEYS\.map/.test(m[1])) throw new Error('the per-reaction columns must be generated');
   if (JSON.stringify(cols) !== JSON.stringify(want)) {

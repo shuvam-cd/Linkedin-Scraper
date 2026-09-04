@@ -235,14 +235,16 @@ function countMedia() {
   let docs = 0;
   let comments = 0;
   let undownloadableVideos = 0;
+  let reshared = 0;
   for (const p of posts) {
     const m = Array.isArray(p.media) ? p.media : [];
     media += m.length;
+    if (p.repost && Array.isArray(p.repost.media)) reshared += p.repost.media.filter((x) => x && x.url).length;
     docs += m.filter((x) => x.type === 'document').length;
     undownloadableVideos += m.filter((x) => x.type === 'video' && !x.url).length;
     comments += Array.isArray(p.commentList) ? p.commentList.length : 0;
   }
-  return { media, docs, comments, undownloadableVideos };
+  return { media, docs, comments, undownloadableVideos, reshared };
 }
 
 function publicState() {
@@ -930,25 +932,38 @@ function mergeProfileRecords(existing, incoming) {
   if (!incoming || typeof incoming !== 'object') return existing;
   if (existing.publicId && incoming.publicId && existing.publicId !== incoming.publicId) return incoming;
   const out = Object.assign({}, existing);
+  // Rows are the same row when they name the same thing, whatever else one
+  // reader filled in that another did not; keying on the whole row made a
+  // card-only re-read a duplicate of the enriched row already stored.
+  const identity = (k, x) => {
+    if (!x || typeof x !== 'object') return String(x);
+    if (k === 'experience') return `${x.title}|${x.company}|${x.dates}`;
+    if (k === 'education') return `${x.school}|${x.degree}|${x.dates}`;
+    if (x.name != null) return `${x.name}|${x.detail}|${x.dates}|${String(x.description || '').slice(0, 40)}`;
+    return JSON.stringify(x);
+  };
+  const filled = (x) => (x && typeof x === 'object' ? Object.values(x).filter((f) => f != null && f !== '' && f !== false && !(Array.isArray(f) && !f.length)).length : 0);
   for (const k of Object.keys(incoming)) {
     const v = incoming[k];
     const cur = out[k];
     if (Array.isArray(v)) {
-      const seen = new Set();
-      const key = (x) => (x && typeof x === 'object' ? JSON.stringify(x) : String(x));
-      out[k] = [].concat(Array.isArray(cur) ? cur : [], v).filter((x) => {
-        const id = key(x);
-        if (seen.has(id)) return false;
-        seen.add(id);
-        return true;
-      });
+      const byId = new Map();
+      for (const x of [].concat(Array.isArray(cur) ? cur : [], v)) {
+        const id = identity(k, x);
+        const prev = byId.get(id);
+        // The richer of the two readings of the same row.
+        if (!prev || filled(x) > filled(prev)) byId.set(id, x);
+      }
+      out[k] = [...byId.values()];
       continue;
     }
     if (v && typeof v === 'object' && cur && typeof cur === 'object' && !Array.isArray(cur)) {
       out[k] = Object.assign({}, cur, v);
       continue;
     }
-    if (v == null || v === '') continue;
+    // Empty, and a `false` from a reader that did not see the badge, do not
+    // erase a value already known.
+    if (v == null || v === '' || (v === false && cur === true)) continue;
     out[k] = v;
   }
   return out;
@@ -969,17 +984,24 @@ function mediaFileNames(post) {
   let videoNo = 0;
   let docNo = 0;
   let posterNo = 0;
+  const taken = new Set();
   return media.map((m) => {
     const has = (u) => !!u && /^https?:/i.test(u);
     if (m.type === 'document') {
       docNo++;
       const stem = docNo === 1 ? 'document' : `document_${U.pad(docNo, 2)}`;
-      return {
-        kind: 'document',
-        file: has(m.url) ? `${U.sanitizeSegment(m.title || stem)}.${U.extFromUrl(m.url, 'pdf')}` : null,
-        note: `${stem}.txt`,
-        stem
-      };
+      // Unique here, not later: two documents titled alike were renamed by
+      // the final pass after metadata.txt had already named the first name
+      // for both.
+      let file = null;
+      if (has(m.url)) {
+        const base = U.sanitizeSegment(m.title || stem);
+        const ext = U.extFromUrl(m.url, 'pdf');
+        file = `${base}.${ext}`;
+        if (taken.has(file.toLowerCase())) file = `${base}_${docNo}.${ext}`;
+        taken.add(file.toLowerCase());
+      }
+      return { kind: 'document', file, note: `${stem}.txt`, stem };
     }
     if (m.type === 'video') {
       const poster = has(m.thumbnail) ? `poster_${U.pad(++posterNo, 2)}.jpg` : null;
@@ -1214,6 +1236,9 @@ function postFileText(post) {
 function metadataFileText(post, n) {
   // The archive number, which is the loop position and not post.index.
   const num = n != null ? n : post.index != null ? post.index + 1 : 0;
+  // Declared up here: the reshare block that lists these sits above the
+  // MEDIA section, and a declaration below it was a dead-zone error.
+  const resharedMedia = post.repost && Array.isArray(post.repost.media) ? post.repost.media.filter((m) => m && m.url && /^https?:/i.test(m.url)) : [];
   const out = [];
   out.push(kv('Post URL', post.postUrl || 'unknown'));
   out.push(kv('URN', post.urn || 'unknown'));
@@ -1258,6 +1283,20 @@ function metadataFileText(post, n) {
    * with no link, a poll with no result, a reshare with no idea whose post
    * it was.
    */
+  if (resharedMedia.length) {
+    // Written as reshared_NN beside the post; they are the original's, and
+    // the MEDIA count above is the post's own.
+    out.push('');
+    out.push(`RESHARED MEDIA (${resharedMedia.length})`);
+    out.push(RULE);
+    resharedMedia.forEach((m, i) => {
+      const ext = U.extFromUrl(m.url, m.type === 'video' ? 'mp4' : 'jpg');
+      out.push(`${String(i + 1).padStart(3)}. ${m.type || 'image'} — reshared_${U.pad(i + 1, 2)}.${ext}`);
+      if (m.alt) out.push(`     alt: ${m.alt}`);
+      out.push(`     ${m.url}`);
+    });
+  }
+
   if (post.repost) {
     out.push('RESHARED FROM');
     out.push(RULE);
@@ -1304,6 +1343,7 @@ function metadataFileText(post, n) {
   const media = mediaOf(post);
   out.push(`MEDIA (${media.length})`);
   out.push(RULE);
+
   if (!media.length) {
     // "None" and "we could not get it" are different facts, and only one of
     // them means the post genuinely had nothing attached.
@@ -1386,10 +1426,15 @@ function commentsFileText(post) {
     }
   }
   let n = 0;
+  const printed = new Set();
   const printOne = (c, depth) => {
+    if (printed.has(c)) return;
+    printed.add(c);
     const pad = '      ' + '    '.repeat(depth);
     const when = c.at ? U.fmtTimestamp(c.at) : '';
-    n++;
+    // Numbered per top-level comment: counting replies too made "12." the
+    // ninth comment and the last number disagree with the count.
+    if (!depth) n++;
     const head = depth ? `${'    '.repeat(depth)}  ↳ ` : `${String(n).padStart(4)}. `;
     out.push(`${head}${c.author || '(unknown)'}${when ? '   [' + when + ']' : ''}`);
     if (c.headline) out.push(`${pad}${c.headline}`);
@@ -1405,6 +1450,10 @@ function commentsFileText(post) {
     for (const r of children.get(c.urn) || []) printOne(r, depth + 1);
   };
   for (const c of roots) printOne(c, 0);
+  // A reply cycle — two comments each naming the other as parent — has no
+  // root and was never reached. Whatever the walk from the roots missed is
+  // printed at top level rather than lost.
+  for (const c of list) if (!printed.has(c)) printOne(c, 0);
 
   if (post.commentsTruncated) {
     out.push(`(capped at ${list.length} of ${nOf(post.comments)} — see MAX_COMMENTS_PER_POST in utils.js)`);
@@ -1462,7 +1511,7 @@ function postsCsv(list) {
     'comments_captured', 'comments_capped', 'comment_error',
     // Everything past here is flat by necessity — the structured form of all
     // of it is in posts.json, which is what these columns point at.
-    'hashtags', 'mentions', 'article_url', 'poll_votes', 'reshared_from', 'reshared_url', 'edited'
+    'hashtags', 'mentions', 'article_url', 'poll_votes', 'reshared_from', 'reshared_url', 'reshared_media_count', 'edited'
   ];
   // A BOM so Excel opens UTF-8 correctly instead of mangling every accent.
   let out = '﻿' + U.csvRow(head);
@@ -1494,6 +1543,7 @@ function postsCsv(list) {
       p.poll && p.poll.totalVotes != null ? p.poll.totalVotes : '',
       (p.repost && p.repost.author) || '',
       (p.repost && p.repost.postUrl) || '',
+      p.repost && Array.isArray(p.repost.media) ? p.repost.media.filter((m) => m && m.url).length : '',
       p.edited ? 'yes' : ''
     ]);
   }
@@ -1536,7 +1586,18 @@ function treeSummary(items, root) {
     const file = parts.pop();
     // Post folders repeat by the hundred; fold them to their kind.
     const folded = parts.map((seg) => (/^Post_\d+$/.test(seg) ? 'Post_NNN' : seg)).join('/') || '(root)';
-    const name = file.replace(/^(media|video|poster|reshared|document)_\d+/, '$1_NN').replace(/^frame_\d+/, 'frame_NNNN');
+    const name = file
+      .replace(/^(media|video|poster|reshared|document)_\d+/, '$1_NN')
+      .replace(/^Post_\d+_/, 'Post_NNN_')
+      .replace(/^frame_\d+/, 'frame_NNNN');
+    // Frames are written by the packer, after this list is made; say so.
+    if (it.video && it.video.framesDir) {
+      const fd = it.video.framesDir.startsWith(root + '/') ? it.video.framesDir.slice(root.length + 1) : it.video.framesDir;
+      const fdKey = fd.split('/').map((seg) => (/^Post_\d+$/.test(seg) ? 'Post_NNN' : seg.replace(/^video_\d+_frames$/, 'video_NN_frames'))).join('/');
+      if (!folders.has(fdKey)) folders.set(fdKey, new Set());
+      folders.get(fdKey).add('frame_NNNNs.jpg (one per second, written when the video is packed)');
+      folders.get(fdKey).add('frames.txt');
+    }
     if (!folders.has(folded)) folders.set(folded, new Set());
     folders.get(folded).add(name);
   }
@@ -1957,9 +2018,11 @@ function zipEntries() {
 
   items.push({ path: `${root}/posts.csv`, text: postsCsv(posts) });
   items.push({ path: `${root}/posts.json`, text: postsJson(posts) });
-  items.push({ path: `${root}/README.txt`, text: readmeFileText(stats, items) });
+  // Deduped first, so the README's file list names the files as written.
+  const deduped = dedupePaths(items);
+  deduped.push({ path: `${root}/README.txt`, text: readmeFileText(stats, deduped) });
+  return deduped;
 
-  return dedupePaths(items);
 }
 
 /**

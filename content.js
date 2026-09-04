@@ -4333,6 +4333,10 @@
           post[k] = v;
         }
         post.detailFetched = true;
+        // The permalink carries the whole body; the card's "…see more" is
+        // answered. Left set, the flag kept the post "needing detail" on
+        // every resume and posts.csv said text_truncated=yes for good.
+        if (post.text) post.textTruncated = false;
         /*
          * The permalink page is the authoritative source. If the media was not
          * there either, it is not obtainable — recording that keeps the post

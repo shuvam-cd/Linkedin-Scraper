@@ -69,7 +69,7 @@ const factory = new Function(
    return {
      zipEntries, postsCsv, postsJson, readmeFileText, metadataFileText, profileFileText,
      commentsFileText, videoNoteText, experienceFileText, educationFileText,
-     blankState,
+     blankState, mediaFileNames, mergeProfileRecords,
      load: (s, p) => { state = s; posts = p; reindex(); }
    };`
 );
@@ -416,7 +416,7 @@ check('header is exactly the specified columns', () => {
     'reactions', 'comments', 'reposts', 'media_count',
     ...reactionCols,
     'comments_captured', 'comments_capped', 'comment_error',
-    'hashtags', 'mentions', 'article_url', 'poll_votes', 'reshared_from', 'reshared_url', 'edited'
+    'hashtags', 'mentions', 'article_url', 'poll_votes', 'reshared_from', 'reshared_url', 'reshared_media_count', 'edited'
   ]);
 });
 
@@ -902,5 +902,79 @@ check('a document titled "post" cannot land on the post body', () => {
 });
 
 /* ================================================================== */
+/* ================================================================== */
+group('the archive after the audit');
+
+check('a reply cycle is printed, and top-level comments are numbered without gaps', () => {
+  loadFixture();
+  const list = [
+    { urn: 'c1', author: 'Carol', text: 'one' },
+    { urn: 'c2', author: 'Dan', text: 'two' },
+    { urn: 'c3', parentUrn: 'c2', author: 'Eve', text: 'a reply' },
+    { urn: 'c4', author: 'Fay', text: 'three' },
+    { urn: 'c5', parentUrn: 'c6', author: 'Gus', text: 'cycle a' },
+    { urn: 'c6', parentUrn: 'c5', author: 'Hal', text: 'cycle b' }
+  ];
+  const txt = BG.commentsFileText({ comments: 6, commentList: list, commentsFetchedAt: 'x' });
+  for (const who of ['Carol', 'Dan', 'Eve', 'Fay', 'Gus', 'Hal']) ok(txt.includes(who), `${who} is printed`);
+  ok(/\n   1\. Carol/.test(txt) && /\n   2\. Dan/.test(txt) && /\n   3\. Fay/.test(txt), 'top-level numbering has no gap for the reply');
+  ok(/↳ Eve/.test(txt), 'the reply is indented under its parent');
+});
+
+check('two documents with the same title get two names, and metadata.txt names them', () => {
+  loadFixture();
+  const post = Object.assign({}, POSTS[0], {
+    activityId: '7100000000000000099', type: 'document',
+    media: [
+      { type: 'document', url: 'https://media.licdn.com/f/a.pdf', title: 'Q3 Report' },
+      { type: 'document', url: 'https://media.licdn.com/g/b.pdf', title: 'Q3 Report' }
+    ]
+  });
+  const names = BG.mediaFileNames(post).map((n) => n.file);
+  eq(names, ['Q3 Report.pdf', 'Q3 Report_2.pdf']);
+  const meta = BG.metadataFileText(post, 1);
+  ok(meta.includes('Q3 Report.pdf') && meta.includes('Q3 Report_2.pdf'), 'metadata.txt names both real files');
+});
+
+check('the README file list is rendered from the deduped archive', () => {
+  loadFixture();
+  const items = BG.zipEntries();
+  const readme = items.find((i) => i.path.endsWith('/README.txt'));
+  ok(readme, 'README is written');
+  eq(items[items.length - 1].path, readme.path, 'and it is the last entry, built from everything before it');
+  if (items.some((i) => /\/Comments\/Post_\d+_comments\.txt$/.test(i.path))) {
+    ok(!/Post_00\d_comments\.txt/.test(readme.text), 'comment files are folded');
+    ok(/Post_NNN_comments\.txt/.test(readme.text), 'to one line');
+  }
+  // With comments on, the fold must apply.
+  loadFixture({ options: { includeComments: true } });
+  const withComments = BG.zipEntries();
+  const readme2 = withComments.find((i) => i.path.endsWith('/README.txt'));
+  ok(/Post_NNN_comments\.txt/.test(readme2.text) && !/Post_00\d_comments\.txt/.test(readme2.text), 'comment files fold to one line');
+});
+
+check('the profile merge keys rows by identity and keeps the richer one', () => {
+  const merged = BG.mergeProfileRecords(
+    { publicId: 'a', verified: true, experience: [{ title: 'Founder', company: 'X', dates: '2020 - Present', description: 'Long text', employmentType: 'Full-time' }] },
+    { publicId: 'a', verified: false, experience: [{ title: 'Founder', company: 'X', dates: '2020 - Present', description: '', employmentType: '' }] }
+  );
+  eq(merged.experience.length, 1, 'the card-only re-read is the same row');
+  eq(merged.experience[0].description, 'Long text', 'and the richer reading is kept');
+  eq(merged.verified, true, 'a false from a reader that did not see the badge does not erase a true');
+});
+
+check('reshared media is counted and listed', () => {
+  loadFixture();
+  const post = Object.assign({}, POSTS[0], {
+    activityId: '7100000000000000098', type: 'repost', text: '', media: [],
+    repost: { author: 'Someone', postUrl: 'https://www.linkedin.com/feed/update/9/', text: 'orig', media: [{ type: 'image', url: 'https://media.licdn.com/r/o.jpg', alt: 'a cover' }] }
+  });
+  const meta = BG.metadataFileText(post, 1);
+  ok(/RESHARED MEDIA \(1\)/.test(meta) && /reshared_01\.jpg/.test(meta), 'metadata.txt lists it by file name');
+  const rows = csvRows(BG.postsCsv([post]));
+  const head = csvFields(rows[0]);
+  eq(csvFields(rows[1])[head.indexOf('reshared_media_count')], '1');
+});
+
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
 if (failures.length) process.exit(1);

@@ -73,7 +73,7 @@
    * ran. The popup sat on "Packaging…" with a frozen counter and every button
    * disabled, and the keep-alive dutifully kept the worker alive for it.
    */
-  const FETCH_TIMEOUT_MS = 60000;
+  let FETCH_TIMEOUT_MS = 60000;
 
   /** Set by ZIP_CANCEL so a cancel is felt inside a batch, not after it. */
   let cancelled = false;
@@ -102,25 +102,25 @@
        * then blamed an expired CDN link. A stall is a *gap*: sixty seconds
        * with no bytes at all.
        */
-      if (!res.body || !res.body.getReader) return await res.blob();
-      const reader = res.body.getReader();
-      const chunks = [];
-      for (;;) {
-        clearTimeout(timer);
-        timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (cancelled) {
-          try {
-            await reader.cancel();
-          } catch (_) {
-            /* already closed */
+      if (!res.body || typeof TransformStream !== 'function') return await res.blob();
+      /*
+       * Watched, not buffered. Draining the stream into an array held the
+       * whole file on the JS heap — a 200 MB video, four at a time — and
+       * then copied it into a Blob. Piping through a pass-through lets Blink
+       * build the blob the way res.blob() does, in its disk-backed store,
+       * while each chunk still restarts the deadline.
+       */
+      const watched = res.body.pipeThrough(
+        new TransformStream({
+          transform(chunk, controller) {
+            clearTimeout(timer);
+            timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
+            if (cancelled) throw new Error('cancelled');
+            controller.enqueue(chunk);
           }
-          throw new Error('cancelled');
-        }
-        chunks.push(value);
-      }
-      return new Blob(chunks, { type: res.headers.get('content-type') || '' });
+        })
+      );
+      return await new Response(watched, { headers: res.headers }).blob();
     } catch (err) {
       if (ctl.signal.aborted) throw timedOut();
       throw err;
@@ -162,7 +162,10 @@
   /** Divides the archive's frame budget among its videos. */
   function shareFrameBudget(videoCount) {
     const videos = Math.max(1, Number(videoCount) || 1);
-    framesPerVideo = Math.max(30, Math.floor(MACHINE.maxFramesPerExport / videos));
+    // No floor: a floor of thirty times forty videos exceeded the ceiling,
+    // and the videos at the tail of the archive got nothing at all. A small
+    // share is still a sequence; an empty folder is not.
+    framesPerVideo = Math.max(1, Math.floor(MACHINE.maxFramesPerExport / videos));
     return framesPerVideo;
   }
 
@@ -304,8 +307,16 @@
       const asked = Math.max(0.1, Number(intervalSec) || 1);
       const share = Math.max(1, Math.min(FRAMES.MAX_PER_VIDEO, framesPerVideo));
       const step = Math.max(asked, duration / share);
+      /*
+       * By index, and bounded by the share. Adding the step repeatedly lands
+       * a hair short of the end — 100 s at a third-of-a-second step reached
+       * 99.99999999999997 — and took one frame over the share, so every video
+       * overshot and the last one was reported as cut by the ceiling.
+       */
+      const planned = Math.min(FRAMES.MAX_PER_VIDEO, share, Math.ceil(duration / step));
       let hitCeiling = false;
-      for (let t = 0; t < duration && count < FRAMES.MAX_PER_VIDEO; t += step) {
+      for (let i = 0; i < planned; i++) {
+        const t = i * step;
         if (cancelled) throw new Error('cancelled');
         if (framesThisExport >= MACHINE.maxFramesPerExport) {
           hitCeiling = true;
@@ -534,6 +545,6 @@
    * that contains a video.
    */
   if (globalThis.__LIS_OFFSCREEN_TEST__) {
-    Object.assign(globalThis.__LIS_OFFSCREEN_TEST__, { extractFrames, FRAMES, framesReadme, fetchBlob, MACHINE, shareFrameBudget });
+    Object.assign(globalThis.__LIS_OFFSCREEN_TEST__, { extractFrames, FRAMES, framesReadme, fetchBlob, MACHINE, shareFrameBudget, setFetchTimeout: (ms) => { FETCH_TIMEOUT_MS = ms; } });
   }
 })();

@@ -98,14 +98,15 @@ their API" from the outside. So it lives in its own file, has no DOM or
 `chrome.*` dependency, and is tested in isolation:
 
 ```
-node tools/test.mjs               416 assertions, no dependencies
+node tools/test.mjs               420 assertions, no dependencies
 
   resolver-test.mjs   58   URN resolution, session cookies, Rest.li encoding
   utils-test.mjs      33   public-id normalisation, CSV escaping
   engine-test.mjs     81   session detection, entity mapping, post kinds, profile
   export-test.mjs     62   archive tree, CSV, JSON, README, path collisions
   wiring-check.mjs    34   manifest / popup / message wiring, safety limits
-  regression-test.mjs 148  tab navigation, timeouts, Stop, profile reads, packaging
+  regression-test.mjs 152  tab navigation, timeouts, Stop, profile reads, packaging
+  shapes-test.mjs      22  the readers against 22 page shapes (opt-in: needs a browser)
 ```
 
 None of it can talk to LinkedIn, which is the point — it covers exactly the
@@ -699,6 +700,134 @@ Three things followed from it:
   company alongside the title, so self-employed, freelance, and roles at a
   company LinkedIn has since deleted were dropped. A title plus a date range is
   a job.
+
+## Everything the profile has, by default
+
+The brief for this build: *scrape every single data — if I do not mention it,
+scrape it anyway.* Measured against that, the previous build was missing more
+than it had.
+
+**Seven profile sections were never read at all** — patents, test scores,
+organizations, volunteer causes, recommendations, interests, featured. A
+profile with any of them exported as though it had none. All fourteen sections
+LinkedIn renders are read now, from the card, from the "Show all" page, and
+from the page payload; recommendations and interests are tabbed pages, so each
+tab is its own fetch and every row says which tab it came from.
+
+**The contact-info overlay is its own URL and nothing had ever fetched it.**
+Email, phone, birthday, address, listed websites, Twitter — read from its
+markup and from its embedded payload, merged.
+
+**The top card's pronouns, verification badge, Open-to-work frame, current
+company and school, and personal sites** were on the page the reader was
+already holding and were not being written down. Read now — and read from the
+card that holds the `<h1>` rather than all of `<main>`, because scanning the
+whole page made the first `/company/` link anywhere (a past employer, an
+interest) the current company, and every post's outbound link a "website".
+
+**Per post:** @mentions with the profile they point at, image alt text, the
+edited marker, comment replies threaded under what they answer, a reshare's
+original media downloaded beside the post, and the post's *own* words — the
+longest-string rule had been handing a reshare the original's body and an
+article post its summary.
+
+**Comments are on by default.** They were the one opt-in, which meant
+"everything" was never the default. The export's DATA HANDLING notice says what
+that means for other people's data; the checkbox is still there.
+
+**Every section gets its own file** beside `experience.txt`, and there is a
+`contact.txt` and a `skills.txt`.
+
+## One page, many shapes
+
+Every fixture the readers had been tested against was written by the same hand
+that wrote the readers. So a new test renders **one profile eight ways, its
+"Show all" page six ways, and one feed card eight ways** — same facts,
+different markup — and each reader has to produce the same answer from all of
+them:
+
+```
+                      before   after
+profile page          3 / 8    8 / 8
+"Show all" page       4 / 6    6 / 6
+feed card             3 / 8    8 / 8
+```
+
+Every reader had exactly one strategy: rows are `<li>`, text is in
+`span[aria-hidden]`, the section is an anchor div with that id, the URN is on
+the card root. When the assumption was false the reader returned nothing — or
+worse. The grouped shape, which is what LinkedIn renders for several roles at
+one employer, filed the company as a job title and each role's employment type
+as its company:
+
+```
+before   Studio Nine @ ""  ·  Junior Editor @ Full-time  ·  Intern @ Internship
+after    Junior Editor @ Studio Nine  ·  Intern @ Studio Nine
+```
+
+Rows now come from any of LinkedIn's entry selectors; their text from
+aria-hidden spans, then screen-reader copies, then the leaf text of the row; a
+section is found by its anchor or by its heading; a group of roles under a
+company is expanded with the company spliced into each. Feed cards climb from
+the URN node to the card that owns it, keep a reshared inner card as the
+original rather than a second post, open "…see more" before reading and strip
+it if it stayed closed (and mark the post so the detail pass fetches the whole
+body), read background images, and fall back to the words "1,234 reactions"
+when no selector matches.
+
+The test is `tools/shapes-test.mjs`. It needs a browser, so it is opt-in:
+`npm i -D playwright`, then `node tools/shapes-test.mjs`.
+
+## Sized to the machine
+
+Measured before it was written: packing twenty one-minute videos with a still
+per second held about 550 MB above Chrome's own floor and took 138 seconds on
+four cores. Fine on a workstation; a bad afternoon on a 4 GB laptop with two.
+
+```
+                       baseline    5 videos    20 videos
+peak Chrome RSS         834 MB     1,287 MB    1,379 MB
+wall time                          35 s        138 s
+```
+
+The fetch concurrency, the frame edge and a per-archive frame ceiling now scale
+with `navigator.deviceMemory` and `hardwareConcurrency`, and the ceiling is
+shared out among the archive's videos rather than first-come — first-come gave
+the first three videos every still and the other seventeen an empty folder.
+`frames.txt` says what was widened and why.
+
+Three more things a weak machine or a slow link would have hit:
+
+- **The media deadline was a total-transfer timeout.** A 200 MB video at
+  2 MB/s is a hundred seconds; it was dropped at sixty and blamed on an expired
+  CDN link. The deadline is sixty seconds *between bytes* now.
+- **Cancel was not felt inside a video decode.** Up to 900 seeks on two cores
+  with a frozen counter. A pending seek returns on Cancel now.
+- **A one-post update rewrote its whole 100-post chunk plus the state** — about
+  7 MB per update during the comment pass, gigabytes over a 500-post run.
+  Chunks are 25 posts.
+
+Found on the way: a file whose container carries no duration reports
+`Infinity`, and the extractor gave up on it — no frames for a video that would
+have decoded fine.
+
+## The archive, as a place someone opens
+
+- **An index.** `Posts/index.txt` maps every post — number, date, kind, folder,
+  first line, permalink, comment count — and `index_by_date.txt` is the same
+  sorted newest first. Posts are grouped by kind, so reading in order meant
+  jumping between folders with nothing saying which folder held post 7.
+- **The README's file list is generated** from what was actually written, so
+  it cannot drift from the archive the way a hand-kept one had.
+- **`metadata.txt` names the files beside it.** It numbered media 1..N across
+  every kind while the files were numbered per kind; both sides now ask one
+  naming helper.
+- **`posts.csv` carries** the stable activity id, the archive number, timestamp
+  provenance, truncation, one column per reaction kind, comment-capture status,
+  and mentions — 30 columns, found by name in the tests rather than by index.
+- **`comments.txt` threads replies** under what they answer, and says when a
+  reply's parent was not captured; a post whose comment count is *unknown* no
+  longer reads as "(no comments)".
 
 ## Where he works — the other four ways it went missing
 

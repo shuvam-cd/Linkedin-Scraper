@@ -3007,27 +3007,45 @@
     const hidden = safeQueryAll(row, '.visually-hidden').filter(own).map((el) => el.textContent);
     if (hidden.length) return clean(hidden);
 
-    // Leaf text: an element with text of its own and no element child that has text.
+    /*
+     * Leaf text, per block. Inline markup — <strong>Skills:</strong> beside
+     * its words, a name inside an <a> — is part of the line it sits in, not a
+     * line of its own; walking element children only threw the surrounding
+     * text nodes away. Text is gathered per block-level element instead.
+     */
+    const INLINE = /^(A|STRONG|EM|B|I|U|SPAN|SMALL|MARK|ABBR|CODE|TIME|LABEL)$/i;
     const leaves = [];
-    const walk = (el) => {
-      if (!el || el.nodeType !== 1) return;
-      if (el !== row && safeClosest(el, ROW_SEL) !== row) return; // nested entry
-      if (/^(BUTTON|SVG|IMG|SCRIPT|STYLE)$/i.test(el.tagName)) return;
-      let childHasText = false;
-      for (const c of el.children || []) {
-        if ((c.textContent || '').trim()) {
-          childHasText = true;
+    const gather = (el, into) => {
+      // An inline element is part of its parent's line only when the parent
+      // has words of its own beside it. A row made of bare <span>s, one per
+      // field, has no such words, and each span is then a line of its own.
+      let directText = false;
+      for (const c of el.childNodes || []) {
+        if (c.nodeType === 3 && String(c.data || '').trim()) {
+          directText = true;
           break;
         }
       }
-      if (!childHasText) {
-        const t = (el.textContent || '').trim();
-        if (t) leaves.push(t);
-        return;
+      for (const c of el.childNodes || []) {
+        if (c.nodeType === 3) {
+          into.push(c.data);
+        } else if (c.nodeType === 1) {
+          if (/^(BUTTON|SVG|IMG|SCRIPT|STYLE)$/i.test(c.tagName)) continue;
+          if (c !== row && safeClosest(c, ROW_SEL) !== row) continue; // nested entry
+          if (INLINE.test(c.tagName) && directText) gather(c, into);
+          else {
+            const own = [];
+            gather(c, own);
+            const t = own.join('').replace(/\s+/g, ' ').trim();
+            if (t) leaves.push(t);
+          }
+        }
       }
-      for (const c of el.children || []) walk(c);
     };
-    walk(row);
+    const top = [];
+    gather(row, top);
+    const rowOwn = top.join('').replace(/\s+/g, ' ').trim();
+    if (rowOwn) leaves.unshift(rowOwn);
     return clean(leaves);
   }
 
@@ -3037,6 +3055,40 @@
       const parentRow = safeClosest(el.parentElement, ROW_SEL);
       return parentRow === row;
     });
+  }
+
+  /**
+   * The entry itself, under LinkedIn's wrapping.
+   *
+   * On the live page every <li> holds one entity <div> that carries all of
+   * the item's text, and both match ROW_SEL. Read as row-and-group, the
+   * <li> owned no spans and the <div> became a nested "role" — a flat entry
+   * survived by accident, a grouped company lost its roles, and a skill lost
+   * its name. A row that has exactly one row-child holding all its text is a
+   * wrapper: step through it.
+   */
+  function unwrap(row) {
+    let el = row;
+    for (let i = 0; i < 4; i++) {
+      const kids = nestedRows(el);
+      if (kids.length !== 1) return el;
+      const inner = kids[0];
+      const outerText = String(el.textContent || '').replace(/\s+/g, ' ').trim();
+      const innerText = String(inner.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!outerText || innerText !== outerText) return el;
+      el = inner;
+    }
+    return el;
+  }
+
+  /**
+   * Whether a nested row reads as a role — a title with a date *range*
+   * beside it. A bare duration is not enough: a grouped company's header
+   * carries one ("2 yrs 2 mos"), and taking that as a role read the header
+   * as the entry and its roles as its tail.
+   */
+  function looksLikeRole(spans) {
+    return spans.length >= 2 && (isDateRange(spans[1]) || isDateRange(spans[2]));
   }
 
   /** Outbound links inside an entry, excluding LinkedIn's own. */
@@ -3080,35 +3132,52 @@
       rows.push(spans);
     };
 
-    for (const row of topLevel) {
-      if (rows.length >= cap) break;
+    /*
+     * One entry, or a group of them. A group is a company header whose
+     * nested rows read as roles — a title with a date beside it. Anything
+     * else nested under an entry (an endorsement count under a skill, a
+     * "Skills:" line or a description under a role) is part of that entry
+     * and is appended to its own strings, where tailFields sorts it out.
+     * Treating "has nested text" as "is a group" threw the parent's own
+     * strings away and filed the nested line as an entry of its own.
+     */
+    const readEntry = (raw, inheritedCompany, depth) => {
+      if (rows.length >= cap || depth > 3) return;
+      const row = unwrap(raw);
       const spans = rowSpans(row);
-      const children = nestedRows(row);
-      if (!children.length) {
-        push(spans, row);
-        continue;
+      const children = nestedRows(row).map(unwrap);
+      const childSpans = children.map((c) => rowSpans(c));
+      const roles = children.filter((c, i) => looksLikeRole(childSpans[i]) || nestedRows(c).some((g) => looksLikeRole(rowSpans(unwrap(g)))));
+
+      if (roles.length && !looksLikeRole(spans)) {
+        // A company header with roles beneath it. Its first string names the
+        // company; each role is read as its own entry with that name.
+        const company = spans[0] || inheritedCompany || '';
+        for (const sub of roles) readEntry(sub, company, depth + 1);
+        return;
       }
-      // A group. Its own strings name the company; each nested row is a role.
-      const company = spans[0] || '';
-      let any = false;
-      for (const sub of children) {
-        const sp = rowSpans(sub);
-        if (!sp.length) continue;
-        any = true;
-        const merged = sp.slice();
-        if (company) {
-          // The role's own second string is its employment type; the company
-          // goes ahead of it in the same "Company · Type" form a flat row uses.
-          const type = merged[1] && !looksLikeDateRange(merged[1]) && merged[1] !== company ? merged[1] : '';
-          merged.splice(1, type ? 1 : 0, type ? `${company} · ${type}` : company);
+
+      const merged = spans.slice();
+      if (inheritedCompany) {
+        // The role's own second string is its employment type, or repeats the
+        // company; either way the result is the "Company · Type" form a flat
+        // row uses, and never the company twice.
+        const second = merged[1] || '';
+        const names = second && second.split('·')[0].trim().toLowerCase() === inheritedCompany.toLowerCase();
+        if (!names) {
+          const type = second && !looksLikeDateRange(second) ? second : '';
+          merged.splice(1, type ? 1 : 0, type ? `${inheritedCompany} · ${type}` : inheritedCompany);
         }
-        push(merged, sub);
-        if (rows.length >= cap) break;
       }
-      // A "group" with no readable roles is just an entry with a sub-list
-      // (a skill and its endorsements, say) — keep it as itself.
-      if (!any) push(spans, row);
-    }
+      // Whatever else sits under the entry belongs to it.
+      children.forEach((c, i) => {
+        if (roles.includes(c)) return;
+        for (const t of childSpans[i]) merged.push(t);
+      });
+      push(merged, row);
+    };
+
+    for (const row of topLevel) readEntry(row, '', 0);
     return rows;
   }
 
@@ -3145,6 +3214,13 @@
   /** "Jan 2020 - Present", "2019 - 2023", "2 yrs 3 mos" — a date, not a name. */
   function looksLikeDateRange(s) {
     return DATE_RANGE_RE.test(String(s == null ? '' : s).trim());
+  }
+
+  const DURATION_ONLY_RE = /^(?:present\b|\d+\s*(?:yrs?|mos?|years?|months?)\b)/i;
+  /** A range — two ends, or an end and "Present" — and not merely a length. */
+  function isDateRange(s) {
+    const t = String(s == null ? '' : s).trim();
+    return DATE_RANGE_RE.test(t) && !DURATION_ONLY_RE.test(t);
   }
 
   /**
@@ -3497,7 +3573,9 @@
       } catch (_) {
         continue;
       }
-      if (v.indexOf('urn:li:activity:') >= 0) return v;
+      // The post's own URN, not a comment or reaction URN that embeds it:
+      // those sit inside the card and would read as a second post.
+      if (/^urn:li:activity:\d+/.test(v)) return v;
     }
     return '';
   }
@@ -3530,6 +3608,7 @@
   /** For every ancestor of the given URN nodes, how many of them it contains. */
   function countUrnsPerAncestor(nodes, top) {
     const counts = new Map();
+    const counted = new Map(); // ancestor -> set of activity ids beneath it
     for (const n of nodes) {
       // A reshare's inner URN belongs to its outer card; count the pair once.
       let outerMost = n;
@@ -3537,7 +3616,13 @@
         if (activityUrnOf(a)) outerMost = a;
       }
       if (outerMost !== n) continue;
+      const id = VY.activityId(activityUrnOf(n));
       for (let a = n.parentElement; a && a !== top && a !== document.body; a = a.parentElement) {
+        // The same post's URN on two nested elements is one post, not two.
+        let ids = counted.get(a);
+        if (!ids) counted.set(a, (ids = new Set()));
+        if (ids.has(id)) continue;
+        ids.add(id);
         counts.set(a, (counts.get(a) || 0) + 1);
       }
     }
@@ -3562,10 +3647,16 @@
     const innerOf = new Map(); // outer activityId -> inner node
     const inner = new Set();
     for (const el of nodes) {
-      const outer = safeClosest(el.parentElement, URN_SEL);
+      const ownId = VY.activityId(activityUrnOf(el));
+      // The nearest URN ancestor that is a *different* post. LinkedIn wraps a
+      // card in a data-id holder carrying the same URN as the data-urn inside
+      // it; read as a reshare of itself, the card's text and media were
+      // emptied into `repost`.
+      let outer = safeClosest(el.parentElement, URN_SEL);
+      while (outer && VY.activityId(activityUrnOf(outer)) === ownId) outer = safeClosest(outer.parentElement, URN_SEL);
       if (!outer) continue;
       const outerId = VY.activityId(activityUrnOf(outer));
-      if (!outerId) continue;
+      if (!outerId || outerId === ownId) continue;
       inner.add(el);
       if (!innerOf.has(outerId)) innerOf.set(outerId, el);
     }
@@ -3576,6 +3667,10 @@
       if (inner.has(el)) continue;
       const activityId = VY.activityId(activityUrnOf(el));
       if (!activityId || seen.has(activityId)) continue;
+      // An inner node carrying the same URN as its holder: read from the
+      // holder, which is the outermost element of this post.
+      let holder = safeClosest(el.parentElement, URN_SEL);
+      if (holder && VY.activityId(activityUrnOf(holder)) === activityId) continue;
       seen.add(activityId);
       // Every round re-read every card on the page and then threw away the
       // ones already collected. Reading only the new ones keeps a round's
@@ -3777,21 +3872,21 @@
       }
       return false;
     };
-    grab(['[class*="social-details-social-counts__reactions-count"]', '[aria-label*="reaction"]', '[data-reaction-details]'], 'reactions');
-    grab(['[aria-label*="comment"]', '[class*="social-details-social-counts__comments"]'], 'comments');
-    grab(['[aria-label*="repost"]', '[class*="social-details-social-counts__reposts"]'], 'reposts');
+    grab(['[class*="social-details-social-counts__reactions-count"]', '[aria-label*="reaction" i]', '[data-reaction-details]'], 'reactions');
+    grab(['[class*="social-details-social-counts__comments"]', '[aria-label*="comments" i]'], 'comments');
+    grab(['[class*="social-details-social-counts__reposts"]', '[aria-label*="reposts" i]'], 'reposts');
 
-    if (out.reactions == null || out.comments == null || out.reposts == null) {
-      let text = '';
-      try {
-        text = String(el.innerText || el.textContent || '');
-      } catch (_) {
-        text = '';
-      }
-      if (exclude) {
-        const inner = String(exclude.innerText || exclude.textContent || '');
-        if (inner) text = text.replace(inner, '');
-      }
+    /*
+     * The words themselves — but only the strip's words. Scanning the whole
+     * card found "3 comments" in a post body, or a comment's own count. And a
+     * strip that exists but lacks a counter means that count is zero:
+     * LinkedIn omits the comments and reposts counters entirely at zero.
+     */
+    const strips = safeQueryAll(el, '.social-details-social-counts, .feed-shared-social-action-bar, [class*="social-counts"]').filter(
+      (n) => !(exclude && exclude.contains(n))
+    );
+    if (strips.length) {
+      let text = strips.map((n) => String(n.textContent || '') + ' ' + safeQueryAll(n, '[aria-label]').map((a) => a.getAttribute('aria-label')).join(' ')).join(' ');
       const words = (re) => {
         const m = text.replace(/,/g, '').match(re);
         return m ? parseCompact(m[1]) : null;
@@ -3799,6 +3894,8 @@
       if (out.reactions == null) out.reactions = words(/([\d.]+[KMB]?)\s*(?:reactions?|likes?)\b/i);
       if (out.comments == null) out.comments = words(/([\d.]+[KMB]?)\s*comments?\b/i);
       if (out.reposts == null) out.reposts = words(/([\d.]+[KMB]?)\s*reposts?\b/i);
+      if (out.comments == null) out.comments = 0;
+      if (out.reposts == null) out.reposts = 0;
     }
     return out;
   }

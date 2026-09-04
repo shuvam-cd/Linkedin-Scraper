@@ -98,15 +98,15 @@ their API" from the outside. So it lives in its own file, has no DOM or
 `chrome.*` dependency, and is tested in isolation:
 
 ```
-node tools/test.mjs               420 assertions, no dependencies
+node tools/test.mjs               434 assertions, no dependencies
 
   resolver-test.mjs   58   URN resolution, session cookies, Rest.li encoding
   utils-test.mjs      33   public-id normalisation, CSV escaping
-  engine-test.mjs     81   session detection, entity mapping, post kinds, profile
+  engine-test.mjs     89   session detection, entity mapping, post kinds, profile, mappers
   export-test.mjs     62   archive tree, CSV, JSON, README, path collisions
   wiring-check.mjs    34   manifest / popup / message wiring, safety limits
-  regression-test.mjs 152  tab navigation, timeouts, Stop, profile reads, packaging
-  shapes-test.mjs      22  the readers against 22 page shapes (opt-in: needs a browser)
+  regression-test.mjs 158  tab navigation, timeouts, Stop, profile reads, packaging, storage
+  shapes-test.mjs      25  the readers against 25 page shapes (opt-in: needs a browser)
 ```
 
 None of it can talk to LinkedIn, which is the point — it covers exactly the

@@ -132,6 +132,34 @@ const VARIANTS = {
   'V9 French headings, no anchor ids': (F) => head(F.name, F.headline) +
     headingOnly('Expérience', ul(F.exp, ariaPair)) + headingOnly('Formation', ul(F.edu, ariaPair)) + headingOnly('Compétences', ul(F.skills.map((s) => [s]), ariaPair)) + tail,
 
+  // LinkedIn's live markup: every <li> holds one entity <div> carrying all
+  // its text, and a role's extras (a Skills line, a description) sit in a
+  // sub-components list beneath it. A grouped company nests its roles the
+  // same way, one level further down.
+  'V11 LinkedIn\'s wrapper divs and sub-component lists': (F) => {
+    const ent = (inner) => `<div data-view-name="profile-component-entity">${inner}</div>`;
+    const sub = (inner) => `<div class="pvs-entity__sub-components"><ul><li>${ent(inner)}</li></ul></div>`;
+    const li = (inner) => `<li class="artdeco-list__item">${ent(inner)}</li>`;
+    const exp = `<ul>
+      ${li(F.exp[0].map(ariaPair).join('') + sub(ariaPair('Skills: Editing · Strategy')))}
+      ${li(F.exp[1].map(ariaPair).join('') + sub(ariaPair('Built the studio from zero to a team of six.')))}
+      ${li(ariaPair('Studio Nine') + ariaPair('Full-time · 1 yr 9 mos') + `<div class="pvs-entity__sub-components"><ul>
+        <li>${ent(ariaPair('Junior Editor') + ariaPair('Studio Nine') + ariaPair('Jun 2017 - Feb 2019 · 1 yr 9 mos') + ariaPair('Kolkata, India'))}</li>
+      </ul></div>`)}
+    </ul>`;
+    const skills = `<ul>${F.skills.map((s) => li(ariaPair(s) + sub(ariaPair('3 endorsements')))).join('')}</ul>`;
+    const edu = `<ul>${F.edu.map((r) => li(r.map(ariaPair).join('') + sub(ariaPair('Grade: First')))).join('')}</ul>`;
+    return head(F.name, F.headline) + anchored('experience', exp) + anchored('education', edu) + anchored('skills', skills) + tail;
+  },
+
+  // No spans at all, and inline markup inside a line: the words around a
+  // <strong> and inside an <a> belong to the line they sit in.
+  'V12 mixed inline markup, no spans': (F) => {
+    const line = (t) => `<div class="t-14">${t}</div>`;
+    const rows = F.exp.map((r) => `<li>${line(`<a href="https://www.linkedin.com/company/x/">${r[0]}</a>`)}${line(r[1])}${line(r[2])}${line(r[3])}${line('<strong>Skills:</strong> Editing · Strategy')}</li>`).join('');
+    return head(F.name, F.headline) + anchored('experience', `<ul>${rows}</ul>`) + anchored('education', ul(F.edu, bareText)) + anchored('skills', ul(F.skills.map((s) => [s]), bareText)) + tail;
+  },
+
   // Everything a top card can carry — and, below it, a section full of links
   // that belong to posts and past employers, none of which is the profile's.
   'V10 a full top card, with a linky section beneath it': (F) => `<!doctype html><html><head><meta charset="utf-8"></head><body><nav id="global-nav"><img src="https://media.licdn.com/dms/image/v2/D56/profile-displayphoto-shrink_100_100/0/99?e=1" alt="Viewer"></nav><main>
@@ -162,9 +190,20 @@ async function profileShapes(browser) {
       const p = globalThis.__LIS_TEST__.profileFromDom('sumon', document);
       const e0 = (p.experience || [])[0] || {};
       return { name: p.fullName, exp: (p.experience || []).length, edu: (p.education || []).length, skills: (p.skills || []).length, first: `${e0.title || '?'} @ ${e0.company || '?'}`,
+               roles: (p.experience || []).map((e) => `${e.title} @ ${e.company}`), firstSkills: e0.skills || [], firstDescription: e0.description || '',
+               skillNames: p.skills || [], grade: ((p.education || [])[0] || {}).grade || '',
                pronouns: p.pronouns, verified: p.verified, openTo: p.openTo, company: p.currentCompany, school: p.currentSchool, websites: p.websites, photo: p.photoUrl };
     });
     let ok = r.name === FACTS.name && r.exp === 3 && r.edu === 2 && r.skills === 3 && r.first === 'Founder @ Content Daddy';
+    if (label.startsWith('V11')) {
+      // The grouped role gets its company once; the Skills line reaches the
+      // role; the endorsement count is not a skill; the grade is a grade.
+      ok = ok && r.roles.includes('Junior Editor @ Studio Nine') && !r.roles.some((x) => /^Studio Nine @|Skills:|endorsements/.test(x))
+        && r.firstSkills.join('|') === 'Editing|Strategy' && r.skillNames.join('|') === FACTS.skills.join('|') && r.grade === 'First';
+    }
+    if (label.startsWith('V12')) {
+      ok = ok && r.firstSkills.join('|') === 'Editing|Strategy' && r.firstDescription === '';
+    }
     if (label.startsWith('V10')) {
       // The card's own facts, and none of the section-below's links.
       ok = ok && r.pronouns === 'she/her' && r.verified === true && r.openTo === 'Open to work' && r.company === 'Content Daddy' && r.school === 'University of Calcutta'
@@ -235,10 +274,11 @@ async function detailShapes(browser) {
 }
 
 /* ---------------- one feed card, eight ways ---------------- */
-const { TEXT, TEXT9, FEED_VARIANTS } = (() => {
+const { TEXT, TEXT9, TEXT10, FEED_VARIANTS } = (() => {
 const URN = 'urn:li:activity:7100000000000000001';
 const TEXT = 'Post number 1 about repurposing podcast footage into a month of clips.';
 const TEXT9 = 'If you want to see more of this, say so — see more posts like it every week.';
+const TEXT10 = 'We got 3 comments on the first draft and 900 reposts on the second — here is what changed.';
 const IMG = 'https://media.licdn.com/dms/image/v2/D56/feedshare-shrink_800/0/17?e=1';
 const wrap = (inner) => `<!doctype html><html><body><nav id="global-nav"></nav><main>${inner}</main></body></html>`;
 const social = `<div class="social-details-social-counts"><button aria-label="1,234 reactions"><span>1,234</span></button><button aria-label="56 comments">56 comments</button><button aria-label="7 reposts">7 reposts</button></div>`;
@@ -270,11 +310,17 @@ const FEED_VARIANTS = {
 
   // The post itself says "see more". Removing the button's text by first
   // occurrence would cut the post; only the trailing button may go.
+  // LinkedIn's scroll container: a data-id holder carrying the same URN as
+  // the card inside it, a comment node embedding the activity URN, a body that
+  // mentions a count, and no reposts counter at all (LinkedIn omits it at 0).
+  'F10 same-URN holder and inner card, a comment URN, a body that says "3 comments"':
+    wrap(`<div data-id="${URN}"><div class="feed-shared-update-v2" data-urn="${URN}"><div class="update-components-text">${TEXT10}</div><img src="${IMG}"><div class="social-details-social-counts"><button aria-label="1,234 reactions">1,234</button><button aria-label="56 comments">56 comments</button></div><div class="comments-comments-list"><article data-id="urn:li:comment:(${URN},7777)"><span>Nice — 3 comments already</span></article></div></div></div>`),
+
   'F9 the post text itself contains "see more"':
     wrap(`<div data-urn="${URN}"><div class="update-components-text"><span dir="ltr" id="tt9">${TEXT9}</span><button class="feed-shared-inline-show-more-text__see-more-less-toggle">see less</button></div><img src="${IMG}">${social}</div>`)
 };
 
-  return { TEXT, TEXT9, FEED_VARIANTS };
+  return { TEXT, TEXT9, TEXT10, FEED_VARIANTS };
 })();
 
 async function feedShapes(browser) {
@@ -293,7 +339,10 @@ async function feedShapes(browser) {
       ? r.n === 1 && r.type === 'repost' && r.text === '' && r.media === 0 && r.repostText === TEXT && r.repostMedia === 1 && counts
       : label.startsWith('F9')
         ? r.n === 1 && r.text === TEXT9 && r.media === 1 && counts && !r.truncated
-        : r.n === 1 && r.id === '7100000000000000001' && r.text === TEXT && r.media === 1 && counts && !r.truncated;
+        : label.startsWith('F10')
+          // one post, its own text and picture, the strip's counts, and zero reposts — not 900
+          ? r.n === 1 && r.type !== 'repost' && r.text === TEXT10 && r.media === 1 && r.reactions === 1234 && r.comments === 56 && r.reposts === 0
+          : r.n === 1 && r.id === '7100000000000000001' && r.text === TEXT && r.media === 1 && counts && !r.truncated;
     report(label, ok, ok ? '' : JSON.stringify(r));
     await page.close();
   }

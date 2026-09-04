@@ -446,11 +446,15 @@
     const until = Date.now() + ms;
     let left = ms;
     while (left > 0) {
-      if (S.stop) throw new Abort('stopped', 'Stopped by user');
+      throwIfStopped();
       log('warn', `${why} — waiting ${Math.ceil(left / 1000)}s...`);
-      await U.sleep(Math.min(10000, left));
+      // Slept in 400 ms slices (pause), logged every ten seconds. A raw ten
+      // second sleep meant a Stop pressed during a three-minute 429 back-off
+      // was not seen for up to ten seconds.
+      await pause(Math.min(10000, left));
       left = until - Date.now();
     }
+    throwIfStopped();
   }
 
   function spendRequest() {
@@ -500,7 +504,10 @@
         continue;
       }
 
-      await limiter.wait();
+      await limiter.wait(0, () => S.stop);
+      // A Stop that landed in the gap must not issue one more request — the
+      // deadline is 45 s and nothing else would have cut it short.
+      throwIfStopped();
       spendRequest();
 
       let res;
@@ -1952,14 +1959,22 @@
    * the whole history rather than the two roles that fitted on screen.
    */
   async function getProfile(publicId) {
+    // Up to a page, seventeen "Show all" pages and their tabs, and the contact
+    // overlay come before the first post. Without a stage of their own the
+    // popup sat on "Scraping 0 / N · 0%" for minutes with an empty card.
+    setStage('profile', 0);
     const profile = await readProfile(publicId);
     if (!profile) return profile;
-    if (S.cfg && S.cfg.fullProfile === false) return withCurrentPosition(profile);
+    if (S.cfg && S.cfg.fullProfile === false) {
+      setStage('harvest', (S.cfg && S.cfg.maxPosts) || 0);
+      return withCurrentPosition(profile);
+    }
 
     // Collected while the profile was being read, off whichever document that
     // read used — fetching the page a second time just to look at its links
     // would spend a request for something already in hand.
     const full = await enrichFromDetailPages(publicId, profile, S.detailLinks || new Set());
+    setStage('harvest', (S.cfg && S.cfg.maxPosts) || 0);
 
     /*
      * Recomputed here, after enrichment, and not only at the end of the read.
@@ -2699,6 +2714,8 @@
     for (const d of wanted) {
       for (const tab of d.tabs || [null]) fetches.push({ d, tab });
     }
+    // The pages, plus the contact overlay that follows them.
+    setStage('profile', fetches.length + 1);
 
     let added = 0;
     for (const { d, tab } of fetches) {
@@ -2739,6 +2756,7 @@
         if (err instanceof Abort) throw err;
         log('warn', `Could not read the full ${d.key} list (${err.message}) — keeping what the profile card showed.`);
       }
+      bumpStage();
       await pause(U.randOf(L.PAGE_DELAY));
     }
 
@@ -2763,6 +2781,7 @@
         if (Array.isArray(fromDoc.websites) || Array.isArray(fromPayload.websites)) {
           contact.websites = mergeById(fromDoc.websites, fromPayload.websites, (u) => String(u));
         }
+        bumpStage();
         if (Object.keys(contact).length) {
           profile.contact = Object.assign({}, profile.contact || {}, contact);
           if (Array.isArray(contact.websites)) {
@@ -3534,7 +3553,7 @@
    * A URN node with a URN ancestor is the inner card: it is recorded on the
    * outer as what was reshared, and not as a post.
    */
-  function harvestFeedCards() {
+  function harvestFeedCards(alreadySeen) {
     const found = [];
     const seen = new Set();
     const nodes = safeQueryAll(document, URN_SEL);
@@ -3557,6 +3576,10 @@
       const activityId = VY.activityId(activityUrnOf(el));
       if (!activityId || seen.has(activityId)) continue;
       seen.add(activityId);
+      // Every round re-read every card on the page and then threw away the
+      // ones already collected. Reading only the new ones keeps a round's
+      // cost proportional to what it adds, not to the length of the feed.
+      if (alreadySeen && alreadySeen.has(activityId)) continue;
       found.push(readCard(el, activityId, innerOf.get(activityId) || null, urnCount));
     }
     return found;
@@ -3592,7 +3615,7 @@
         if (safeClosest(n, CARD_CHROME)) continue;
         let t = String(n.innerText || n.textContent || '');
         for (const b of safeQueryAll(n, 'button')) {
-          const bt = String(b.innerText || b.textContent || '').trim();
+          const bt = String(b.textContent || '').trim();
           if (!bt) continue;
           // The button sits at the end of the text, so remove the *last*
           // occurrence — a post that itself says "see more" keeps its words.
@@ -3705,7 +3728,7 @@
     let textTruncated = false;
     for (const b of safeQueryAll(card, 'button')) {
       if (exclude && exclude.contains(b)) continue;
-      if (/^(?:…|\.\.\.)?\s*(?:see|show)\s+more$/i.test(String(b.innerText || b.textContent || '').trim())) {
+      if (/^(?:…|\.\.\.)?\s*(?:see|show)\s+more$/i.test(String(b.textContent || '').trim())) {
         textTruncated = true;
         break;
       }
@@ -3788,7 +3811,9 @@
     let n = 0;
     for (const b of safeQueryAll(document, 'button')) {
       if (n >= (limit || 40)) break;
-      const t = String(b.innerText || b.textContent || '').trim();
+      // textContent, not innerText: innerText forces a layout per button, and
+      // this runs over every button on the page every round.
+      const t = String(b.textContent || '').trim();
       const cls = String(b.className || '');
       const isSeeMore = /^(?:…|\.\.\.)?\s*(?:see|show)\s+more$/i.test(t) || (/see-more/.test(cls) && !/less/i.test(t));
       if (!isSeeMore) continue;
@@ -3822,7 +3847,7 @@
       // The card renders the first lines and a "…see more"; the post is
       // behind the button. Opened before reading, so the text is the post.
       expandSeeMore();
-      for (const p of harvestFeedCards()) {
+      for (const p of harvestFeedCards(S.seen)) {
         add(p);
         if (S.collected >= S.cfg.maxPosts) break;
       }
@@ -4069,6 +4094,22 @@
           }
           if (k === 'mediaCount') continue; // derived from the merge above
           if (v == null || v === '' || (Array.isArray(v) && !v.length)) continue;
+          /*
+           * A nested record is merged field by field, not replaced. The
+           * permalink's `repost` carries the original's author and text; the
+           * feed's carried the original's media. Replacing wholesale threw
+           * the media away, and the reshared_NN files were never written.
+           */
+          if ((k === 'repost' || k === 'article' || k === 'poll') && v && typeof v === 'object' && post[k] && typeof post[k] === 'object') {
+            const merged = Object.assign({}, post[k]);
+            for (const f of Object.keys(v)) {
+              const fv = v[f];
+              if (fv == null || fv === '' || (Array.isArray(fv) && !fv.length)) continue;
+              merged[f] = f === 'media' ? mergeMedia(merged.media, fv) : fv;
+            }
+            post[k] = merged;
+            continue;
+          }
           post[k] = v;
         }
         post.detailFetched = true;
@@ -4327,7 +4368,10 @@
         streak = 0;
       } catch (err) {
         if (err instanceof Abort) throw err;
-        post.commentList = [];
+        // No list: an empty one read as "fetched, none", and the post was
+        // never handed back to a Resume, so its comments stayed uncollected
+        // for good. The error is recorded; the list stays outstanding.
+        delete post.commentList;
         post.commentError = err.message;
         emit(MSG.C_POST_UPDATE, { post });
         failed++;

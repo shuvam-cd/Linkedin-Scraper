@@ -84,7 +84,7 @@
   };
 
   // The pill is a glance, so it gets one word rather than the full label.
-  const STAGE_SHORT = { detail: 'Detail', comments: 'Comments' };
+  const STAGE_SHORT = { profile: 'Profile', detail: 'Detail', comments: 'Comments' };
 
   let lastState = null;
 
@@ -277,6 +277,9 @@
    * the "Collected x / y" figure above already describes, so it says nothing.
    */
   const STAGE = {
+    // Up to a page, seventeen "Show all" pages and their tabs, and the contact
+    // overlay come before the first post; this is what the bar shows meanwhile.
+    profile: { label: 'Reading the profile', unit: 'pages' },
     detail: { label: 'Fetching post detail', unit: 'posts' },
     comments: { label: 'Fetching comments', unit: 'posts' }
   };

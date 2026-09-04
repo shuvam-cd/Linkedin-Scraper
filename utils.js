@@ -138,11 +138,19 @@ if (!globalThis.LIS) {
         this.gap = gap;
         this.next = 0;
       }
-      async wait(extra = 0) {
+      /**
+       * @param {number} extra   added to the gap after this request
+       * @param {() => boolean} [cancelled]  polled every 250 ms; a true cuts the wait short
+       */
+      async wait(extra = 0, cancelled) {
         const now = Date.now();
         const at = Math.max(now, this.next);
         this.next = at + this.gap + extra;
-        if (at > now) await sleep(at - now);
+        // Sliced so a Stop lands within a quarter second, not after the gap.
+        for (let left = at - now; left > 0; left = at - Date.now()) {
+          if (cancelled && cancelled()) return;
+          await sleep(Math.min(250, left));
+        }
       }
     }
 
@@ -320,7 +328,12 @@ if (!globalThis.LIS) {
      * ones out of the bounded handoff.
      */
     function postNeedsComments(p) {
-      return !!p && p.comments !== 0 && !Array.isArray(p.commentList);
+      if (!p || p.comments === 0) return false;
+      // A list settles it — unless it was written by a failed fetch, which an
+      // earlier build did (an empty list beside an error and no fetch stamp).
+      // That post is still outstanding.
+      if (Array.isArray(p.commentList)) return !(p.commentsFetchedAt || !p.commentError);
+      return true;
     }
 
     /* ------------------------------------------------------------------ *

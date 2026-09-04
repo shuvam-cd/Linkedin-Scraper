@@ -101,8 +101,23 @@ const BG = new Function(
   'importScripts',
   'chrome',
   `${BG_SRC}
-   return { samePage, isLinkedInTab, needsMoreWork, blankState };`
+   return { samePage, isLinkedInTab, needsMoreWork, blankState, mergeProfileRecords };`
 )(() => new Function(read('utils.js'))(), chromeStub);
+
+/**
+ * A fresh worker over a storage stub of the caller's choosing, with its
+ * persistence internals exposed — for tests about what is on disk.
+ */
+function loadBackground(storage) {
+  const local = Object.assign({ get: async () => ({}), set: async () => {}, remove: async () => {} }, storage || {});
+  const stub = Object.assign({}, chromeStub, { storage: { local } });
+  return new Function(
+    'importScripts',
+    'chrome',
+    `${BG_SRC}
+     return { loadFromStorage, persist, posts: () => posts, dirty: () => dirtyChunks, state: () => state };`
+  )(() => new Function(read('utils.js'))(), stub);
+}
 
 /* ---------------- load content.js ---------------- */
 globalThis.window = globalThis;
@@ -1605,6 +1620,81 @@ check('finding a card is linear in the length of the feed', () => {
   ok(/counts\.get\(parent\)/.test(body), 'it reads a precomputed count');
   ok(/function countUrnsPerAncestor/.test(CS_SRC), 'built once per harvest');
   ok(/const urnCount = countUrnsPerAncestor\(nodes, top\)/.test(fnBody('function harvestFeedCards')), 'and harvestFeedCards builds it');
+});
+
+check('Stop pressed while the run is starting is not undone', () => {
+  const body = stripComments(BG_SRC.slice(BG_SRC.indexOf('async function startScrape'), BG_SRC.indexOf('function handleStartResponse')));
+  // Stop is enabled during 'starting', and it went to a tab with no content
+  // script yet; startScrape then carried on and sent START anyway.
+  ok(/const abandoned = \(\) =>/.test(body), 'the status is re-read');
+  const checks = (body.match(/if \(abandoned\(\)\)/g) || []).length;
+  ok(checks >= 4, `after every await, found ${checks}`);
+  const hsr = fnBody('function handleStartResponse', BG_SRC);
+  ok(/if \(state\.status === 'starting'\) setStatus\('running'\)/.test(hsr), "and 'running' is only set from 'starting'");
+});
+
+check('a Stop lands within a slice, not after a gap', () => {
+  const cool = stripComments(fnBody('async function coolOff'));
+  ok(!/U\.sleep\(/.test(cool), 'coolOff no longer sleeps ten seconds blind');
+  ok(/await pause\(/.test(cool), 'it uses the interruptible pause');
+  ok(/await limiter\.wait\(0, \(\) => S\.stop\);\s*[^;]*throwIfStopped\(\);/s.test(stripComments(CS_SRC)), 'and the limiter gap is cancellable with no request after it');
+  const wait = read('utils.js').slice(read('utils.js').indexOf('async wait(extra = 0, cancelled)'));
+  ok(/Math\.min\(250, left\)/.test(wait), 'sliced to a quarter second');
+});
+
+check('a failed comment fetch stays outstanding', () => {
+  const U = globalThis.LIS;
+  // An empty list read as "fetched, none"; the post was never handed back.
+  eq(U.postNeedsComments({ comments: 4, commentError: 'HTTP 500' }), true, 'no list, an error: outstanding');
+  eq(U.postNeedsComments({ comments: 4, commentList: [], commentError: 'HTTP 500' }), true, 'the earlier build wrote an empty list beside the error: still outstanding');
+  eq(U.postNeedsComments({ comments: 4, commentList: [], commentsFetchedAt: 'x' }), false, 'a fetch that ran and found none is done');
+  eq(U.postNeedsComments({ comments: 4, commentList: [{ text: 'hi' }] }), false, 'a list from before the stamp existed is done');
+  const pass = stripComments(CS_SRC.slice(CS_SRC.indexOf('async function commentPass')));
+  ok(/delete post\.commentList;/.test(pass), 'and the pass no longer writes an empty list on failure');
+});
+
+check('the profile is merged on receipt, not replaced', () => {
+  const merged = BG.mergeProfileRecords(
+    { publicId: 'a', headline: 'old', about: 'kept', experience: [{ title: 'x' }], contact: { email: 'e' } },
+    { publicId: 'a', headline: 'new', about: '', experience: [{ title: 'y' }, { title: 'x' }], contact: { phone: 'p' } }
+  );
+  eq(merged.headline, 'new', 'a new non-empty scalar wins');
+  eq(merged.about, 'kept', 'an empty one does not erase');
+  eq(merged.experience.map((e) => e.title), ['x', 'y'], 'lists union');
+  eq(merged.contact, { email: 'e', phone: 'p' }, 'records merge');
+  ok(/state\.profile = mergeProfileRecords\(state\.profile, msg\.profile\)/.test(BG_SRC), 'and C_PROFILE uses it');
+});
+
+await checkAsync('a stored layout with another chunk size is rewritten whole', async () => {
+  // 250 posts under the previous build's 100-post buckets. Writing only the
+  // dirty chunks over them scrambled the order and lost 75 posts.
+  const mk = (i) => ({ activityId: String(i), urn: 'u' + i, text: 't' + i, media: [] });
+  const stored = {
+    lis_state: { publicId: 'ada', status: 'done' },
+    lis_index: { total: 250, chunks: 3 },
+    lis_posts_0: Array.from({ length: 100 }, (_, i) => mk(i)),
+    lis_posts_1: Array.from({ length: 100 }, (_, i) => mk(100 + i)),
+    lis_posts_2: Array.from({ length: 50 }, (_, i) => mk(200 + i))
+  };
+  const removed = [];
+  const W = loadBackground({
+    get: async (keys) => {
+      const out = {};
+      for (const k of [].concat(keys)) if (k in stored) out[k] = stored[k];
+      return out;
+    },
+    set: async (payload) => Object.assign(stored, payload),
+    remove: async (keys) => { for (const k of [].concat(keys)) { removed.push(k); delete stored[k]; } }
+  });
+  await W.loadFromStorage();
+  eq(W.posts().length, 250, 'every post kept');
+  eq(W.posts().map((p) => p.activityId), Array.from({ length: 250 }, (_, i) => String(i)), 'in order, none duplicated');
+  eq(W.dirty().size, 10, 'every new chunk marked dirty');
+  await W.persist();
+  eq(stored.lis_index.chunkSize, 25, 'the index now says which layout it is');
+  eq(stored.lis_index.chunks, 10);
+  for (let i = 0; i < 10; i++) eq((stored['lis_posts_' + i] || []).length, i === 9 ? 25 : 25, `chunk ${i} rewritten`);
+  ok(!('lis_posts_10' in stored), 'nothing beyond the new count');
 });
 
 check('a strategy that never makes a request still notices Stop', () => {

@@ -112,6 +112,23 @@ async function loadFromStorage() {
   posts = fresh;
   reindex();
 
+  /*
+   * A stored layout with a different chunk size — an earlier build's 100-post
+   * buckets, say — must be rewritten whole. Writing only the dirty chunks over
+   * it would have put 25 posts into a key that held 100, left the old keys
+   * beyond the new count untouched, and on the next load scrambled the order
+   * and lost the 75 posts the first key no longer held.
+   */
+  if (idx && idx.chunks > 0 && idx.chunkSize !== CHUNK) {
+    const newCount = chunkCount();
+    for (let i = 0; i < newCount; i++) dirtyChunks.add(i);
+    const stale = [];
+    for (let i = newCount; i < Math.max(idx.chunks, newCount); i++) stale.push(U.KEYS.chunk(i));
+    if (stale.length) await chrome.storage.local.remove(stale).catch(() => {});
+    addLog('info', `Storage layout updated (${idx.chunkSize || 'old'} → ${CHUNK} posts per chunk) — ${posts.length} posts kept.`);
+    schedulePersist(true);
+  }
+
   // A run can't survive a worker restart mid-flight unless the content script
   // is still streaming; mark it interrupted so the UI is honest about it.
   if (state.status === 'running' || state.status === 'starting') {
@@ -169,7 +186,9 @@ async function persist() {
 
   const payload = {
     [U.KEYS.STATE]: state,
-    [U.KEYS.INDEX]: { total: posts.length, chunks: chunkCount() }
+    // chunkSize is recorded so a build that changes it can tell the stored
+    // layout is not its own, and rewrite it whole rather than over the top.
+    [U.KEYS.INDEX]: { total: posts.length, chunks: chunkCount(), chunkSize: CHUNK }
   };
   for (const c of writing) payload[U.KEYS.chunk(c)] = posts.slice(c * CHUNK, (c + 1) * CHUNK);
 
@@ -552,17 +571,39 @@ async function startScrape(payload, keepResults) {
   );
   setStatus('starting');
 
+  /*
+   * Stop is enabled while the status is 'starting', and a Stop pressed then
+   * went to a tab with no content script yet — swallowed — after which this
+   * function carried on, sent START, and the popup flipped from "Stopping"
+   * back to "Scraping". Same rule as continueAt: re-read the status after
+   * every await, and go no further once it is not the one we set.
+   */
+  const abandoned = () => {
+    if (state.status === 'starting') return false;
+    addLog('info', 'Stop landed while the run was starting — nothing was started.');
+    if (state.status !== 'stopped') setStatus('stopped', { finishedAt: Date.now() });
+    return true;
+  };
+
   try {
     // Resuming into the feed scroll means the feed is where the run belongs.
     const target = state.phase === 'posts-dom' ? U.activityUrl(publicId) : U.profileUrl(publicId);
     const { tabId, navigated } = await ensureTab(target);
     state.tabId = tabId;
+    if (abandoned()) return { ok: false, error: 'stopped' };
     // Only wait when something is actually loading — a tab already on the
     // profile never fires another `complete`, so waiting would just time out.
     if (navigated) await waitForTabLoad(tabId, target);
+    if (abandoned()) return { ok: false, error: 'stopped' };
     await injectContent(tabId);
+    if (abandoned()) return { ok: false, error: 'stopped' };
 
     const res = await sendToTab(tabId, { type: MSG.START, cfg: runCfg() });
+    if (abandoned()) {
+      // The script did start; tell it to stop rather than leave it running.
+      sendToTab(tabId, { type: MSG.STOP }).catch(() => {});
+      return { ok: false, error: 'stopped' };
+    }
     return handleStartResponse(res);
   } catch (err) {
     addLog('error', err.message);
@@ -573,7 +614,8 @@ async function startScrape(payload, keepResults) {
 
 function handleStartResponse(res) {
   if (res && res.ok) {
-    setStatus('running');
+    // Only from 'starting': a Stop that arrived meanwhile must not be undone.
+    if (state.status === 'starting') setStatus('running');
     return { ok: true };
   }
   if (res && res.error === 'not-logged-in') {
@@ -717,7 +759,14 @@ chrome.runtime.onConnect.addListener((port) => {
         return; // presence alone keeps the worker alive
 
       case MSG.C_PROFILE:
-        state.profile = msg.profile;
+        /*
+         * Merged, not replaced. A resume in phase 'main' re-reads the profile,
+         * and that read can be thinner than the one already stored — a
+         * "Show all" page that failed this time, a reader that answered
+         * last time and not now. Scalars take the new non-empty value; lists
+         * are unioned; nothing already known is erased by an empty answer.
+         */
+        state.profile = mergeProfileRecords(state.profile, msg.profile);
         broadcast();
         schedulePersist();
         return;
@@ -873,6 +922,36 @@ const crlf = (lines) => lines.join('\r\n') + '\r\n';
 const padWidth = () => 3;
 
 const mediaOf = (post) => (Array.isArray(post.media) ? post.media : []);
+
+/** One profile read over another: new non-empty scalars win, lists union. */
+function mergeProfileRecords(existing, incoming) {
+  if (!existing || typeof existing !== 'object') return incoming;
+  if (!incoming || typeof incoming !== 'object') return existing;
+  if (existing.publicId && incoming.publicId && existing.publicId !== incoming.publicId) return incoming;
+  const out = Object.assign({}, existing);
+  for (const k of Object.keys(incoming)) {
+    const v = incoming[k];
+    const cur = out[k];
+    if (Array.isArray(v)) {
+      const seen = new Set();
+      const key = (x) => (x && typeof x === 'object' ? JSON.stringify(x) : String(x));
+      out[k] = [].concat(Array.isArray(cur) ? cur : [], v).filter((x) => {
+        const id = key(x);
+        if (seen.has(id)) return false;
+        seen.add(id);
+        return true;
+      });
+      continue;
+    }
+    if (v && typeof v === 'object' && cur && typeof cur === 'object' && !Array.isArray(cur)) {
+      out[k] = Object.assign({}, cur, v);
+      continue;
+    }
+    if (v == null || v === '') continue;
+    out[k] = v;
+  }
+  return out;
+}
 
 /**
  * The file each of a post's media becomes, decided once.

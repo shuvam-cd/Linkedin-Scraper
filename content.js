@@ -1447,7 +1447,9 @@
     const r = reactionsFrom(node);
     let comments = null;
     let reposts = null;
-    for (const s of VY.collect(node, (n) => n.numComments != null || n.numShares != null)) {
+    // The same scoped walk reactionsFrom uses: a reshared original's counts
+    // and a comment's reply count are not this post's.
+    for (const s of collectContent(node, (n) => n.numComments != null || n.numShares != null, { skip: OTHER_COUNT_KEYS })) {
       if (comments == null) comments = num(s.numComments);
       if (reposts == null) reposts = num(s.numShares);
       if (comments != null && reposts != null) break;
@@ -1460,6 +1462,14 @@
    * ------------------------------------------------------------------ */
   /** Reads a field that may be inline or still a `*`-prefixed reference. */
   const linked = (n, key) => (n[key] !== undefined ? n[key] : n['*' + key]);
+
+  /** "Jun 2019" from an epoch in milliseconds; '' for anything else. */
+  function epochMonth(v) {
+    const ts = num(v);
+    if (!ts || ts < 1e11) return '';
+    const d = new Date(ts);
+    return monthYear({ year: d.getUTCFullYear(), month: d.getUTCMonth() + 1 });
+  }
 
   /** LinkedIn's pronoun enum, as the words it stands for. */
   function pronounText(v) {
@@ -1541,7 +1551,7 @@
        * the maiden name, and the two states a profile can be in that change
        * how everything else should be read.
        */
-      pronouns: textOf(p.customPronoun) || pronounText(p.pronoun),
+      pronouns: textOf(p.customPronoun) || pronounText(p.standardizedPronoun) || pronounText(p.pronoun) || pronounText(p.pronouns),
       birthday: p.birthDateOn ? (p.birthDateOn.month && MONTHS[p.birthDateOn.month] ? `${MONTHS[p.birthDateOn.month]} ${p.birthDateOn.day || ''}`.trim() : textOf(p.birthDateOn)) : '',
       address: textOf(p.address),
       maidenName: textOf(p.maidenName),
@@ -1727,7 +1737,7 @@
         return {
           name: byName || '(name not returned)',
           detail: textOf(n.relationship) || (who && textOf(who.headline)) || '',
-          dates: datePointText(n.createdAt || n.created || n.dateRange) || '',
+          dates: epochMonth(n.createdAt) || epochMonth(n.created) || datePointText(n.dateRange) || '',
           url: who && who.publicIdentifier ? U.profileUrl(who.publicIdentifier) : null,
           description: textOf(n.recommendationText) || textOf(n.text)
         };
@@ -1766,7 +1776,8 @@
       for (const raw of VY.collect(pool, (x) => typeof x.$type === 'string' && s.type.test(x.$type))) {
         const e = sectionEntry(resolveAgainst(pool, raw, index), s);
         if (!e) continue;
-        const key = `${e.name}|${e.detail}|${e.dates}`;
+        // Two recommendations from one person differ only in what they say.
+        const key = `${e.name}|${e.detail}|${e.dates}|${String(e.description || '').slice(0, 40)}`;
         if (seen.has(key)) continue;
         seen.add(key);
         rows.push(e);
@@ -1849,30 +1860,43 @@
       const shown = start != null && length != null ? full.substr(start, length) : '';
       let kind = '';
       let target = null;
-      if (d.profileMention || d['*profileMention'] || d.miniProfile || d['*miniProfile']) {
+      const has = (k) => d[k] != null || d['*' + k] != null;
+      const pick = (k) => (d[k] && typeof d[k] === 'object' ? d[k] : null);
+      if (has('profileMention') || has('miniProfile') || has('profileFullName') || has('profileFamiliarName')) {
         kind = 'person';
-        target = d.profileMention || d.miniProfile || null;
-      } else if (d.companyMention || d['*companyMention'] || d.miniCompany || d['*miniCompany']) {
+        target = pick('profileMention') || pick('miniProfile') || pick('profileFullName') || pick('profileFamiliarName') || null;
+      } else if (has('companyMention') || has('miniCompany') || has('companyName') || has('schoolName')) {
         kind = 'company';
-        target = d.companyMention || d.miniCompany || null;
-      } else if (d.hyperlink || d.url) {
+        target = pick('companyMention') || pick('miniCompany') || pick('companyName') || pick('schoolName') || null;
+      } else if (d.hyperlink || d.url || d.textLink) {
         kind = 'link';
       } else if (d.hashtag || d['*hashtag']) {
         continue; // hashtags are read elsewhere
+      } else if (d.type && typeof d.type === 'object') {
+        // The typed shape: one key, named for what it is.
+        const k = Object.keys(d.type)[0] || '';
+        if (/url|link/i.test(k)) kind = 'link';
+        else if (/member|profile/i.test(k)) kind = 'person';
+        else if (/company|school|organization/i.test(k)) kind = 'company';
+        else continue;
+        target = d.type[k] && typeof d.type[k] === 'object' ? d.type[k] : null;
       } else {
         continue;
       }
       const id = (target && (target.publicIdentifier || target.universalName)) || '';
       const url =
         kind === 'link'
-          ? String((d.hyperlink && (d.hyperlink.url || d.hyperlink)) || d.url || '')
+          ? String((d.hyperlink && (d.hyperlink.url || d.hyperlink)) || d.url || (d.textLink && (d.textLink.url || d.textLink)) || (target && target.url) || '')
           : kind === 'person' && id
             ? U.profileUrl(id)
             : kind === 'company' && id
               ? `${ORIGIN}/company/${encodeURIComponent(id)}/`
               : '';
-      // The span covers the name; if a shape ever includes the @, drop it.
-      const name = (shown || (target && [textOf(target.firstName), textOf(target.lastName)].filter(Boolean).join(' ')) || textOf(target && target.name) || '').replace(/^@/, '').trim();
+      // The resolved entity's own name first: the offset slice depends on
+      // LinkedIn's offset convention, and an emoji before the mention moves
+      // it. The slice is only for a mention that resolved to nothing.
+      const resolved = (target && ([textOf(target.firstName), textOf(target.lastName)].filter(Boolean).join(' ') || textOf(target.name) || textOf(target.localizedName))) || '';
+      const name = (resolved || shown || '').replace(/^@/, '').trim();
       if (!name && !url) continue;
       const key = `${kind}|${name}|${url}`;
       if (seen.has(key)) continue;
@@ -2652,7 +2676,7 @@
   ];
 
   function entryKey(r) {
-    return `${r.name}|${r.detail}|${r.dates}`;
+    return `${r.name}|${r.detail}|${r.dates}|${String(r.description || '').slice(0, 40)}`;
   }
 
   /*
@@ -4364,8 +4388,18 @@
    * follows a commenter's profile link.
    * ------------------------------------------------------------------ */
   function mapComment(c) {
+    /*
+     * The commenter first, never the body. A deep scan for "anything that
+     * looks like a profile" found the first profile in walk order — which,
+     * in the newer shape, is whoever the comment @mentions, since the
+     * commenter there has no firstName or publicIdentifier of its own.
+     */
+    const who = (c.commenter && typeof c.commenter === 'object' && c.commenter) || (c.actor && typeof c.actor === 'object' && c.actor) || (c.author && typeof c.author === 'object' && c.author) || null;
+    const mini = (who && ((who.miniProfile && typeof who.miniProfile === 'object' && who.miniProfile) || (who['*miniProfile'] && typeof who['*miniProfile'] === 'object' && who['*miniProfile']))) || who;
     const author =
-      deepFindObject(c, (n) => n.firstName != null || n.publicIdentifier != null || n.headline != null) || {};
+      (mini && (mini.firstName != null || mini.publicIdentifier != null || mini.headline != null || mini.title != null) && mini) ||
+      collectContent(c, (n) => n.firstName != null || n.publicIdentifier != null, { skip: new Set([...CHROME_KEYS, 'commentary', 'comment', 'commentV2', 'text', 'message', 'replies', 'socialDetail']), limit: 1 })[0] ||
+      {};
     const name =
       [textOf(author.firstName), textOf(author.lastName)].filter(Boolean).join(' ') ||
       textOf(author.name) ||

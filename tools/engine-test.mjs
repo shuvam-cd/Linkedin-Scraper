@@ -921,6 +921,45 @@ check('the contact overlay payload is read', () => {
   eq(c.address, '12 Analytical Row');
 });
 
+check('a comment belongs to its commenter, not to whom it mentions', () => {
+  const c = E.mapComment({
+    commenter: { title: { text: 'Bo Writer' }, subtitle: { text: 'Editor' }, navigationUrl: 'https://www.linkedin.com/in/bo/' },
+    commentary: { text: { text: 'Thanks Ada Lovelace!', attributesV2: [{ start: 7, length: 12, detailData: { profileMention: { firstName: 'Ada', lastName: 'Lovelace', publicIdentifier: 'ada-l' } } }] } }
+  });
+  eq(c.author, 'Bo Writer');
+  eq(c.profileUrl, 'https://www.linkedin.com/in/bo/');
+});
+
+check('comment and repost counts come from the post, not the reshare', () => {
+  const s = E.socialCountsFrom({
+    resharedUpdate: { socialDetail: { numComments: 900, numShares: 50, numLikes: 1 } },
+    socialDetail: { numComments: 4, numShares: 2, numLikes: 9 }
+  });
+  eq([s.comments, s.reposts, s.reactions], [4, 2, 9]);
+});
+
+check('a recommendation dated by epoch keeps its month, and two from one person both survive', () => {
+  const pool = { included: [
+    { $type: 'com.linkedin.voyager.dash.identity.profile.Recommendation', entityUrn: 'urn:li:r:1', recommendationText: 'First note about Ada.', relationship: 'Managed Ada', createdAt: 1560000000000, recommender: { firstName: 'Bo', lastName: 'Boss', publicIdentifier: 'bo' } },
+    { $type: 'com.linkedin.voyager.dash.identity.profile.Recommendation', entityUrn: 'urn:li:r:2', recommendationText: 'Second note, years later.', relationship: 'Managed Ada', createdAt: 1690000000000, recommender: { firstName: 'Bo', lastName: 'Boss', publicIdentifier: 'bo' } }
+  ] };
+  const sections = E.readProfileSections(pool);
+  eq(sections.recommendations.length, 2);
+  eq(sections.recommendations[0].dates, 'Jun 2019');
+  eq(sections.recommendations[0].name, 'Bo Boss');
+  eq(sections.recommendations[0].url, 'https://www.linkedin.com/in/bo/');
+});
+
+check('the dash profile pronoun field is read', () => {
+  const p = E.mapProfileEntity({ publicIdentifier: 'x', firstName: 'A', lastName: 'B', standardizedPronoun: 'HE_HIM' }, { included: [] });
+  eq(p.pronouns, 'he/him');
+});
+
+check('a mention prefers the resolved name to the text slice', () => {
+  const m = E.mentionsFrom({ commentary: { text: { text: '🎉 Thanks Ada', attributesV2: [{ start: 9, length: 3, detailData: { profileMention: { firstName: 'Ada', lastName: 'Lovelace', publicIdentifier: 'ada-l' } } }] } } });
+  eq(m, [{ kind: 'person', name: 'Ada Lovelace', url: 'https://www.linkedin.com/in/ada-l/' }]);
+});
+
 check('the pronoun enum reads as words', () => {
   eq(E.pronounText('SHE_HER'), 'she/her');
   eq(E.pronounText({ text: 'THEY_THEM' }), 'they/them');

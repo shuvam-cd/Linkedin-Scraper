@@ -126,7 +126,8 @@ async function loadFromStorage() {
     for (let i = newCount; i < Math.max(idx.chunks, newCount); i++) stale.push(U.KEYS.chunk(i));
     if (stale.length) await chrome.storage.local.remove(stale).catch(() => {});
     addLog('info', `Storage layout updated (${idx.chunkSize || 'old'} → ${CHUNK} posts per chunk) — ${posts.length} posts kept.`);
-    schedulePersist(true);
+    // Awaited: the load is not done until the disk holds the new layout.
+    await schedulePersist(true);
   }
 
   // A run can't survive a worker restart mid-flight unless the content script

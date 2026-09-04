@@ -1689,12 +1689,17 @@ await checkAsync('a stored layout with another chunk size is rewritten whole', a
   await W.loadFromStorage();
   eq(W.posts().length, 250, 'every post kept');
   eq(W.posts().map((p) => p.activityId), Array.from({ length: 250 }, (_, i) => String(i)), 'in order, none duplicated');
-  eq(W.dirty().size, 10, 'every new chunk marked dirty');
-  await W.persist();
+  // The rewrite happens as part of the load, so the disk is already right.
+  eq(W.dirty().size, 0, 'and nothing is left dirty afterwards');
   eq(stored.lis_index.chunkSize, 25, 'the index now says which layout it is');
   eq(stored.lis_index.chunks, 10);
-  for (let i = 0; i < 10; i++) eq((stored['lis_posts_' + i] || []).length, i === 9 ? 25 : 25, `chunk ${i} rewritten`);
+  for (let i = 0; i < 10; i++) eq((stored['lis_posts_' + i] || []).length, 25, `chunk ${i} rewritten`);
   ok(!('lis_posts_10' in stored), 'nothing beyond the new count');
+  // And a second load of what was written comes back identical.
+  const again = loadBackground({ get: async (keys) => { const o = {}; for (const k of [].concat(keys)) if (k in stored) o[k] = stored[k]; return o; } });
+  await again.loadFromStorage();
+  eq(again.posts().map((p) => p.activityId), W.posts().map((p) => p.activityId), 'round-trips');
+  eq(again.dirty().size, 0, 'and is recognised as its own layout');
 });
 
 check('a strategy that never makes a request still notices Stop', () => {
